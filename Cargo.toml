@@ -8,10 +8,6 @@ name = "mnk_game"
 path = "play.rs"
 
 [[bin]]
-name = "nnue_sanity"
-path = "src/nnue_sanity.rs"
-
-[[bin]]
 name = "train_alphazero"
 path = "src/train_alphazero.rs"
 
