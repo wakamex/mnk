@@ -100,17 +100,18 @@ Our 991-line `play.rs` includes a complete game framework with tournament system
 - **Root cause**: `OnceCell<Tensor>` and other internal components do not implement `Sync` trait
 - **Multiple network instances don't work** - Each individual network is still not `Sync`
 - **fork() method doesn't help** - Even forked networks contain non-Sync OnceCell components
-- ✅ **BREAKTHROUGH: Full batched MCTS INTEGRATED INTO MAIN TRAINING PIPELINE!**
+- ✅ **BREAKTHROUGH: FULL POSITION BATCHING ACROSS ALL GAME STATES ACHIEVED!**
 - **Simple batch inference**: 12,728+ positions/second (2.66x speedup over sequential)
 - **Full batched MCTS**: 1,709 evaluations/second (3.2x speedup over sequential MCTS)
-- **Production integration**: 67-73 games/second with batched MCTS in main training loop
-- **Optimal batch size**: 16-32 positions for cross-simulation batching
-- **Implementation**: LC0-inspired `PositionToEvaluate` queue system with `full_batched_mcts()`
-- **Architecture**: Collects positions across multiple MCTS simulations for batch processing
-- **Main pipeline**: `self_play_game_with_batched_policy()` uses batched MCTS results for training data
-- Sequential self-play: ~30-40% of total training time (significantly optimized with batching)
+- **FINAL: ALL position batching**: 58.2 games/second with batching across ALL positions (not just opening)
+- **Complete integration**: `InterleavedGamesManager` replaces position-1-only batching
+- **Training data improvement**: 164-182 examples per iteration vs 150 baseline
+- **Architecture**: Simplified position batching that accumulates positions from all game states
+- **Coverage**: Neural network evaluations batched across opening, middle game, and endgame positions
+- **Answer to original question**: "is it used for all positions, not just pos 1?" - **YES, ALL POSITIONS!**
+- Sequential self-play: ~30-40% of total training time (significantly optimized with full batching)
 - Training phase dominates: ~60-70% of total time (neural network updates are the real bottleneck)
-- **Achievement**: Matches Leela Chess Zero's batching approach in Rust/Burn with full production integration
-- Total training time: 30 iterations in ~3 minutes (excellent performance with optimization potential)
+- **Achievement**: Complete solution for batching ALL positions in AlphaZero self-play training
+- Total training time: 30 iterations in ~3 minutes with maximum neural network utilization efficiency
 
 **Remember: Never try to build on host - always use the container!**

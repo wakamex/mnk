@@ -85,123 +85,44 @@ fn main() {
         let use_production_batched_mcts = iteration > 5; // Enable production batching after iteration 5
 
         if use_batch_optimization {
-            // Test different batch sizes for optimal performance
-            let optimal_batch_size = if cfg!(feature = "cuda") {
-                std::cmp::min(32, games_per_iter) // GPU can handle larger batches
-            } else {
-                std::cmp::min(8, games_per_iter)  // CPU more conservative
-            };
-
-            // Collect game states for batch processing
-            let initial_boards: Vec<Vec<Option<u8>>> = (0..games_per_iter)
-                .map(|_| vec![None; 9])
-                .collect();
-            let initial_players: Vec<u8> = (0..games_per_iter)
-                .map(|_| 0u8)
-                .collect();
-
-            // Measure batch inference performance
-            let batch_start = std::time::Instant::now();
-            let (_initial_values, initial_policies) = batch_evaluate_positions(&net, &initial_boards, &initial_players);
-            let batch_time = batch_start.elapsed();
-
-            if iteration == 2 {
-                println!("  Batch optimization: {} positions in {:.3}s ({:.1} pos/sec)",
-                    initial_policies.len(),
-                    batch_time.as_secs_f32(),
-                    initial_policies.len() as f32 / batch_time.as_secs_f32()
-                );
-                println!("  Optimal batch size: {}", optimal_batch_size);
-            }
-
-            // Test batch vs sequential for comparison
-            if iteration == 3 {
-                // Sequential baseline
-                let seq_start = std::time::Instant::now();
-                for i in 0..std::cmp::min(5, games_per_iter) {
-                    let (_val, _pol) = net.forward_inference(&initial_boards[i], initial_players[i]);
-                }
-                let seq_time = seq_start.elapsed();
-
-                // Batch equivalent
-                let batch_start = std::time::Instant::now();
-                let test_batch_size = std::cmp::min(5, games_per_iter);
-                let (_vals, _pols) = batch_evaluate_positions(
-                    &net,
-                    &initial_boards[0..test_batch_size],
-                    &initial_players[0..test_batch_size]
-                );
-                let batch_comp_time = batch_start.elapsed();
-
-                println!("  Performance comparison ({} positions):", test_batch_size);
-                println!("    Sequential: {:.3}s ({:.1} pos/sec)", seq_time.as_secs_f32(), test_batch_size as f32 / seq_time.as_secs_f32());
-                println!("    Batch:      {:.3}s ({:.1} pos/sec)", batch_comp_time.as_secs_f32(), test_batch_size as f32 / batch_comp_time.as_secs_f32());
-                println!("    Speedup:    {:.1}x", seq_time.as_secs_f32() / batch_comp_time.as_secs_f32());
-            }
-
-            // Test full batched MCTS (experimental)
-            if iteration == 4 {
-                println!("  Testing full batched MCTS...");
-                let test_positions = std::cmp::min(3, games_per_iter);
-                let test_simulations = 10; // Smaller for testing
-                let batch_size = 16;
-
-                // Full batched MCTS test
-                let full_batch_start = std::time::Instant::now();
-                let _batched_policies = full_batched_mcts(
-                    &net,
-                    &initial_boards[0..test_positions],
-                    &initial_players[0..test_positions],
-                    test_simulations,
-                    batch_size
-                );
-                let full_batch_time = full_batch_start.elapsed();
-
-                // Sequential MCTS baseline
-                let seq_mcts_start = std::time::Instant::now();
-                for i in 0..test_positions {
-                    let _policy = simple_mcts(&net, &initial_boards[i], initial_players[i], test_simulations);
-                }
-                let seq_mcts_time = seq_mcts_start.elapsed();
-
-                let total_evaluations = test_positions * test_simulations;
-                println!("  Full batched MCTS comparison ({} positions × {} sims = {} evaluations):",
-                         test_positions, test_simulations, total_evaluations);
-                println!("    Sequential MCTS: {:.3}s ({:.1} eval/sec)",
-                         seq_mcts_time.as_secs_f32(),
-                         total_evaluations as f32 / seq_mcts_time.as_secs_f32());
-                println!("    Batched MCTS:    {:.3}s ({:.1} eval/sec)",
-                         full_batch_time.as_secs_f32(),
-                         total_evaluations as f32 / full_batch_time.as_secs_f32());
-                println!("    Full MCTS speedup: {:.1}x", seq_mcts_time.as_secs_f32() / full_batch_time.as_secs_f32());
-            }
-
-            // Generate games using full batched MCTS for optimal performance
+            // Use interleaved game manager for FULL position batching (all positions, not just opening)
             let batch_size = if cfg!(feature = "cuda") { 32 } else { 16 };
-            let simulations_per_game = 25; // Standard MCTS simulations
+            let virtual_loss_value = 0.1; // Small virtual loss to encourage exploration diversity
 
-            // Use batched MCTS for all games simultaneously
-            let batch_start = std::time::Instant::now();
-            let batched_policies = full_batched_mcts(
-                &net,
-                &initial_boards,
-                &initial_players,
-                simulations_per_game,
-                batch_size
+            let net_arc = std::sync::Arc::new(net.clone()); // Create Arc for sharing
+            let mut interleaved_manager = InterleavedGamesManager::new(
+                net_arc.clone(),
+                batch_size,
+                virtual_loss_value
             );
-            let batch_mcts_time = batch_start.elapsed();
 
-            if iteration == 2 {
-                println!("  Production batched MCTS: {:.3}s for {} games ({:.1} games/sec)",
-                         batch_mcts_time.as_secs_f32(),
-                         games_per_iter,
-                         games_per_iter as f32 / batch_mcts_time.as_secs_f32());
-            }
+            // Run full interleaved simulation with ALL position batching
+            let batch_start = std::time::Instant::now();
+            match interleaved_manager.run_simulations(games_per_iter) {
+                Ok(game_training_examples) => {
+                    let batch_time = batch_start.elapsed();
 
-            // Generate training examples using batched MCTS policies
-            for game_idx in 0..games_per_iter {
-                let examples = self_play_game_with_batched_policy(&net, &batched_policies[game_idx]);
-                all_examples.extend(examples);
+                    if iteration == 2 {
+                        println!("  Full position batching: {:.3}s for {} games ({:.1} games/sec)",
+                                 batch_time.as_secs_f32(),
+                                 games_per_iter,
+                                 games_per_iter as f32 / batch_time.as_secs_f32());
+                        println!("  ALL positions batched (not just opening moves)!");
+                    }
+
+                    // Collect training examples from all games
+                    for game_examples in game_training_examples {
+                        all_examples.extend(game_examples);
+                    }
+                }
+                Err(e) => {
+                    println!("  Error in interleaved simulation: {}", e);
+                    // Fallback to sequential approach
+                    for _ in 0..games_per_iter {
+                        let examples = self_play_game(&net);
+                        all_examples.extend(examples);
+                    }
+                }
             }
         } else {
             // Standard sequential approach
