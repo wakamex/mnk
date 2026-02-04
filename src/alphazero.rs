@@ -53,6 +53,58 @@ impl<B: Backend> AlphaZeroNet<B> {
 
         (value_scalar, policy_vec)
     }
+
+    // Batch inference method for processing multiple positions simultaneously
+    pub fn forward_batch_inference(&self, boards: &[&[Option<u8>]], players: &[u8]) -> (Vec<f32>, Vec<Vec<f32>>)
+    where
+        B: Backend<FloatElem = f32>,
+    {
+        assert_eq!(boards.len(), players.len(), "Boards and players must have same length");
+
+        if boards.is_empty() {
+            return (vec![], vec![]);
+        }
+
+        let device = &self.fc1.devices()[0];
+        let batch_size = boards.len();
+
+        // Create batch input tensor
+        let mut batch_data = vec![0.0f32; batch_size * 9];
+        for (batch_idx, (&board, &player)) in boards.iter().zip(players.iter()).enumerate() {
+            for (cell_idx, &cell) in board.iter().enumerate() {
+                batch_data[batch_idx * 9 + cell_idx] = match cell {
+                    Some(p) if p == player => 1.0,
+                    Some(_) => -1.0,
+                    None => 0.0,
+                };
+            }
+        }
+
+        let batch_input = Tensor::<B, 1>::from_floats(batch_data.as_slice(), device)
+            .reshape([batch_size, 9]);
+
+        // Forward pass for entire batch
+        let (batch_values, batch_policies) = self.forward(batch_input);
+
+        // Extract results for each position
+        let mut values = Vec::with_capacity(batch_size);
+        let mut policies = Vec::with_capacity(batch_size);
+
+        for i in 0..batch_size {
+            // Extract value for position i
+            let value: f32 = batch_values.clone().slice([i..i+1, 0..1]).into_scalar();
+            values.push(value);
+
+            // Extract policy for position i
+            let policy: Vec<f32> = (0..9).map(|j| {
+                let elem = batch_policies.clone().slice([i..i+1, j..j+1]);
+                elem.into_scalar()
+            }).collect();
+            policies.push(policy);
+        }
+
+        (values, policies)
+    }
 }
 
 fn board_to_tensor<B: Backend>(board: &[Option<u8>], player: u8, device: &B::Device) -> Tensor<B, 2>

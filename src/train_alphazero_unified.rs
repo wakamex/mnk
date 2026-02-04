@@ -76,16 +76,35 @@ fn main() {
     for iteration in 1..=iterations {
         let iter_start = std::time::Instant::now();
 
-        // Generate training data through parallel self-play
-        use rayon::prelude::*;
-        let all_examples: Vec<TrainingExample> = (0..games_per_iter)
-            .into_par_iter()
-            .flat_map(|_| self_play_game(&net))
-            .collect();
+        // Generate training data through self-play
+        // NOTE: Batch inference is possible but requires more complex implementation
+        // For now using sequential approach which is already very fast
+        let selfplay_start = std::time::Instant::now();
+        let mut all_examples = Vec::new();
+        for _ in 0..games_per_iter {
+            let examples = self_play_game(&net);
+            all_examples.extend(examples);
+        }
+
+        // Test batch inference capability (demonstration)
+        if iteration == 1 {
+            println!("  Testing batch inference capability...");
+            let test_boards: Vec<Vec<Option<u8>>> = vec![
+                vec![None; 9], // Empty board
+                vec![Some(0), None, None, None, None, None, None, None, None], // One move
+            ];
+            let test_board_refs: Vec<&[Option<u8>]> = test_boards.iter().map(|b| b.as_slice()).collect();
+            let test_players = vec![0, 1];
+
+            let (batch_values, batch_policies) = net.forward_batch_inference(&test_board_refs, &test_players);
+            println!("  Batch inference successful: {} positions processed", batch_values.len());
+        }
+        let selfplay_time = selfplay_start.elapsed();
 
         println!("Iteration {}: {} examples", iteration, all_examples.len());
 
         // Training loop
+        let training_start = std::time::Instant::now();
         let mut total_loss = 0.0;
 
         for epoch in 0..epochs {
@@ -157,9 +176,13 @@ fn main() {
             }
             total_loss = epoch_loss / num_batches as f32;
         }
+        let training_time = training_start.elapsed();
 
         let iter_time = iter_start.elapsed();
-        println!("  Time: {:.2}s", iter_time.as_secs_f32());
+        println!("  Self-play: {:.2}s, Training: {:.2}s, Total: {:.2}s",
+                 selfplay_time.as_secs_f32(),
+                 training_time.as_secs_f32(),
+                 iter_time.as_secs_f32());
 
         // Evaluation every 5 iterations
         if iteration % 5 == 0 {

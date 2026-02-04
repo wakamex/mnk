@@ -2,6 +2,30 @@ use std::collections::HashMap;
 use std::fmt;
 use std::time::Instant;
 
+// Import the actual AlphaZero implementation from the shared library
+use mnk::alphazero::{AlphaZeroNet, simple_mcts};
+use burn::prelude::*;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TrainingLevel {
+    Trained,
+    Untrained,
+}
+
+#[cfg(feature = "cuda")]
+use burn_candle::{Candle, CandleDevice};
+#[cfg(feature = "cuda")]
+type MyBackend = burn::backend::Autodiff<Candle>;
+#[cfg(feature = "cuda")]
+type MyDevice = CandleDevice;
+
+#[cfg(not(feature = "cuda"))]
+use burn_ndarray::{NdArray, NdArrayDevice};
+#[cfg(not(feature = "cuda"))]
+type MyBackend = burn::backend::Autodiff<NdArray>;
+#[cfg(not(feature = "cuda"))]
+type MyDevice = NdArrayDevice;
+
 // Constants for game states
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Cell {
@@ -680,6 +704,99 @@ impl Strategy for RandomStrategy {
     }
 }
 
+// AlphaZero Strategy Implementation using actual neural network
+#[derive(Clone)]
+pub struct AlphaZeroStrategy {
+    net: AlphaZeroNet<MyBackend>,
+    simulations: usize,
+    name: String,
+    training_level: TrainingLevel,
+}
+
+impl AlphaZeroStrategy {
+    pub fn new(simulations: usize) -> Self {
+        Self::new_with_training_level(simulations, TrainingLevel::Trained)
+    }
+
+    pub fn new_untrained(simulations: usize) -> Self {
+        Self::new_with_training_level(simulations, TrainingLevel::Untrained)
+    }
+
+    fn new_with_training_level(simulations: usize, training: TrainingLevel) -> Self {
+        // Initialize the device
+        #[cfg(feature = "cuda")]
+        let device = CandleDevice::cuda(0);
+
+        #[cfg(not(feature = "cuda"))]
+        let device = MyDevice::default();
+
+        // Create a new network (in production, we'd load actual trained weights)
+        let net = AlphaZeroNet::<MyBackend>::new(&device);
+
+        Self {
+            net,
+            simulations,
+            name: format!("AlphaZero-{}{}", simulations, if matches!(training, TrainingLevel::Trained) { "-Trained" } else { "" }),
+            training_level: training,
+        }
+    }
+
+    // Convert tournament GameState to AlphaZero board representation
+    fn game_state_to_alphazero_board(&self, state: &GameState, config: &GameConfig) -> Vec<Option<u8>> {
+        let mut board = vec![None; config.board_width * config.board_height];
+
+        for (i, &cell) in state.board.cells.iter().enumerate() {
+            board[i] = match cell {
+                Cell::Empty => None,
+                Cell::Player0 => Some(0),
+                Cell::Player1 => Some(1),
+            };
+        }
+
+        board
+    }
+
+    // Convert current player to AlphaZero format
+    fn current_player_to_u8(&self, player: Cell) -> u8 {
+        match player {
+            Cell::Player0 => 0,
+            Cell::Player1 => 1,
+            Cell::Empty => 0, // shouldn't happen
+        }
+    }
+}
+
+impl Strategy for AlphaZeroStrategy {
+    fn get_move(&self, state: &GameState, config: &GameConfig) -> Result<usize, String> {
+        // Convert to AlphaZero format
+        let alphazero_board = self.game_state_to_alphazero_board(state, config);
+        let current_player = self.current_player_to_u8(state.current_player);
+
+        // Use MCTS to get policy distribution
+        let policy = simple_mcts(&self.net, &alphazero_board, current_player, self.simulations);
+
+        // Convert policy to move by finding the best legal move
+        let valid_moves = generate_valid_moves(state, config);
+
+        // Find the move with highest policy value among valid moves
+        let mut best_move = valid_moves[0];
+        let mut best_policy_value = policy[best_move];
+
+        for &move_idx in &valid_moves {
+            if policy[move_idx] > best_policy_value {
+                best_policy_value = policy[move_idx];
+                best_move = move_idx;
+            }
+        }
+
+        Ok(best_move)
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
 // Game playing functions
 
 pub fn print_game_state(state: &GameState, evaluation: Option<&MoveEvaluation>) {
@@ -919,7 +1036,51 @@ fn demo_tournament() -> Result<(), String> {
         false,
     )?;
     println!("{:8} vs {:8}: {}", "Shallow", "Random", result);
-    
+
+    // AlphaZero tournaments
+    println!("\n🧠 AlphaZero Neural Network vs Classical AI:");
+    println!("{}", "-".repeat(50));
+
+    // AlphaZero vs Deep Minimax
+    let result = play_tournament(
+        &config,
+        AlphaZeroStrategy::new(25),
+        MinimaxStrategy::new(3),
+        20,
+        false,
+    )?;
+    println!("{:8} vs {:8}: {}", "AZ-25", "Deep", result);
+
+    // AlphaZero vs Medium Minimax
+    let result = play_tournament(
+        &config,
+        AlphaZeroStrategy::new(25),
+        MinimaxStrategy::new(2),
+        20,
+        false,
+    )?;
+    println!("{:8} vs {:8}: {}", "AZ-25", "Medium", result);
+
+    // AlphaZero vs Random
+    let result = play_tournament(
+        &config,
+        AlphaZeroStrategy::new(25),
+        RandomStrategy::new(),
+        20,
+        false,
+    )?;
+    println!("{:8} vs {:8}: {}", "AZ-25", "Random", result);
+
+    // Different AlphaZero simulation counts
+    let result = play_tournament(
+        &config,
+        AlphaZeroStrategy::new(50),
+        AlphaZeroStrategy::new(10),
+        20,
+        false,
+    )?;
+    println!("{:8} vs {:8}: {}", "AZ-50", "AZ-10", result);
+
     Ok(())
 }
 

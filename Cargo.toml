@@ -11,6 +11,10 @@ path = "play.rs"
 name = "train_alphazero"
 path = "src/train_alphazero_unified.rs"
 
+[lib]
+name = "mnk"
+path = "src/lib.rs"
+
 [dependencies]
 rand = "0.8"
 serde = { version = "1.0", features = ["derive"] }
