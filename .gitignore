@@ -1,0 +1,39 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Cargo lockfile (uncomment if building a library)
+# Cargo.lock
+
+# Neural network models and training artifacts
+*.bin
+
+# CUDA build artifacts
+*.cu.o
+*.ptx
+
+# Temporary files
+*.tmp
+*.temp
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Claude development artifacts (optional - include if needed)
+/.claude/
+
+# Container and CUDA setup artifacts
+cuda-keyring*.deb
+*.wrapper.c
+*.wrapper.sh
+fix_cuda_math.h
+
+# Test artifacts
+test_*.rs
