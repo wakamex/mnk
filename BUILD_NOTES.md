@@ -75,6 +75,30 @@ podman exec cuda-dev bash -c "curl --proto '=https' --tlsv1.2 -sSf https://sh.ru
 - Shallow vs Random: 18-2-0 (90% win rate)
 - Deep vs Medium: 10-0-10 (75% win rate)
 
+### Concurrent Hyperparameter Sweep Status:
+✅ **PARALLEL EXECUTION SYSTEM FULLY OPERATIONAL**
+
+**File Contention Resolution:**
+- ✅ Added `--model-path` parameter to training binary for unique model paths
+- ✅ Each experiment uses unique filenames: `alphazero_model_{experiment_name}.bin`
+- ✅ Fixed Burn framework filename truncation by replacing dots with underscores
+- ✅ Eliminated race conditions between concurrent training processes
+
+**GPU Memory Management:**
+- ✅ Dynamic VRAM-aware scheduling prevents OOM errors
+- ✅ Conservative tournament limits: 3 concurrent tournaments (~4.2GB each)
+- ✅ Training parallelism: Up to 16 concurrent jobs (~300MB each)
+- ✅ Automatic fallback to sequential mode when memory insufficient
+
+**16-Core Value Weight Sweep:**
+```bash
+python parallel_sweep.py --value-weight 0.5:3.0:0.5 --jobs 16
+```
+- **6 experiments**: vw=[0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
+- **Concurrent training**: 16 jobs for CPU parallelism
+- **GPU-managed tournaments**: Max 3 concurrent for memory safety
+- **Estimated time**: ~8-12 minutes total
+
 **Why Our LOC is Higher:**
 Our 991-line `play.rs` includes a complete game framework with tournament system, multiple AI strategies, and rich interface - significantly more comprehensive than the inspiration repositories' basic game logic files.
 

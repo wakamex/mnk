@@ -106,7 +106,7 @@ class AlphaZeroSweep:
         # Dynamic timeout calculation
         # Base timeouts scaled by parallel load
         self.base_training_timeout = 300  # 5 minutes base
-        self.base_tournament_timeout = 300  # 5 minutes base
+        self.base_tournament_timeout = 120  # 2 minutes base for testing
 
         print(f"🚀 AlphaZero Advanced Sweep Harness")
         print(f"   CPU Cores: {self.cpu_cores}")
@@ -203,6 +203,14 @@ class AlphaZeroSweep:
                 text=True,
                 timeout=config.tournament_timeout
             )
+
+            # Debug: save command output for failed tournaments
+            if result.returncode != 0:
+                with open(work_dir / 'tournament_debug.log', 'w') as f:
+                    f.write(f"Command: {' '.join(cmd)}\n")
+                    f.write(f"Return code: {result.returncode}\n")
+                    f.write(f"STDOUT:\n{result.stdout}\n")
+                    f.write(f"STDERR:\n{result.stderr}\n")
 
             if result.returncode == 0:
                 output = result.stdout
@@ -341,10 +349,10 @@ class AlphaZeroSweep:
         if not self.gpu_memory:
             return self.max_parallel_jobs, 1, False  # Conservative fallback
 
-        # VRAM requirements (in MB)
+        # VRAM requirements (in MB) - conservative estimates
         training_vram_per_job = 300      # Training uses ~300MB per job
-        tournament_vram_per_job = 5200   # Tournament peaks at ~5.2GB per job
-        safety_margin = 2000             # Keep 2GB free
+        tournament_vram_per_job = 6000   # Tournament uses ~4.2GB but be conservative
+        safety_margin = 3000             # Keep 3GB free for overhead
 
         available_vram = self.gpu_memory - safety_margin
 
@@ -431,7 +439,8 @@ class AlphaZeroSweep:
                             console.print(f"  ✅ Training: {exp.name} - {train_time:.1f}s, value={empty_value:.3f}" if success else f"  ❌ Training: {exp.name} - {error}")
 
                             # Immediately submit tournament if training succeeded and we have capacity
-                            if success and model_file and len(tournament_futures) < tournament_jobs:
+                            active_tournaments = len([f for f in tournament_futures if not f.done()])
+                            if success and model_file and active_tournaments < tournament_jobs:
                                 tournament_future = executor.submit(self.run_tournament_only, exp, model_file)
                                 tournament_futures[tournament_future] = (exp, train_time, empty_value)
                                 running_tournaments[exp.name] = time.time()
@@ -648,7 +657,7 @@ class AlphaZeroSweep:
             final_table.add_column(col, style="cyan" if col == "Experiment" else None)
 
         for _, row in df.iterrows():
-            final_table.add_row(*[str(val) for val in row.values])
+            final_table.add_row(*[str(val) for val in row.tolist()])
 
         console.print(final_table)
 
