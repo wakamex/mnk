@@ -25,6 +25,7 @@ from rich.live import Live
 from rich.layout import Layout
 import itertools
 import argparse
+import fcntl
 from rich.panel import Panel
 from rich.text import Text
 from rich.columns import Columns
@@ -136,19 +137,23 @@ class AlphaZeroSweep:
         work_dir = self.results_dir / config.name
         work_dir.mkdir(exist_ok=True)
 
-        # Create unique model filename to avoid conflicts
-        unique_model = f"alphazero_model_{config.name}.bin"
+        # Create unique model filename to avoid conflicts - replace dots with underscores to avoid Burn recorder issues
+        safe_name = config.name.replace(".", "_")
+        unique_model = f"alphazero_model_{safe_name}.bin"
 
         try:
             training_start = time.time()
-            cmd = f"./target/release/train_alphazero {config.args}"
 
+            # Execute training in container with unique model path
+            cmd = [
+                "podman", "exec", "cuda-dev", "bash", "-c",
+                f"cd /workspace/mnk && LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/lib64:/usr/local/nccl/lib:/usr/local/cuda-12/lib64:/usr/local/lib ./target/release/train_alphazero {config.args} --model-path {unique_model}"
+            ]
             result = subprocess.run(
-                cmd.split(),
+                cmd,
                 capture_output=True,
                 text=True,
-                timeout=config.training_timeout,
-                cwd='.'
+                timeout=config.training_timeout
             )
 
             training_time = time.time() - training_start
@@ -159,17 +164,23 @@ class AlphaZeroSweep:
                 match = re.search(r'Empty board evaluation: value=([0-9.-]+)', output)
                 empty_board_value = float(match.group(1)) if match else 0.0
 
-                # Save training log
-                with open(work_dir / 'training.log', 'w') as f:
-                    f.write(output)
+                # Check if model was successfully created
+                if Path(unique_model).exists():
+                    # Save training log
+                    with open(work_dir / 'training.log', 'w') as f:
+                        f.write(output)
 
-                # Rename the model to unique name to avoid tournament conflicts
-                if Path("alphazero_model.bin").exists():
-                    Path("alphazero_model.bin").rename(unique_model)
-
-                return True, training_time, empty_board_value, "", unique_model
+                    return True, training_time, empty_board_value, "", unique_model
+                else:
+                    # Save stdout and stderr for debugging
+                    with open(work_dir / 'training.log', 'w') as f:
+                        f.write("STDOUT:\n" + result.stdout + "\n\nSTDERR:\n" + result.stderr)
+                    return False, training_time, 0.0, f"Training failed - no model produced. Check {work_dir}/training.log", ""
             else:
-                return False, training_time, 0.0, result.stderr[:200], ""
+                # Save stdout and stderr for debugging
+                with open(work_dir / 'training.log', 'w') as f:
+                    f.write("STDOUT:\n" + result.stdout + "\n\nSTDERR:\n" + result.stderr)
+                return False, training_time, 0.0, f"Training failed with code {result.returncode}. Check {work_dir}/training.log", ""
 
         except subprocess.TimeoutExpired:
             return False, config.training_timeout, 0.0, "Training timeout", ""
@@ -177,29 +188,20 @@ class AlphaZeroSweep:
             return False, 0.0, 0.0, str(e), ""
 
     def run_tournament_only(self, config: ExperimentConfig, model_file: str = "alphazero_model.bin") -> Tuple[bool, str, str, str]:
-        """Run only the tournament phase of an experiment with specific model file"""
+        """Run only the tournament phase of an experiment with isolated model file"""
         work_dir = self.results_dir / config.name
 
-        # Temporarily copy the model to the expected filename for this tournament
-        temp_model = f"alphazero_model_temp_{config.name}.bin"
-        model_restored = False
-
         try:
-            # Create a temporary copy so tournament can find the model
-            if Path(model_file).exists() and model_file != "alphazero_model.bin":
-                import shutil
-                shutil.copy2(model_file, temp_model)
-                if Path("alphazero_model.bin").exists():
-                    Path("alphazero_model.bin").rename(f"alphazero_model_backup_{config.name}.bin")
-                Path(temp_model).rename("alphazero_model.bin")
-                model_restored = True
-
+            # Run tournament in container - copy unique model to expected filename
+            cmd = [
+                "podman", "exec", "cuda-dev", "bash", "-c",
+                f"cd /workspace/mnk && cp {model_file} alphazero_model.bin && LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/lib64:/usr/local/nccl/lib:/usr/local/cuda-12/lib64:/usr/local/lib ./target/release/mnk_game && rm alphazero_model.bin"
+            ]
             result = subprocess.run(
-                ['./target/release/mnk_game'],
+                cmd,
                 capture_output=True,
                 text=True,
-                timeout=config.tournament_timeout,
-                cwd='.'
+                timeout=config.tournament_timeout
             )
 
             if result.returncode == 0:
@@ -226,14 +228,6 @@ class AlphaZeroSweep:
             return False, "TIMEOUT", "TIMEOUT", "TIMEOUT"
         except Exception as e:
             return False, "ERROR", "ERROR", "ERROR"
-        finally:
-            # Restore original model file structure
-            if model_restored:
-                if Path("alphazero_model.bin").exists():
-                    Path("alphazero_model.bin").rename(temp_model)
-                backup_file = f"alphazero_model_backup_{config.name}.bin"
-                if Path(backup_file).exists():
-                    Path(backup_file).rename("alphazero_model.bin")
 
     def get_current_vram_usage(self) -> int:
         """Get current GPU memory usage in MB"""
@@ -654,7 +648,7 @@ class AlphaZeroSweep:
             final_table.add_column(col, style="cyan" if col == "Experiment" else None)
 
         for _, row in df.iterrows():
-            final_table.add_row(*[str(val) for val in row.values()])
+            final_table.add_row(*[str(val) for val in row.values])
 
         console.print(final_table)
 

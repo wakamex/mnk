@@ -57,6 +57,10 @@ struct Args {
     /// MCTS simulations per position during self-play
     #[arg(long, default_value = "50")]
     mcts_simulations: usize,
+
+    /// Output path for the trained model
+    #[arg(long, default_value = "alphazero_model.bin")]
+    model_path: String,
 }
 
 fn main() {
@@ -347,8 +351,13 @@ fn main() {
     use burn::record::{BinFileRecorder, FullPrecisionSettings, Recorder};
     let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
 
-    match recorder.record(net.clone().into_record(), "alphazero_model".into()) {
-        Ok(_) => println!("✅ Model saved successfully to 'alphazero_model.bin'!"),
+    let model_name = if args.model_path.ends_with(".bin") {
+        &args.model_path[..args.model_path.len()-4]
+    } else {
+        &args.model_path
+    };
+    match recorder.record(net.clone().into_record(), model_name.into()) {
+        Ok(_) => println!("✅ Model saved successfully to '{}'!", args.model_path),
         Err(e) => println!("❌ Failed to save model: {:?}", e),
     }
 
