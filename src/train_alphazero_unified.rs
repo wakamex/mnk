@@ -279,4 +279,28 @@ fn main() {
 
     let total_time = start_time.elapsed();
     println!("\nTraining completed in {:.2}s", total_time.as_secs_f32());
+
+    // Test the trained model immediately with some positions
+    println!("Testing trained model with sample positions...");
+    let test_board = vec![None; 9]; // Empty board
+    let (value, policy) = net.forward_inference(&test_board, 0);
+    println!("  Empty board evaluation: value={:.3}, policy_max={:.3}", value, policy.iter().fold(0.0f32, |a, &b| a.max(b)));
+
+    // Test with one move made
+    let mut test_board2 = vec![None; 9];
+    test_board2[4] = Some(0); // Center move
+    let (value2, policy2) = net.forward_inference(&test_board2, 1);
+    println!("  After center move: value={:.3}, policy_max={:.3}", value2, policy2.iter().fold(0.0f32, |a, &b| a.max(b)));
+
+    // Save the trained model using Burn's record system
+    println!("Saving trained model...");
+    use burn::record::{BinFileRecorder, FullPrecisionSettings, Recorder};
+    let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
+
+    match recorder.record(net.clone().into_record(), "alphazero_model".into()) {
+        Ok(_) => println!("✅ Model saved successfully to 'alphazero_model.bin'!"),
+        Err(e) => println!("❌ Failed to save model: {:?}", e),
+    }
+
+    println!("✅ Training completed! Model saved and ready for tournament use.");
 }

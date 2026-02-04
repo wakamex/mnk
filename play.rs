@@ -730,8 +730,32 @@ impl AlphaZeroStrategy {
         #[cfg(not(feature = "cuda"))]
         let device = MyDevice::default();
 
-        // Create a new network (in production, we'd load actual trained weights)
-        let net = AlphaZeroNet::<MyBackend>::new(&device);
+        // Load trained network or create new one based on training level
+        let net = match training {
+            TrainingLevel::Trained => {
+                // Try to load the trained model
+                use burn::record::{BinFileRecorder, FullPrecisionSettings, Recorder};
+                let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
+
+                match recorder.load("alphazero_model".into(), &device) {
+                    Ok(record) => {
+                        let loaded_net = AlphaZeroNet::<MyBackend>::new(&device).load_record(record);
+                        println!("✅ Loaded trained AlphaZero model from 'alphazero_model.bin'");
+                        loaded_net
+                    }
+                    Err(e) => {
+                        println!("⚠️  Failed to load trained model: {:?}", e);
+                        println!("   Using untrained network instead");
+                        println!("   Make sure to run training first: ./target/release/train_alphazero");
+                        AlphaZeroNet::<MyBackend>::new(&device)
+                    }
+                }
+            }
+            TrainingLevel::Untrained => {
+                println!("🔄 Creating new untrained network");
+                AlphaZeroNet::<MyBackend>::new(&device)
+            }
+        };
 
         Self {
             net,
