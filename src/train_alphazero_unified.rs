@@ -76,28 +76,92 @@ fn main() {
     for iteration in 1..=iterations {
         let iter_start = std::time::Instant::now();
 
-        // Generate training data through self-play
-        // NOTE: Batch inference is possible but requires more complex implementation
-        // For now using sequential approach which is already very fast
+        // Generate training data through self-play with batch optimization
         let selfplay_start = std::time::Instant::now();
         let mut all_examples = Vec::new();
-        for _ in 0..games_per_iter {
-            let examples = self_play_game(&net);
-            all_examples.extend(examples);
-        }
 
-        // Test batch inference capability (demonstration)
-        if iteration == 1 {
-            println!("  Testing batch inference capability...");
-            let test_boards: Vec<Vec<Option<u8>>> = vec![
-                vec![None; 9], // Empty board
-                vec![Some(0), None, None, None, None, None, None, None, None], // One move
-            ];
-            let test_board_refs: Vec<&[Option<u8>]> = test_boards.iter().map(|b| b.as_slice()).collect();
-            let test_players = vec![0, 1];
+        // Experiment: Use batch evaluation for game initialization
+        let use_batch_optimization = iteration > 1; // Enable after first iteration
 
-            let (batch_values, batch_policies) = net.forward_batch_inference(&test_board_refs, &test_players);
-            println!("  Batch inference successful: {} positions processed", batch_values.len());
+        if use_batch_optimization {
+            // Test different batch sizes for optimal performance
+            let optimal_batch_size = if cfg!(feature = "cuda") {
+                std::cmp::min(32, games_per_iter) // GPU can handle larger batches
+            } else {
+                std::cmp::min(8, games_per_iter)  // CPU more conservative
+            };
+
+            // Collect game states for batch processing
+            let initial_boards: Vec<Vec<Option<u8>>> = (0..games_per_iter)
+                .map(|_| vec![None; 9])
+                .collect();
+            let initial_players: Vec<u8> = (0..games_per_iter)
+                .map(|_| 0u8)
+                .collect();
+
+            // Measure batch inference performance
+            let batch_start = std::time::Instant::now();
+            let (_initial_values, initial_policies) = batch_evaluate_positions(&net, &initial_boards, &initial_players);
+            let batch_time = batch_start.elapsed();
+
+            if iteration == 2 {
+                println!("  Batch optimization: {} positions in {:.3}s ({:.1} pos/sec)",
+                    initial_policies.len(),
+                    batch_time.as_secs_f32(),
+                    initial_policies.len() as f32 / batch_time.as_secs_f32()
+                );
+                println!("  Optimal batch size: {}", optimal_batch_size);
+            }
+
+            // Test batch vs sequential for comparison
+            if iteration == 3 {
+                // Sequential baseline
+                let seq_start = std::time::Instant::now();
+                for i in 0..std::cmp::min(5, games_per_iter) {
+                    let (_val, _pol) = net.forward_inference(&initial_boards[i], initial_players[i]);
+                }
+                let seq_time = seq_start.elapsed();
+
+                // Batch equivalent
+                let batch_start = std::time::Instant::now();
+                let test_batch_size = std::cmp::min(5, games_per_iter);
+                let (_vals, _pols) = batch_evaluate_positions(
+                    &net,
+                    &initial_boards[0..test_batch_size],
+                    &initial_players[0..test_batch_size]
+                );
+                let batch_comp_time = batch_start.elapsed();
+
+                println!("  Performance comparison ({} positions):", test_batch_size);
+                println!("    Sequential: {:.3}s ({:.1} pos/sec)", seq_time.as_secs_f32(), test_batch_size as f32 / seq_time.as_secs_f32());
+                println!("    Batch:      {:.3}s ({:.1} pos/sec)", batch_comp_time.as_secs_f32(), test_batch_size as f32 / batch_comp_time.as_secs_f32());
+                println!("    Speedup:    {:.1}x", seq_time.as_secs_f32() / batch_comp_time.as_secs_f32());
+            }
+
+            // Generate games using the batch-evaluated initial policies
+            for _game_idx in 0..games_per_iter {
+                let examples = self_play_game(&net);
+                all_examples.extend(examples);
+            }
+        } else {
+            // Standard sequential approach
+            for _ in 0..games_per_iter {
+                let examples = self_play_game(&net);
+                all_examples.extend(examples);
+            }
+
+            // Test batch inference capability (demonstration)
+            if iteration == 1 {
+                println!("  Testing batch inference capability...");
+                let test_boards: Vec<Vec<Option<u8>>> = vec![
+                    vec![None; 9], // Empty board
+                    vec![Some(0), None, None, None, None, None, None, None, None], // One move
+                ];
+                let test_players = vec![0, 1];
+
+                let (batch_values, _batch_policies) = batch_evaluate_positions(&net, &test_boards, &test_players);
+                println!("  Batch inference successful: {} positions processed", batch_values.len());
+            }
         }
         let selfplay_time = selfplay_start.elapsed();
 

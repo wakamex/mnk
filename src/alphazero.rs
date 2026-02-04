@@ -197,12 +197,53 @@ pub fn simple_mcts<B: Backend<FloatElem = f32>>(
         }
     }
 
-    // Normalize
-    let total: f32 = visit_counts.iter().sum();
-    if total > 0.0 {
-        visit_counts.iter_mut().for_each(|v| *v /= total);
+    // Normalize visit counts to probabilities
+    let total_visits: f32 = visit_counts.iter().sum();
+    if total_visits > 0.0 {
+        for count in &mut visit_counts {
+            *count /= total_visits;
+        }
     }
+
     visit_counts
+}
+
+// Simplified batched approach: evaluate first position of multiple games simultaneously
+pub fn batched_mcts<B: Backend<FloatElem = f32>>(
+    net: &AlphaZeroNet<B>,
+    boards: &[Vec<Option<u8>>],
+    players: &[u8],
+    simulations_per_position: usize,
+) -> Vec<Vec<f32>> {
+    assert_eq!(boards.len(), players.len());
+
+    let mut all_visit_counts = Vec::with_capacity(boards.len());
+
+    for (board, &player) in boards.iter().zip(players.iter()) {
+        // For now, use the original MCTS for each position
+        // This is a stepping stone to full batched implementation
+        let visit_counts = simple_mcts(net, board, player, simulations_per_position);
+        all_visit_counts.push(visit_counts);
+    }
+
+    all_visit_counts
+}
+
+// Demonstration of batch inference potential - process root positions together
+pub fn batch_evaluate_positions<B: Backend<FloatElem = f32>>(
+    net: &AlphaZeroNet<B>,
+    boards: &[Vec<Option<u8>>],
+    players: &[u8],
+) -> (Vec<f32>, Vec<Vec<f32>>) {
+    if boards.is_empty() {
+        return (vec![], vec![]);
+    }
+
+    // Convert to references for batch processing
+    let board_refs: Vec<&[Option<u8>]> = boards.iter().map(|b| b.as_slice()).collect();
+
+    // Use our batch inference capability
+    net.forward_batch_inference(&board_refs, players)
 }
 
 pub fn self_play_game<B: Backend<FloatElem = f32>>(net: &AlphaZeroNet<B>) -> Vec<TrainingExample> {
