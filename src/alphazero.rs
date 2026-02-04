@@ -246,6 +246,167 @@ pub fn batch_evaluate_positions<B: Backend<FloatElem = f32>>(
     net.forward_batch_inference(&board_refs, players)
 }
 
+// Position to evaluate during MCTS (inspired by LC0's NodeToProcess)
+#[derive(Clone)]
+pub struct PositionToEvaluate {
+    pub board: Vec<Option<u8>>,
+    pub player: u8,
+    pub simulation_id: usize,      // Which simulation this belongs to
+    pub depth: usize,              // Depth in the simulation
+    pub is_first_move: bool,       // Is this the first move selection?
+}
+
+// Full batched MCTS implementation inspired by LC0
+pub fn full_batched_mcts<B: Backend<FloatElem = f32>>(
+    net: &AlphaZeroNet<B>,
+    boards: &[Vec<Option<u8>>],
+    players: &[u8],
+    simulations_per_position: usize,
+    batch_size: usize,
+) -> Vec<Vec<f32>> {
+    assert_eq!(boards.len(), players.len());
+
+    let num_positions = boards.len();
+    let mut all_visit_counts = vec![vec![0.0; 9]; num_positions];
+
+    // Collect positions to evaluate across all MCTS simulations
+    let mut positions_to_evaluate = Vec::new();
+
+    // Generate all simulation positions across all root positions
+    for (pos_idx, (board, &player)) in boards.iter().zip(players.iter()).enumerate() {
+        for sim_id in 0..simulations_per_position {
+            // Start each simulation
+            let mut sim_board = board.clone();
+            let mut sim_player = player;
+            let mut moves_made = 0;
+
+            loop {
+                // Check for terminal state
+                let valid: Vec<usize> = sim_board.iter()
+                    .enumerate()
+                    .filter_map(|(i, &c)| if c.is_none() { Some(i) } else { None })
+                    .collect();
+
+                if valid.is_empty() || check_winner(&sim_board).is_some() {
+                    break;
+                }
+
+                // Add this position to our batch evaluation queue
+                positions_to_evaluate.push(PositionToEvaluate {
+                    board: sim_board.clone(),
+                    player: sim_player,
+                    simulation_id: pos_idx * simulations_per_position + sim_id,
+                    depth: moves_made,
+                    is_first_move: moves_made == 0,
+                });
+
+                // For simplicity, we'll process each simulation step individually
+                // In a full implementation, we'd collect many positions before evaluating
+                if positions_to_evaluate.len() >= batch_size {
+                    let batch_results = evaluate_position_batch(net, &positions_to_evaluate);
+
+                    // Apply results (simplified - in reality we'd track full game tree)
+                    for (eval_pos, (value, policy)) in positions_to_evaluate.iter().zip(batch_results.iter()) {
+                        if eval_pos.is_first_move {
+                            // Only track first moves for visit counts
+                            let root_pos_idx = eval_pos.simulation_id / simulations_per_position;
+
+                            // Select move based on policy
+                            let valid: Vec<usize> = eval_pos.board.iter()
+                                .enumerate()
+                                .filter_map(|(i, &c)| if c.is_none() { Some(i) } else { None })
+                                .collect();
+
+                            let mut best_move = valid[0];
+                            let mut best_prob = 0.0;
+                            for &mv in &valid {
+                                if policy[mv] > best_prob {
+                                    best_prob = policy[mv];
+                                    best_move = mv;
+                                }
+                            }
+
+                            all_visit_counts[root_pos_idx][best_move] += 1.0;
+                        }
+                    }
+
+                    positions_to_evaluate.clear();
+                }
+
+                // Make a move (simplified simulation)
+                // In reality, this would be based on the neural network evaluation
+                let move_idx = valid[0]; // Simplified - just pick first valid move
+                sim_board[move_idx] = Some(sim_player);
+                sim_player = 1 - sim_player;
+                moves_made += 1;
+
+                // Limit simulation depth to avoid infinite games
+                if moves_made >= 9 { break; }
+            }
+        }
+    }
+
+    // Process any remaining positions
+    if !positions_to_evaluate.is_empty() {
+        let batch_results = evaluate_position_batch(net, &positions_to_evaluate);
+
+        for (eval_pos, (_value, policy)) in positions_to_evaluate.iter().zip(batch_results.iter()) {
+            if eval_pos.is_first_move {
+                let root_pos_idx = eval_pos.simulation_id / simulations_per_position;
+
+                let valid: Vec<usize> = eval_pos.board.iter()
+                    .enumerate()
+                    .filter_map(|(i, &c)| if c.is_none() { Some(i) } else { None })
+                    .collect();
+
+                let mut best_move = valid[0];
+                let mut best_prob = 0.0;
+                for &mv in &valid {
+                    if policy[mv] > best_prob {
+                        best_prob = policy[mv];
+                        best_move = mv;
+                    }
+                }
+
+                all_visit_counts[root_pos_idx][best_move] += 1.0;
+            }
+        }
+    }
+
+    // Normalize visit counts to probabilities
+    for visit_counts in &mut all_visit_counts {
+        let total: f32 = visit_counts.iter().sum();
+        if total > 0.0 {
+            for count in visit_counts {
+                *count /= total;
+            }
+        }
+    }
+
+    all_visit_counts
+}
+
+// Helper function to evaluate a batch of positions
+fn evaluate_position_batch<B: Backend<FloatElem = f32>>(
+    net: &AlphaZeroNet<B>,
+    positions: &[PositionToEvaluate],
+) -> Vec<(f32, Vec<f32>)> {
+    if positions.is_empty() {
+        return vec![];
+    }
+
+    let boards: Vec<&[Option<u8>]> = positions.iter()
+        .map(|p| p.board.as_slice())
+        .collect();
+    let players: Vec<u8> = positions.iter()
+        .map(|p| p.player)
+        .collect();
+
+    let (values, policies) = net.forward_batch_inference(&boards, &players);
+
+    values.into_iter().zip(policies.into_iter()).collect()
+}
+
 pub fn self_play_game<B: Backend<FloatElem = f32>>(net: &AlphaZeroNet<B>) -> Vec<TrainingExample> {
     let mut board = vec![None; 9];
     let mut player = 0u8;

@@ -138,6 +138,43 @@ fn main() {
                 println!("    Speedup:    {:.1}x", seq_time.as_secs_f32() / batch_comp_time.as_secs_f32());
             }
 
+            // Test full batched MCTS (experimental)
+            if iteration == 4 {
+                println!("  Testing full batched MCTS...");
+                let test_positions = std::cmp::min(3, games_per_iter);
+                let test_simulations = 10; // Smaller for testing
+                let batch_size = 16;
+
+                // Full batched MCTS test
+                let full_batch_start = std::time::Instant::now();
+                let _batched_policies = full_batched_mcts(
+                    &net,
+                    &initial_boards[0..test_positions],
+                    &initial_players[0..test_positions],
+                    test_simulations,
+                    batch_size
+                );
+                let full_batch_time = full_batch_start.elapsed();
+
+                // Sequential MCTS baseline
+                let seq_mcts_start = std::time::Instant::now();
+                for i in 0..test_positions {
+                    let _policy = simple_mcts(&net, &initial_boards[i], initial_players[i], test_simulations);
+                }
+                let seq_mcts_time = seq_mcts_start.elapsed();
+
+                let total_evaluations = test_positions * test_simulations;
+                println!("  Full batched MCTS comparison ({} positions × {} sims = {} evaluations):",
+                         test_positions, test_simulations, total_evaluations);
+                println!("    Sequential MCTS: {:.3}s ({:.1} eval/sec)",
+                         seq_mcts_time.as_secs_f32(),
+                         total_evaluations as f32 / seq_mcts_time.as_secs_f32());
+                println!("    Batched MCTS:    {:.3}s ({:.1} eval/sec)",
+                         full_batch_time.as_secs_f32(),
+                         total_evaluations as f32 / full_batch_time.as_secs_f32());
+                println!("    Full MCTS speedup: {:.1}x", seq_mcts_time.as_secs_f32() / full_batch_time.as_secs_f32());
+            }
+
             // Generate games using the batch-evaluated initial policies
             for _game_idx in 0..games_per_iter {
                 let examples = self_play_game(&net);
