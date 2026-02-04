@@ -1,35 +1,76 @@
 // Simplified AlphaZero with Burn that actually compiles and works
 
 use burn::prelude::*;
-use burn::nn::{Linear, LinearConfig};
+use burn::nn::{Linear, LinearConfig, conv::Conv2d, conv::Conv2dConfig,
+               PaddingConfig2d};
 use burn::tensor::activation;
 use burn::module::Module;
 use rand::seq::SliceRandom;
 
 #[derive(Module, Debug)]
 pub struct AlphaZeroNet<B: Backend> {
-    fc1: Linear<B>,
-    fc2: Linear<B>,
-    value_head: Linear<B>,
-    policy_head: Linear<B>,
+    // Shared convolutional layers (matching other repos)
+    conv1: Conv2d<B>,
+    conv2: Conv2d<B>,
+    conv3: Conv2d<B>,
+
+
+    // Policy head
+    policy_conv: Conv2d<B>,
+    policy_fc: Linear<B>,
+
+    // Value head
+    value_conv: Conv2d<B>,
+    value_fc1: Linear<B>,
+    value_fc2: Linear<B>,
 }
 
 impl<B: Backend> AlphaZeroNet<B> {
     pub fn new(device: &B::Device) -> Self {
         Self {
-            fc1: LinearConfig::new(9, 128).init(device),
-            fc2: LinearConfig::new(128, 64).init(device),
-            value_head: LinearConfig::new(64, 1).init(device),
-            policy_head: LinearConfig::new(64, 9).init(device),
+            // Shared convolutional backbone: 1 -> 32 -> 64 -> 128 filters
+            conv1: Conv2dConfig::new([1, 32], [3, 3])
+                .with_padding(PaddingConfig2d::Same)
+                .init(device),
+            conv2: Conv2dConfig::new([32, 64], [3, 3])
+                .with_padding(PaddingConfig2d::Same)
+                .init(device),
+            conv3: Conv2dConfig::new([64, 128], [3, 3])
+                .with_padding(PaddingConfig2d::Same)
+                .init(device),
+
+
+            // Policy head (action selection)
+            policy_conv: Conv2dConfig::new([128, 4], [1, 1]).init(device),
+            policy_fc: LinearConfig::new(4 * 3 * 3, 9).init(device), // 4 channels * 3x3 board -> 9 moves
+
+            // Value head (position evaluation)
+            value_conv: Conv2dConfig::new([128, 2], [1, 1]).init(device),
+            value_fc1: LinearConfig::new(2 * 3 * 3, 64).init(device), // 2 channels * 3x3 board -> 64 hidden
+            value_fc2: LinearConfig::new(64, 1).init(device), // 64 hidden -> 1 value
         }
     }
 
     pub fn forward(&self, x: Tensor<B, 2>) -> (Tensor<B, 2>, Tensor<B, 2>) {
-        let x = activation::relu(self.fc1.forward(x));
-        let x = activation::relu(self.fc2.forward(x));
+        // Reshape input from [batch_size, 9] to [batch_size, 1, 3, 3]
+        let batch_size = x.dims()[0];
+        let x = x.reshape([batch_size, 1, 3, 3]);
 
-        let value = activation::tanh(self.value_head.forward(x.clone()));
-        let policy = activation::softmax(self.policy_head.forward(x), 1);
+        // Shared convolutional backbone
+        let x = activation::relu(self.conv1.forward(x));
+        let x = activation::relu(self.conv2.forward(x));
+        let x = activation::relu(self.conv3.forward(x)); // [batch_size, 128, 3, 3]
+
+        // Policy head
+        let policy_x = activation::relu(self.policy_conv.forward(x.clone())); // [batch_size, 4, 3, 3]
+        let policy_x = policy_x.flatten(1, 3); // Flatten from dim 1 to 3 -> [batch_size, 4*3*3]
+        let policy = activation::softmax(self.policy_fc.forward(policy_x), 1); // [batch_size, 9]
+
+        // Value head
+        let value_x = activation::relu(self.value_conv.forward(x)); // [batch_size, 2, 3, 3]
+        let value_x = value_x.flatten(1, 3); // Flatten from dim 1 to 3 -> [batch_size, 2*3*3]
+        let value_x = activation::relu(self.value_fc1.forward(value_x)); // [batch_size, 64]
+        let value = activation::tanh(self.value_fc2.forward(value_x)); // [batch_size, 1]
 
         (value, policy)
     }
@@ -38,7 +79,7 @@ impl<B: Backend> AlphaZeroNet<B> {
     where
         B: Backend<FloatElem = f32>,
     {
-        let input = board_to_tensor(board, player, &self.fc1.devices()[0]);
+        let input = board_to_tensor(board, player, &self.conv1.devices()[0]);
         let (value, policy) = self.forward(input);
 
         // Convert to scalar and vector
@@ -65,7 +106,7 @@ impl<B: Backend> AlphaZeroNet<B> {
             return (vec![], vec![]);
         }
 
-        let device = &self.fc1.devices()[0];
+        let device = &self.conv1.devices()[0];
         let batch_size = boards.len();
 
         // Create batch input tensor
@@ -193,12 +234,19 @@ pub fn simple_mcts<B: Backend<FloatElem = f32>>(
             sim_player = 1 - sim_player;
         }
 
+        // CRITICAL FIX: Evaluate game outcome and propagate value
+        let game_value = if let Some(winner) = check_winner(&sim_board) {
+            if winner == player { 1.0 } else { -1.0 } // Win/loss from current player's perspective
+        } else {
+            0.0 // Draw
+        };
+
         if let Some(mv) = first_move {
-            visit_counts[mv] += 1.0;
+            visit_counts[mv] += 1.0 + game_value; // Weight by outcome, not just frequency
         }
     }
 
-    // Normalize visit counts to probabilities
+    // Normalize to probabilities (visit counts now include outcome weighting)
     let total_visits: f32 = visit_counts.iter().sum();
     if total_visits > 0.0 {
         for count in &mut visit_counts {
@@ -1034,7 +1082,7 @@ fn evaluate_position_batch<B: Backend<FloatElem = f32>>(
     values.into_iter().zip(policies.into_iter()).collect()
 }
 
-pub fn self_play_game<B: Backend<FloatElem = f32>>(net: &AlphaZeroNet<B>) -> Vec<TrainingExample> {
+pub fn self_play_game<B: Backend<FloatElem = f32>>(net: &AlphaZeroNet<B>, mcts_simulations: usize) -> Vec<TrainingExample> {
     let mut board = vec![None; 9];
     let mut player = 0u8;
     let mut examples: Vec<TrainingExample> = Vec::new();
@@ -1059,7 +1107,7 @@ pub fn self_play_game<B: Backend<FloatElem = f32>>(net: &AlphaZeroNet<B>) -> Vec
             return examples;
         }
 
-        let policy = simple_mcts(net, &board, player, 25);
+        let policy = simple_mcts(net, &board, player, mcts_simulations); // Configurable MCTS simulations
         examples.push(TrainingExample {
             board: board.clone(),
             player,
@@ -1098,7 +1146,8 @@ pub fn self_play_game<B: Backend<FloatElem = f32>>(net: &AlphaZeroNet<B>) -> Vec
 
 pub fn self_play_game_with_batched_policy<B: Backend<FloatElem = f32>>(
     net: &AlphaZeroNet<B>,
-    initial_policy: &[f32]
+    initial_policy: &[f32],
+    mcts_simulations: usize
 ) -> Vec<TrainingExample> {
     let mut board = vec![None; 9];
     let mut player = 0u8;
@@ -1129,7 +1178,7 @@ pub fn self_play_game_with_batched_policy<B: Backend<FloatElem = f32>>(
         let policy = if move_count == 0 {
             initial_policy.to_vec()
         } else {
-            simple_mcts(net, &board, player, 25)
+            simple_mcts(net, &board, player, mcts_simulations) // Configurable MCTS simulations
         };
 
         examples.push(TrainingExample {

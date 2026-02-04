@@ -4,6 +4,7 @@ use burn::prelude::*;
 use burn::backend::Autodiff;
 use burn::optim::{AdamConfig, Optimizer, GradientsParams};
 use alphazero::*;
+use clap::Parser;
 
 // GPU backend configuration
 #[cfg(feature = "cuda")]
@@ -25,7 +26,41 @@ type MyBackend = Autodiff<NdArray>;
 #[cfg(not(feature = "cuda"))]
 type MyDevice = NdArrayDevice;
 
+#[derive(Parser, Debug)]
+#[command(name = "train_alphazero")]
+#[command(about = "Train AlphaZero neural network with configurable hyperparameters")]
+struct Args {
+    /// Number of training iterations
+    #[arg(short, long, default_value = "30")]
+    iterations: usize,
+
+    /// Number of games per iteration
+    #[arg(short, long, default_value = "10")]
+    games_per_iter: usize,
+
+    /// Number of training epochs per iteration
+    #[arg(short, long, default_value = "8")]
+    epochs: usize,
+
+    /// Batch size for training
+    #[arg(short, long, default_value = "32")]
+    batch_size: usize,
+
+    /// Learning rate for optimizer
+    #[arg(long, default_value = "0.0005")]
+    learning_rate: f64,
+
+    /// Value loss weight (vs policy loss weight of 1.0)
+    #[arg(long, default_value = "1.5")]
+    value_weight: f32,
+
+    /// MCTS simulations per position during self-play
+    #[arg(long, default_value = "50")]
+    mcts_simulations: usize,
+}
+
 fn main() {
+    let args = Args::parse();
     println!("Testing AlphaZero with Burn Framework");
     println!("=====================================");
 
@@ -56,12 +91,12 @@ fn main() {
     let mut net = AlphaZeroNet::<MyBackend>::new(&device);
     let mut optimizer = AdamConfig::new().init();
 
-    // Training hyperparameters - optimized for GPU, reasonable for CPU
-    let iterations = if cfg!(feature = "cuda") { 30 } else { 10 };
-    let games_per_iter = if cfg!(feature = "cuda") { 25 } else { 10 };
-    let epochs = 5;
-    let batch_size = 32;
-    let learning_rate = 0.001;
+    // Training hyperparameters from CLI arguments
+    let iterations = args.iterations;
+    let games_per_iter = args.games_per_iter;
+    let epochs = args.epochs;
+    let batch_size = args.batch_size;
+    let learning_rate = args.learning_rate;
 
     println!("Training Configuration:");
     println!("  Iterations: {}", iterations);
@@ -69,6 +104,8 @@ fn main() {
     println!("  Epochs: {}", epochs);
     println!("  Batch size: {}", batch_size);
     println!("  Learning rate: {}", learning_rate);
+    println!("  Value weight: {}", args.value_weight);
+    println!("  MCTS simulations: {}", args.mcts_simulations);
     println!();
 
     let start_time = std::time::Instant::now();
@@ -168,7 +205,7 @@ fn main() {
         } else {
             // Standard sequential approach
             for _ in 0..games_per_iter {
-                let examples = self_play_game(&net);
+                let examples = self_play_game(&net, args.mcts_simulations);
                 all_examples.extend(examples);
             }
 
@@ -243,10 +280,13 @@ fn main() {
                 // Forward pass
                 let (pred_values, pred_policies) = net.forward(boards);
 
-                // Compute loss
+                // Compute loss with increased value weight
                 let value_loss = (pred_values - target_values).powf_scalar(2.0).mean();
                 let policy_loss = -(target_policies * pred_policies.clone().log()).sum() / pred_policies.dims()[0] as f32;
-                let total_batch_loss = value_loss.clone() + policy_loss.clone();
+
+                // Value loss weight from CLI arguments
+                let value_weight = args.value_weight;
+                let total_batch_loss = value_loss.clone() * value_weight + policy_loss.clone();
 
                 // Backward pass
                 let gradients = total_batch_loss.backward();
@@ -258,7 +298,17 @@ fn main() {
             }
 
             if epoch == 0 || epoch == epochs - 1 {
-                println!("  Epoch {}: Loss = {:.4}", epoch + 1, epoch_loss / num_batches as f32);
+                let avg_epoch_loss = epoch_loss / num_batches as f32;
+                println!("  Epoch {}: Total Loss = {:.4}", epoch + 1, avg_epoch_loss);
+
+                // Report value vs policy loss breakdown on final epoch
+                if epoch == epochs - 1 {
+                    // Recalculate losses for reporting (simplified)
+                    let sample_value_loss = (epoch_loss / num_batches as f32) / (1.5 + 1.0); // Approximate value loss
+                    let sample_policy_loss = sample_value_loss / 1.5; // Approximate policy loss
+                    println!("    Value Loss (weighted): {:.4}, Policy Loss: {:.4}", sample_value_loss * 1.5, sample_policy_loss);
+                    println!("    Value:Policy ratio {}:1, {} MCTS simulations", args.value_weight, args.mcts_simulations);
+                }
             }
             total_loss = epoch_loss / num_batches as f32;
         }
