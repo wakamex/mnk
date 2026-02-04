@@ -469,6 +469,79 @@ pub fn self_play_game<B: Backend<FloatElem = f32>>(net: &AlphaZeroNet<B>) -> Vec
     }
 }
 
+pub fn self_play_game_with_batched_policy<B: Backend<FloatElem = f32>>(
+    net: &AlphaZeroNet<B>,
+    initial_policy: &[f32]
+) -> Vec<TrainingExample> {
+    let mut board = vec![None; 9];
+    let mut player = 0u8;
+    let mut examples: Vec<TrainingExample> = Vec::new();
+    let mut move_count = 0;
+
+    loop {
+        let valid: Vec<usize> = board.iter()
+            .enumerate()
+            .filter_map(|(i, &c)| if c.is_none() { Some(i) } else { None })
+            .collect();
+
+        if valid.is_empty() {
+            for ex in &mut examples {
+                ex.value = 0.0; // Draw
+            }
+            return examples;
+        }
+
+        if let Some(winner) = check_winner(&board) {
+            for ex in &mut examples {
+                ex.value = if ex.player == winner { 1.0 } else { -1.0 };
+            }
+            return examples;
+        }
+
+        // Use batched policy for first move, then fall back to regular MCTS
+        let policy = if move_count == 0 {
+            initial_policy.to_vec()
+        } else {
+            simple_mcts(net, &board, player, 25)
+        };
+
+        examples.push(TrainingExample {
+            board: board.clone(),
+            player,
+            policy: policy.clone(),
+            value: 0.0,
+        });
+
+        // Select move (temperature for first 2 moves)
+        let selected = if examples.len() <= 2 {
+            // Sample from distribution
+            let r = rand::random::<f32>();
+            let mut cumsum = 0.0;
+            let mut selected = valid[0];
+            for i in 0..9 {
+                cumsum += policy[i];
+                if cumsum > r && board[i].is_none() {
+                    selected = i;
+                    break;
+                }
+            }
+            selected
+        } else {
+            // Greedy
+            policy.iter()
+                .enumerate()
+                .filter(|(i, _)| board[*i].is_none())
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                .map(|(i, _)| i)
+                .unwrap()
+        };
+
+        board[selected] = Some(player);
+        player = 1 - player;
+        move_count += 1;
+    }
+}
+
 pub fn evaluate_vs_random<B: Backend<FloatElem = f32>>(net: &AlphaZeroNet<B>) -> f32 {
     let mut wins = 0;
     let mut draws = 0;

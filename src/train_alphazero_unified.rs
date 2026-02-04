@@ -82,6 +82,7 @@ fn main() {
 
         // Experiment: Use batch evaluation for game initialization
         let use_batch_optimization = iteration > 1; // Enable after first iteration
+        let use_production_batched_mcts = iteration > 5; // Enable production batching after iteration 5
 
         if use_batch_optimization {
             // Test different batch sizes for optimal performance
@@ -175,9 +176,31 @@ fn main() {
                 println!("    Full MCTS speedup: {:.1}x", seq_mcts_time.as_secs_f32() / full_batch_time.as_secs_f32());
             }
 
-            // Generate games using the batch-evaluated initial policies
-            for _game_idx in 0..games_per_iter {
-                let examples = self_play_game(&net);
+            // Generate games using full batched MCTS for optimal performance
+            let batch_size = if cfg!(feature = "cuda") { 32 } else { 16 };
+            let simulations_per_game = 25; // Standard MCTS simulations
+
+            // Use batched MCTS for all games simultaneously
+            let batch_start = std::time::Instant::now();
+            let batched_policies = full_batched_mcts(
+                &net,
+                &initial_boards,
+                &initial_players,
+                simulations_per_game,
+                batch_size
+            );
+            let batch_mcts_time = batch_start.elapsed();
+
+            if iteration == 2 {
+                println!("  Production batched MCTS: {:.3}s for {} games ({:.1} games/sec)",
+                         batch_mcts_time.as_secs_f32(),
+                         games_per_iter,
+                         games_per_iter as f32 / batch_mcts_time.as_secs_f32());
+            }
+
+            // Generate training examples using batched MCTS policies
+            for game_idx in 0..games_per_iter {
+                let examples = self_play_game_with_batched_policy(&net, &batched_policies[game_idx]);
                 all_examples.extend(examples);
             }
         } else {
