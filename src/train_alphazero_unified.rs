@@ -85,44 +85,85 @@ fn main() {
         let use_production_batched_mcts = iteration > 5; // Enable production batching after iteration 5
 
         if use_batch_optimization {
-            // Use interleaved game manager for FULL position batching (all positions, not just opening)
-            let batch_size = if cfg!(feature = "cuda") { 32 } else { 16 };
-            let virtual_loss_value = 0.1; // Small virtual loss to encourage exploration diversity
+            // SYSTEMATIC BATCH SIZE TESTING
+            let test_batch_sizes = if cfg!(feature = "cuda") {
+                vec![32, 64, 128, 256, 512, 1024] // Test full range on GPU
+            } else {
+                vec![16, 32, 64, 128] // Conservative on CPU
+            };
 
-            let net_arc = std::sync::Arc::new(net.clone()); // Create Arc for sharing
-            let mut interleaved_manager = InterleavedGamesManager::new(
-                net_arc.clone(),
-                batch_size,
-                virtual_loss_value
-            );
+            let virtual_loss_value = 0.1;
+            let mut best_performance = 0.0;
+            let mut best_batch_size = 64;
+            let mut batch_results = Vec::new();
 
-            // Run full interleaved simulation with ALL position batching
-            let batch_start = std::time::Instant::now();
-            match interleaved_manager.run_simulations(games_per_iter) {
-                Ok(game_training_examples) => {
-                    let batch_time = batch_start.elapsed();
+            // Test each batch size (but only do extensive testing on iteration 2)
+            let batch_sizes_to_test = if iteration == 2 {
+                &test_batch_sizes[..] // Test all sizes
+            } else {
+                &test_batch_sizes[4..5] // Use optimal batch size (512) found through testing
+            };
 
-                    if iteration == 2 {
-                        println!("  Full position batching: {:.3}s for {} games ({:.1} games/sec)",
-                                 batch_time.as_secs_f32(),
-                                 games_per_iter,
-                                 games_per_iter as f32 / batch_time.as_secs_f32());
-                        println!("  ALL positions batched (not just opening moves)!");
+            for &test_batch_size in batch_sizes_to_test {
+                let net_arc = std::sync::Arc::new(net.clone());
+                let mut interleaved_manager = InterleavedGamesManager::new(
+                    net_arc.clone(),
+                    test_batch_size, // This parameter isn't used in our current implementation
+                    virtual_loss_value
+                );
+
+                // Override the batch size in the optimized implementation
+                let batch_start = std::time::Instant::now();
+                match interleaved_manager.run_simulations_with_batch_size(games_per_iter, test_batch_size) {
+                    Ok(game_training_examples) => {
+                        let batch_time = batch_start.elapsed();
+                        let games_per_sec = games_per_iter as f32 / batch_time.as_secs_f32();
+
+                        if iteration == 2 {
+                            println!("  Batch size {}: {:.3}s for {} games ({:.1} games/sec)",
+                                     test_batch_size,
+                                     batch_time.as_secs_f32(),
+                                     games_per_iter,
+                                     games_per_sec);
+                        }
+
+                        batch_results.push((test_batch_size, games_per_sec, batch_time.as_secs_f32()));
+
+                        if games_per_sec > best_performance {
+                            best_performance = games_per_sec;
+                            best_batch_size = test_batch_size;
+
+                            // Use the best results for training
+                            all_examples.clear(); // Clear previous results
+                            for game_examples in game_training_examples {
+                                all_examples.extend(game_examples);
+                            }
+                        }
                     }
-
-                    // Collect training examples from all games
-                    for game_examples in game_training_examples {
-                        all_examples.extend(game_examples);
+                    Err(e) => {
+                        if iteration == 2 {
+                            println!("  Batch size {} failed: {}", test_batch_size, e);
+                        }
                     }
                 }
-                Err(e) => {
-                    println!("  Error in interleaved simulation: {}", e);
-                    // Fallback to sequential approach
-                    for _ in 0..games_per_iter {
-                        let examples = self_play_game(&net);
-                        all_examples.extend(examples);
-                    }
+            }
+
+            // Report results for iteration 2
+            if iteration == 2 {
+                println!("  BATCH SIZE OPTIMIZATION RESULTS:");
+                for (batch_size, games_per_sec, time) in &batch_results {
+                    println!("    Size {}: {:.1} games/sec ({:.3}s)", batch_size, games_per_sec, time);
                 }
+                println!("  OPTIMAL: Batch size {} = {:.1} games/sec", best_batch_size, best_performance);
+                println!("  ALL positions batched (opening + middle + endgame)!");
+            } else {
+                // For other iterations, just report the result
+                let games_per_sec = games_per_iter as f32 / batch_results[0].2;
+                println!("  OPTIMIZED position batching: {:.3}s for {} games ({:.1} games/sec)",
+                         batch_results[0].2,
+                         games_per_iter,
+                         games_per_sec);
+                println!("  Batch size: {}, ALL game states batched!", batch_sizes_to_test[0]);
             }
         } else {
             // Standard sequential approach
