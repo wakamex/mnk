@@ -9,11 +9,7 @@ path = "play.rs"
 
 [[bin]]
 name = "train_alphazero"
-path = "src/train_alphazero.rs"
-
-[[bin]]
-name = "train_alphazero_gpu"
-path = "src/train_alphazero_gpu.rs"
+path = "src/train_alphazero_unified.rs"
 
 [dependencies]
 rand = "0.8"

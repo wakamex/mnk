@@ -2,10 +2,8 @@
 
 use burn::prelude::*;
 use burn::nn::{Linear, LinearConfig};
-use burn::optim::{Adam, AdamConfig, GradientsParams, Optimizer};
 use burn::tensor::activation;
 use burn::module::Module;
-use burn::record::{CompactRecorder, Recorder};
 use rand::seq::SliceRandom;
 
 #[derive(Module, Debug)]
