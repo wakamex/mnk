@@ -461,85 +461,72 @@ class AlphaZeroSweep:
                         if exp.name in running_training:
                             del running_training[exp.name]
 
-                # Process tournaments that started during training
+                # Process tournaments with proper parallel queue management
                 print(f"\n📋 Tournament status: {len(tournament_futures)} running, {len(tournaments_pending)} pending")
 
-                # First, wait for any tournaments that are already running
-                for future in as_completed(tournament_futures):
-                    exp, train_time, empty_value = tournament_futures[future]
+                # Process running tournaments and submit pending ones as slots open
+                all_tournament_futures = list(tournament_futures.keys())
+                pending_queue = list(tournaments_pending)
 
-                    if exp.name in running_tournaments:
-                        del running_tournaments[exp.name]
-
-                    try:
-                        success, tournament_games_per_sec, vs_random, vs_deep, vs_medium = future.result()
-
-                        # Update final results
-                        training_games_per_sec = training_results[exp.name][3] if exp.name in training_results else 0.0
-                        final_results[exp.name] = ExperimentResult(
-                            name=exp.name,
-                            args=exp.args,
-                            training_time=train_time,
-                            training_success=True,
-                            empty_board_value=empty_value,
-                            vs_random=vs_random,
-                            vs_deep=vs_deep,
-                            vs_medium=vs_medium,
-                            tournament_success=success,
-                            total_time=train_time,  # Tournament runs concurrent, so don't add time
-                            training_games_per_sec=training_games_per_sec,
-                            tournament_games_per_sec=tournament_games_per_sec
-                        )
-
-                        if success:
-                            print(f"  ✅ Tournament: {exp.name} - Random={vs_random}, Deep={vs_deep}, Medium={vs_medium}, {tournament_games_per_sec:.1f} games/sec")
-                        else:
-                            print(f"  ❌ Tournament failed: {exp.name}")
-
-                    except Exception as e:
-                        print(f"❌ Tournament exception in {exp.name}: {e}")
-
-                # Now process any pending tournaments with proper executor submission
-                if tournaments_pending:
-                    print(f"\n🏆 Processing {len(tournaments_pending)} pending tournaments...")
-                    pending_futures = {}
-
-                    # Submit all pending tournaments to executor
-                    for exp, train_time, empty_value, model_file in tournaments_pending:
-                        print(f"  ▶️  Submitting tournament for {exp.name}...")
+                while all_tournament_futures or pending_queue:
+                    # Submit pending tournaments if we have capacity
+                    while pending_queue and len([f for f in all_tournament_futures if not f.done()]) < tournament_jobs:
+                        exp, train_time, empty_value, model_file = pending_queue.pop(0)
+                        print(f"  🏆 Starting queued tournament: {exp.name}")
                         future = executor.submit(self.run_tournament_only, exp, model_file)
-                        pending_futures[future] = (exp, train_time, empty_value)
+                        tournament_futures[future] = (exp, train_time, empty_value)
+                        all_tournament_futures.append(future)
+                        if exp.name in running_tournaments:
+                            running_tournaments[exp.name] = time.time()
 
-                    # Wait for all pending tournaments to complete
-                    for future in as_completed(pending_futures):
-                        exp, train_time, empty_value = pending_futures[future]
-                        try:
-                            success, tournament_games_per_sec, vs_random, vs_deep, vs_medium = future.result()
+                    # Wait for next tournament to complete
+                    if all_tournament_futures:
+                        done_futures = [f for f in all_tournament_futures if f.done()]
 
-                            # Update final results
-                            training_games_per_sec = training_results[exp.name][3] if exp.name in training_results else 0.0
-                            final_results[exp.name] = ExperimentResult(
-                                name=exp.name,
-                                args=exp.args,
-                                training_time=train_time,
-                                training_success=True,
-                                empty_board_value=empty_value,
-                                vs_random=vs_random,
-                                vs_deep=vs_deep,
-                                vs_medium=vs_medium,
-                                tournament_success=success,
-                                total_time=train_time,
-                                training_games_per_sec=training_games_per_sec,
-                                tournament_games_per_sec=tournament_games_per_sec
-                            )
+                        if not done_futures:
+                            # Wait for at least one to complete
+                            import time as time_module
+                            time_module.sleep(1)
+                            continue
 
-                            if success:
-                                print(f"  ✅ Tournament: {exp.name} - Random={vs_random}, Deep={vs_deep}, Medium={vs_medium}, {tournament_games_per_sec:.1f} games/sec")
-                            else:
-                                print(f"  ❌ Tournament failed: {exp.name}")
+                        for future in done_futures:
+                            all_tournament_futures.remove(future)
+                            if future not in tournament_futures:
+                                continue
 
-                        except Exception as e:
-                            print(f"❌ Tournament exception in {exp.name}: {e}")
+                            exp, train_time, empty_value = tournament_futures[future]
+                            del tournament_futures[future]
+
+                            if exp.name in running_tournaments:
+                                del running_tournaments[exp.name]
+
+                            try:
+                                success, tournament_games_per_sec, vs_random, vs_deep, vs_medium = future.result()
+
+                                # Update final results
+                                training_games_per_sec = training_results[exp.name][3] if exp.name in training_results else 0.0
+                                final_results[exp.name] = ExperimentResult(
+                                    name=exp.name,
+                                    args=exp.args,
+                                    training_time=train_time,
+                                    training_success=True,
+                                    empty_board_value=empty_value,
+                                    vs_random=vs_random,
+                                    vs_deep=vs_deep,
+                                    vs_medium=vs_medium,
+                                    tournament_success=success,
+                                    total_time=train_time,  # Tournament runs concurrent, so don't add time
+                                    training_games_per_sec=training_games_per_sec,
+                                    tournament_games_per_sec=tournament_games_per_sec
+                                )
+
+                                if success:
+                                    print(f"  ✅ Tournament: {exp.name} - Random={vs_random}, Deep={vs_deep}, Medium={vs_medium}, {tournament_games_per_sec:.1f} games/sec")
+                                else:
+                                    print(f"  ❌ Tournament failed: {exp.name}")
+
+                            except Exception as e:
+                                print(f"❌ Tournament exception in {exp.name}: {e}")
 
         else:
             # Sequential Mode: Training first, then tournaments
