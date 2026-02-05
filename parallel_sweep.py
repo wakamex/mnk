@@ -712,9 +712,9 @@ class SweepConfig:
         """Set intelligent defaults for unspecified parameters"""
         # Set defaults if not provided
         if self.iterations is None:
-            self.iterations = [2]
+            self.iterations = [5]
         if self.games_per_iter is None:
-            self.games_per_iter = [5]
+            self.games_per_iter = [100]
         if self.epochs is None:
             self.epochs = [2]
         if self.batch_size is None:
