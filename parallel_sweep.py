@@ -402,7 +402,7 @@ class AlphaZeroSweep:
                     running_training[exp.name] = time.time()
 
                 tournament_futures = {}
-                tournament_queue = []  # Queue for tournaments waiting for capacity
+                tournaments_pending = []  # Track experiments that need tournaments
                 completed_training = 0
 
                 # Status update interval
@@ -422,21 +422,17 @@ class AlphaZeroSweep:
 
                         print(f"  ✅ Training: {exp.name} - {train_time:.1f}s, value={empty_value:.3f}, {training_games_per_sec:.1f} games/sec" if success else f"  ❌ Training: {exp.name} - {error}")
 
-                        # Queue tournament if training succeeded
-                        if success and model_file:
-                            tournament_queue.append((exp, train_time, empty_value, model_file))
-
-                        # Submit tournaments from queue while we have capacity
-                        while tournament_queue:
-                            active_tournaments = len([f for f in tournament_futures if not f.done()])
-                            if active_tournaments >= tournament_jobs:
-                                break  # No capacity available
-
-                            exp_to_run, t_time, e_value, m_file = tournament_queue.pop(0)
-                            tournament_future = executor.submit(self.run_tournament_only, exp_to_run, m_file)
-                            tournament_futures[tournament_future] = (exp_to_run, t_time, e_value)
-                            running_tournaments[exp_to_run.name] = time.time()
-                            print(f"  🏆 Started tournament: {exp_to_run.name}")
+                        # Try to submit tournament immediately if we have capacity
+                        active_tournaments = len([f for f in tournament_futures if not f.done()])
+                        if success and model_file and active_tournaments < tournament_jobs:
+                            tournament_future = executor.submit(self.run_tournament_only, exp, model_file)
+                            tournament_futures[tournament_future] = (exp, train_time, empty_value)
+                            running_tournaments[exp.name] = time.time()
+                            print(f"  🏆 Started tournament: {exp.name}")
+                        elif success and model_file:
+                            # Save for later if no capacity
+                            tournaments_pending.append((exp, train_time, empty_value, model_file))
+                            print(f"  📋 Queued tournament: {exp.name}")
 
                         # Create preliminary result for display
                         final_results[exp.name] = ExperimentResult(
@@ -465,69 +461,85 @@ class AlphaZeroSweep:
                         if exp.name in running_training:
                             del running_training[exp.name]
 
-                # Submit remaining queued tournaments as capacity opens up
-                print(f"  📋 Tournament queue: {len(tournament_queue)} waiting, {len(tournament_futures)} active")
+                # Process tournaments that started during training
+                print(f"\n📋 Tournament status: {len(tournament_futures)} running, {len(tournaments_pending)} pending")
 
-                # Process all tournaments (both running and queued)
-                while tournament_queue or tournament_futures:
-                    # Submit more tournaments from queue as capacity opens up
-                    while tournament_queue:
-                        active_tournaments = len([f for f in tournament_futures if not f.done()])
-                        if active_tournaments >= tournament_jobs:
-                            break  # Wait for capacity
+                # First, wait for any tournaments that are already running
+                for future in as_completed(tournament_futures):
+                    exp, train_time, empty_value = tournament_futures[future]
 
-                        exp_to_run, t_time, e_value, m_file = tournament_queue.pop(0)
-                        tournament_future = executor.submit(self.run_tournament_only, exp_to_run, m_file)
-                        tournament_futures[tournament_future] = (exp_to_run, t_time, e_value)
-                        running_tournaments[exp_to_run.name] = time.time()
-                        print(f"  🏆 Started tournament: {exp_to_run.name} (queue: {len(tournament_queue)} remaining)")
+                    if exp.name in running_tournaments:
+                        del running_tournaments[exp.name]
 
-                    # Process any completed tournaments
-                    if tournament_futures:
-                        # Process all completed tournaments first
-                        completed_futures = [f for f in tournament_futures.keys() if f.done()]
+                    try:
+                        success, tournament_games_per_sec, vs_random, vs_deep, vs_medium = future.result()
 
-                        # If nothing is complete yet but we have futures, wait for one
-                        if not completed_futures and tournament_futures:
-                            for future in as_completed(list(tournament_futures.keys())):
-                                completed_futures = [future]
-                                break  # Just get one completion
+                        # Update final results
+                        training_games_per_sec = training_results[exp.name][3] if exp.name in training_results else 0.0
+                        final_results[exp.name] = ExperimentResult(
+                            name=exp.name,
+                            args=exp.args,
+                            training_time=train_time,
+                            training_success=True,
+                            empty_board_value=empty_value,
+                            vs_random=vs_random,
+                            vs_deep=vs_deep,
+                            vs_medium=vs_medium,
+                            tournament_success=success,
+                            total_time=train_time,  # Tournament runs concurrent, so don't add time
+                            training_games_per_sec=training_games_per_sec,
+                            tournament_games_per_sec=tournament_games_per_sec
+                        )
 
-                        # Process all completed futures
-                        for future in completed_futures:
-                            exp, train_time, empty_value = tournament_futures[future]
-                            del tournament_futures[future]
+                        if success:
+                            print(f"  ✅ Tournament: {exp.name} - Random={vs_random}, Deep={vs_deep}, Medium={vs_medium}, {tournament_games_per_sec:.1f} games/sec")
+                        else:
+                            print(f"  ❌ Tournament failed: {exp.name}")
 
-                            if exp.name in running_tournaments:
-                                del running_tournaments[exp.name]
+                    except Exception as e:
+                        print(f"❌ Tournament exception in {exp.name}: {e}")
 
-                            try:
-                                success, tournament_games_per_sec, vs_random, vs_deep, vs_medium = future.result()
+                # Now process any pending tournaments with proper executor submission
+                if tournaments_pending:
+                    print(f"\n🏆 Processing {len(tournaments_pending)} pending tournaments...")
+                    pending_futures = {}
 
-                                # Update final results
-                                training_games_per_sec = training_results[exp.name][3] if exp.name in training_results else 0.0
-                                final_results[exp.name] = ExperimentResult(
-                                    name=exp.name,
-                                    args=exp.args,
-                                    training_time=train_time,
-                                    training_success=True,
-                                    empty_board_value=empty_value,
-                                    vs_random=vs_random,
-                                    vs_deep=vs_deep,
-                                    vs_medium=vs_medium,
-                                    tournament_success=success,
-                                    total_time=train_time,  # Tournament runs concurrent, so don't add time
-                                    training_games_per_sec=training_games_per_sec,
-                                    tournament_games_per_sec=tournament_games_per_sec
-                                )
+                    # Submit all pending tournaments to executor
+                    for exp, train_time, empty_value, model_file in tournaments_pending:
+                        print(f"  ▶️  Submitting tournament for {exp.name}...")
+                        future = executor.submit(self.run_tournament_only, exp, model_file)
+                        pending_futures[future] = (exp, train_time, empty_value)
 
-                                if success:
-                                    print(f"  ✅ Tournament: {exp.name} - Random={vs_random}, Deep={vs_deep}, Medium={vs_medium}, {tournament_games_per_sec:.1f} games/sec")
-                                else:
-                                    print(f"  ❌ Tournament failed: {exp.name}")
+                    # Wait for all pending tournaments to complete
+                    for future in as_completed(pending_futures):
+                        exp, train_time, empty_value = pending_futures[future]
+                        try:
+                            success, tournament_games_per_sec, vs_random, vs_deep, vs_medium = future.result()
 
-                            except Exception as e:
-                                print(f"❌ Tournament exception in {exp.name}: {e}")
+                            # Update final results
+                            training_games_per_sec = training_results[exp.name][3] if exp.name in training_results else 0.0
+                            final_results[exp.name] = ExperimentResult(
+                                name=exp.name,
+                                args=exp.args,
+                                training_time=train_time,
+                                training_success=True,
+                                empty_board_value=empty_value,
+                                vs_random=vs_random,
+                                vs_deep=vs_deep,
+                                vs_medium=vs_medium,
+                                tournament_success=success,
+                                total_time=train_time,
+                                training_games_per_sec=training_games_per_sec,
+                                tournament_games_per_sec=tournament_games_per_sec
+                            )
+
+                            if success:
+                                print(f"  ✅ Tournament: {exp.name} - Random={vs_random}, Deep={vs_deep}, Medium={vs_medium}, {tournament_games_per_sec:.1f} games/sec")
+                            else:
+                                print(f"  ❌ Tournament failed: {exp.name}")
+
+                        except Exception as e:
+                            print(f"❌ Tournament exception in {exp.name}: {e}")
 
         else:
             # Sequential Mode: Training first, then tournaments
