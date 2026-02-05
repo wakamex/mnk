@@ -22,13 +22,18 @@ pub struct MiniBT4Net<B: Backend> {
     value_head: Linear<B>,         // Global position evaluation
     policy_head: Linear<B>,        // Per-square move probabilities
 
-    // Configuration
+    // Configuration (not parameters, just config)
     d_model: usize,
     max_board_size: usize,
+    current_board_width: usize,
 }
 
 impl<B: Backend> MiniBT4Net<B> {
     pub fn new(device: &B::Device, d_model: usize, n_layers: usize, max_board_size: usize) -> Self {
+        Self::new_with_board_width(device, d_model, n_layers, max_board_size, 3) // Default to 3x3
+    }
+
+    pub fn new_with_board_width(device: &B::Device, d_model: usize, n_layers: usize, max_board_size: usize, board_width: usize) -> Self {
         let n_heads = 8;
 
         Self {
@@ -48,7 +53,26 @@ impl<B: Backend> MiniBT4Net<B> {
 
             d_model,
             max_board_size,
+            current_board_width: board_width,
         }
+    }
+
+    /// Create a network configured for a specific board size
+    pub fn new_for_board(device: &B::Device, board_width: usize) -> Self {
+        let d_model = 128;
+        let n_layers = 4;
+        let max_board_size = 15; // Support up to 15x15
+        Self::new_with_board_width(device, d_model, n_layers, max_board_size, board_width)
+    }
+
+    /// Get current board width
+    pub fn current_board_width(&self) -> usize {
+        self.current_board_width
+    }
+
+    /// Get device
+    pub fn device(&self) -> B::Device {
+        self.input_proj.devices()[0].clone()
     }
 
     pub fn forward(&self, x: Tensor<B, 2>, board_width: usize) -> (Tensor<B, 2>, Tensor<B, 2>) {
@@ -121,11 +145,7 @@ impl<B: Backend> MiniBT4Net<B> {
 
 /// Create MiniBT4 network for specific board size
 pub fn create_minibt4_net<B: Backend>(device: &B::Device, board_width: usize) -> MiniBT4Net<B> {
-    let d_model = 128;  // Smaller than full transformer for efficiency
-    let n_layers = 4;   // Sufficient depth for board game reasoning
-    let max_board_size = 15;  // Support up to 15x15
-
-    MiniBT4Net::new(device, d_model, n_layers, max_board_size)
+    MiniBT4Net::new_for_board(device, board_width)
 }
 
 /// Forward pass for various board sizes

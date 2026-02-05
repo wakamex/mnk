@@ -275,7 +275,7 @@ pub fn load_trained_model() -> Result<AlphaZeroNet<MyBackend>, Box<dyn std::erro
 
     match recorder.load("alphazero_model".into(), &device) {
         Ok(record) => {
-            let loaded_net = AlphaZeroNet::<MyBackend>::new(&device).load_record(record);
+            let loaded_net = AlphaZeroNet::<MyBackend>::new(&device, 3).load_record(record);
             println!("✅ Loaded trained model for diagnostics");
             Ok(loaded_net)
         }

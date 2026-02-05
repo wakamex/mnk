@@ -18,7 +18,6 @@ pub struct AlphaZeroNet<B: Backend> {
     conv2: Conv2d<B>,
     conv3: Conv2d<B>,
 
-
     // Policy head
     policy_conv: Conv2d<B>,
     policy_fc: Linear<B>,
@@ -27,10 +26,18 @@ pub struct AlphaZeroNet<B: Backend> {
     value_conv: Conv2d<B>,
     value_fc1: Linear<B>,
     value_fc2: Linear<B>,
+
+    // Board configuration (not a parameter, just config)
+    board_width: usize,
 }
 
 impl<B: Backend> AlphaZeroNet<B> {
-    pub fn new(device: &B::Device) -> Self {
+    /// Create a new CNN network for the specified board size
+    /// Note: CNN currently only supports 3x3 boards due to FC layer dimensions
+    pub fn new(device: &B::Device, board_width: usize) -> Self {
+        assert_eq!(board_width, 3, "CNN architecture currently only supports 3x3 boards. Use transformer for larger sizes.");
+        let board_size = board_width * board_width;
+
         Self {
             // Shared convolutional backbone: 1 -> 32 -> 64 -> 128 filters
             conv1: Conv2dConfig::new([1, 32], [3, 3])
@@ -43,22 +50,34 @@ impl<B: Backend> AlphaZeroNet<B> {
                 .with_padding(PaddingConfig2d::Same)
                 .init(device),
 
-
             // Policy head (action selection)
             policy_conv: Conv2dConfig::new([128, 4], [1, 1]).init(device),
-            policy_fc: LinearConfig::new(4 * 3 * 3, 9).init(device), // 4 channels * 3x3 board -> 9 moves
+            policy_fc: LinearConfig::new(4 * board_size, board_size).init(device),
 
             // Value head (position evaluation)
             value_conv: Conv2dConfig::new([128, 2], [1, 1]).init(device),
-            value_fc1: LinearConfig::new(2 * 3 * 3, 64).init(device), // 2 channels * 3x3 board -> 64 hidden
-            value_fc2: LinearConfig::new(64, 1).init(device), // 64 hidden -> 1 value
+            value_fc1: LinearConfig::new(2 * board_size, 64).init(device),
+            value_fc2: LinearConfig::new(64, 1).init(device),
+
+            board_width,
         }
     }
 
+    /// Get the board width this network was configured for
+    pub fn board_width(&self) -> usize {
+        self.board_width
+    }
+
+    /// Get the device this network is on
+    pub fn device(&self) -> B::Device {
+        self.conv1.devices()[0].clone()
+    }
+
     pub fn forward(&self, x: Tensor<B, 2>) -> (Tensor<B, 2>, Tensor<B, 2>) {
-        // Reshape input from [batch_size, 9] to [batch_size, 1, 3, 3]
+        // Reshape input from [batch_size, board_size] to [batch_size, 1, width, width]
         let batch_size = x.dims()[0];
-        let x = x.reshape([batch_size, 1, 3, 3]);
+        let w = self.board_width;
+        let x = x.reshape([batch_size, 1, w, w]);
 
         // Shared convolutional backbone
         let x = activation::relu(self.conv1.forward(x));
@@ -93,7 +112,8 @@ impl<B: Backend> AlphaZeroNet<B> {
         let value_scalar: f32 = value.clone().into_scalar();
 
         // For policy, we need to extract the data properly
-        let policy_vec: Vec<f32> = (0..9).map(|i| {
+        let board_size = self.board_width * self.board_width;
+        let policy_vec: Vec<f32> = (0..board_size).map(|i| {
             let elem = policy.clone().slice([0..1, i..i+1]);
             let scalar: f32 = elem.into_scalar();
             scalar
@@ -115,12 +135,13 @@ impl<B: Backend> AlphaZeroNet<B> {
 
         let device = &self.conv1.devices()[0];
         let batch_size = boards.len();
+        let board_size = self.board_width * self.board_width;
 
         // Create batch input tensor
-        let mut batch_data = vec![0.0f32; batch_size * 9];
+        let mut batch_data = vec![0.0f32; batch_size * board_size];
         for (batch_idx, (&board, &player)) in boards.iter().zip(players.iter()).enumerate() {
             for (cell_idx, &cell) in board.iter().enumerate() {
-                batch_data[batch_idx * 9 + cell_idx] = match cell {
+                batch_data[batch_idx * board_size + cell_idx] = match cell {
                     Some(p) if p == player => 1.0,
                     Some(_) => -1.0,
                     None => 0.0,
@@ -129,7 +150,7 @@ impl<B: Backend> AlphaZeroNet<B> {
         }
 
         let batch_input = Tensor::<B, 1>::from_floats(batch_data.as_slice(), device)
-            .reshape([batch_size, 9]);
+            .reshape([batch_size, board_size]);
 
         // Forward pass for entire batch - returns logits
         let (batch_values, batch_policy_logits) = self.forward(batch_input);
@@ -147,7 +168,7 @@ impl<B: Backend> AlphaZeroNet<B> {
             values.push(value);
 
             // Extract policy for position i
-            let policy: Vec<f32> = (0..9).map(|j| {
+            let policy: Vec<f32> = (0..board_size).map(|j| {
                 let elem = batch_policies.clone().slice([i..i+1, j..j+1]);
                 elem.into_scalar()
             }).collect();
@@ -519,7 +540,11 @@ pub fn self_play_game_with_batched_policy<B: Backend<FloatElem = f32>>(
     }
 }
 
-pub fn evaluate_vs_random<B: Backend<FloatElem = f32>>(net: &AlphaZeroNet<B>) -> f32 {
+pub fn evaluate_vs_random<B, N>(net: &N) -> f32
+where
+    B: Backend<FloatElem = f32>,
+    N: crate::unified_mcts::NetworkInference<B>,
+{
     let mut wins = 0;
     let mut draws = 0;
 

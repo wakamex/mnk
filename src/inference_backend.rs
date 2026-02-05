@@ -42,7 +42,7 @@ pub fn load_model_for_inference(
     match recorder.load(model_path.into(), &training_device) {
         Ok(training_record) => {
             // Load into training model first
-            let training_model = AlphaZeroNet::<TrainingBackend>::new(&training_device)
+            let training_model = AlphaZeroNet::<TrainingBackend>::new(&training_device, 3)
                 .load_record(training_record);
             println!("✅ Model loaded with training backend");
 
@@ -62,7 +62,7 @@ pub fn load_model_for_inference(
             #[cfg(not(feature = "cuda"))]
             let device = InferenceDevice::default();
 
-            Ok(AlphaZeroNet::<InferenceBackend>::new(&device))
+            Ok(AlphaZeroNet::<InferenceBackend>::new(&device, 3))
         }
     }
 }
@@ -137,7 +137,7 @@ mod tests {
         let device = InferenceDevice::default();
 
         // Should not segfault
-        let _model = AlphaZeroNet::<InferenceBackend>::new(&device);
+        let _model = AlphaZeroNet::<InferenceBackend>::new(&device, 3);
         println!("✅ Inference model creation test passed");
     }
 }

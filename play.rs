@@ -748,7 +748,7 @@ impl AlphaZeroStrategy {
                 let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
                 match recorder.load(model_path.into(), &device) {
                     Ok(record) => {
-                        let trained_net = AlphaZeroNet::<InferenceBackend>::new(&device).load_record(record);
+                        let trained_net = AlphaZeroNet::<InferenceBackend>::new(&device, 3).load_record(record);
                         println!("✅ Loaded trained AlphaZero model from '{}' (using consistent Autodiff backend)", model_path);
                         trained_net
                     }
@@ -756,7 +756,7 @@ impl AlphaZeroStrategy {
                         println!("⚠️  Failed to load trained model: {:?}", e);
                         println!("   Using untrained network instead");
                         println!("   Make sure to run training first: ./target/release/train_alphazero");
-                        AlphaZeroNet::<InferenceBackend>::new(&device)
+                        AlphaZeroNet::<InferenceBackend>::new(&device, 3)
                     }
                 }
             }
@@ -770,7 +770,7 @@ impl AlphaZeroStrategy {
                 #[cfg(not(feature = "cuda"))]
                 let device = InferenceDevice::default();
 
-                AlphaZeroNet::<InferenceBackend>::new(&device)
+                AlphaZeroNet::<InferenceBackend>::new(&device, 3)
             }
         };
 
@@ -1019,7 +1019,7 @@ pub fn play_interleaved_tournament(
 
     let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
     let net = match recorder.load(model_path.into(), &device) {
-        Ok(record) => AlphaZeroNet::<InferenceBackend>::new(&device).load_record(record),
+        Ok(record) => AlphaZeroNet::<InferenceBackend>::new(&device, 3).load_record(record),
         Err(e) => return Err(format!("Failed to load model from {}: {:?}", model_path, e)),
     };
 

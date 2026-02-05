@@ -5,6 +5,7 @@ use burn::grad_clipping::{GradientClipping, GradientClippingConfig};
 use burn::tensor::activation;
 use mnk::alphazero::{AlphaZeroNet, check_winner, board_to_tensor, batch_evaluate_positions, evaluate_vs_random};
 use mnk::unified_mcts::{InterleavedGamesManager, TrainingExample};
+use mnk::network::{Network, NetworkType};
 use mnk::mcts_bridge; // Enable AlphaZeroNet to work with unified_mcts
 use clap::Parser;
 
@@ -150,6 +151,14 @@ struct Args {
     /// Output path for the trained model
     #[arg(long, default_value = "alphazero_model.bin")]
     model_path: String,
+
+    /// Network architecture type: 'cnn' (AlphaZero-style) or 'transformer' (MiniBT4)
+    #[arg(long, default_value = "cnn")]
+    net_type: String,
+
+    /// Board width (transformer supports variable sizes, cnn only supports 3)
+    #[arg(long, default_value = "3")]
+    board_width: usize,
 }
 
 fn main() {
@@ -181,7 +190,13 @@ fn main() {
     #[cfg(not(feature = "cuda"))]
     let device = MyDevice::default();
 
-    let mut net = AlphaZeroNet::<MyBackend>::new(&device);
+    // Parse network type from CLI
+    let net_type: NetworkType = args.net_type.parse().expect("Invalid network type. Use 'cnn' or 'transformer'");
+    let board_width = args.board_width;
+
+    println!("Network: {:?} (board: {}x{})", net_type, board_width, board_width);
+
+    let mut net = Network::<MyBackend>::new(net_type, &device, board_width);
 
     // Configure optimizer with gradient clipping for stability
     let mut optimizer = AdamConfig::new()
