@@ -1,7 +1,7 @@
 /// Symmetry transformations for board augmentation
 /// Provides 8x data efficiency through dihedral transformations
 
-use crate::TrainingExample;
+use crate::alphazero::TrainingExample;
 
 /// All 8 dihedral transformations for a square board
 #[derive(Debug, Clone, Copy)]

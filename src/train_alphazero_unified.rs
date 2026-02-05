@@ -26,6 +26,93 @@ type MyBackend = Autodiff<NdArray>;
 #[cfg(not(feature = "cuda"))]
 type MyDevice = NdArrayDevice;
 
+// Symmetry augmentation for 8x data efficiency
+fn apply_symmetry_augmentation(examples: &[TrainingExample]) -> Vec<TrainingExample> {
+    let mut augmented = Vec::with_capacity(examples.len() * 8);
+
+    for example in examples {
+        // Add all 8 symmetric versions of this example
+        augmented.extend(get_all_symmetries(example));
+    }
+
+    augmented
+}
+
+fn get_all_symmetries(example: &TrainingExample) -> Vec<TrainingExample> {
+    let transforms = [
+        Transform::Identity,
+        Transform::Rotate90,
+        Transform::Rotate180,
+        Transform::Rotate270,
+        Transform::FlipHorizontal,
+        Transform::FlipVertical,
+        Transform::FlipDiag1,
+        Transform::FlipDiag2,
+    ];
+
+    transforms.iter()
+        .map(|&transform| apply_transform(example, transform))
+        .collect()
+}
+
+#[derive(Clone, Copy)]
+enum Transform {
+    Identity,
+    Rotate90,
+    Rotate180,
+    Rotate270,
+    FlipHorizontal,
+    FlipVertical,
+    FlipDiag1,
+    FlipDiag2,
+}
+
+fn apply_transform(example: &TrainingExample, transform: Transform) -> TrainingExample {
+    TrainingExample {
+        board: transform_board(&example.board, transform),
+        player: example.player,
+        policy: transform_policy(&example.policy, transform),
+        value: example.value,
+    }
+}
+
+fn transform_board(board: &[Option<u8>], transform: Transform) -> Vec<Option<u8>> {
+    let mut new_board = vec![None; 9];
+
+    for old_pos in 0..9 {
+        let new_pos = transform_position(old_pos, transform);
+        new_board[new_pos] = board[old_pos];
+    }
+
+    new_board
+}
+
+fn transform_policy(policy: &[f32], transform: Transform) -> Vec<f32> {
+    let mut new_policy = vec![0.0; 9];
+
+    for old_pos in 0..9 {
+        let new_pos = transform_position(old_pos, transform);
+        new_policy[new_pos] = policy[old_pos];
+    }
+
+    new_policy
+}
+
+fn transform_position(pos: usize, transform: Transform) -> usize {
+    let (row, col) = (pos / 3, pos % 3);
+    let (new_row, new_col) = match transform {
+        Transform::Identity => (row, col),
+        Transform::Rotate90 => (col, 2 - row),
+        Transform::Rotate180 => (2 - row, 2 - col),
+        Transform::Rotate270 => (2 - col, row),
+        Transform::FlipHorizontal => (row, 2 - col),
+        Transform::FlipVertical => (2 - row, col),
+        Transform::FlipDiag1 => (col, row),
+        Transform::FlipDiag2 => (2 - col, 2 - row),
+    };
+    new_row * 3 + new_col
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "train_alphazero")]
 #[command(about = "Train AlphaZero neural network with configurable hyperparameters")]
@@ -142,7 +229,13 @@ fn main() {
             let batch_sizes_to_test = if iteration == 2 {
                 &test_batch_sizes[..] // Test all sizes
             } else {
-                &test_batch_sizes[4..5] // Use optimal batch size (512) found through testing
+                // Use optimal batch size (512 for CUDA, 128 for CPU)
+                let optimal_idx = if cfg!(feature = "cuda") { 4 } else { 3 };
+                if optimal_idx < test_batch_sizes.len() {
+                    &test_batch_sizes[optimal_idx..optimal_idx+1]
+                } else {
+                    &test_batch_sizes[test_batch_sizes.len()-1..] // Use last (largest) size
+                }
             };
 
             for &test_batch_size in batch_sizes_to_test {
@@ -228,7 +321,17 @@ fn main() {
         }
         let selfplay_time = selfplay_start.elapsed();
 
-        println!("Iteration {}: {} examples", iteration, all_examples.len());
+        let original_count = all_examples.len();
+
+        // Apply 8x symmetry augmentation for data efficiency
+        let augmented_examples = apply_symmetry_augmentation(&all_examples);
+
+        println!("Iteration {}: {} → {} examples ({}x symmetry)",
+                 iteration, original_count, augmented_examples.len(),
+                 augmented_examples.len() as f32 / original_count as f32);
+
+        // Use augmented examples for training
+        let mut all_examples = augmented_examples;
 
         // Training loop
         let training_start = std::time::Instant::now();
