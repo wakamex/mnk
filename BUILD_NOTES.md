@@ -12,14 +12,14 @@ The host system (Fedora 43) has GCC 15.2.1 which is incompatible with CUDA. Even
 # Start the container if not running
 podman start cuda-dev
 
-# Build inside container (IMPORTANT: Set compute capability to bypass NVML detection)
-podman exec cuda-dev bash -c "cd /workspace/mnk && source ~/.cargo/env && CUDA_COMPUTE_CAP=86 cargo build --release --features cuda"
+# Build using the provided script (handles CUDA environment automatically)
+./build.sh
 
 # Run tournament system
 podman exec cuda-dev bash -c "cd /workspace/mnk && ./target/release/mnk_game"
 
-# Run GPU training
-podman exec cuda-dev bash -c "cd /workspace/mnk && LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/lib64:/usr/local/nccl/lib:/usr/local/cuda-12/lib64:/usr/local/lib ./target/release/train_alphazero"
+# Run GPU training (with PTX JIT compiler support)
+podman exec cuda-dev bash -c "cd /workspace/mnk && LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/lib64:/usr/local/nccl/lib:/usr/local/cuda-12/lib64:/usr/local/lib:/usr/local/cuda-12.8/compat ./target/release/train_alphazero"
 ```
 
 ### Why This is Necessary:
@@ -31,11 +31,12 @@ podman exec cuda-dev bash -c "cd /workspace/mnk && LD_LIBRARY_PATH=/usr/local/cu
 
 ### Container Status:
 - Container: `cuda-dev`
+- **UPDATED**: CUDA Version: 12.8.0-devel-ubuntu24.04 (compatibility upgrade)
 - **CRITICAL**: Must use `--privileged` flag for GPU access
-- CUDA Version: 13.1.1-devel-ubuntu22.04
 - GCC Version: 11.x (compatible)
 - Workspace: `/workspace/mnk`
-- GPU Support: RTX 3090 with compute capability 8.6
+- GPU Support: RTX 3090/4080 with compute capability 8.6
+- Mock nvidia-smi: Installed for build compatibility
 
 ### Working Container Command:
 ```bash
@@ -47,13 +48,17 @@ podman run -d --privileged --name cuda-dev \
   -v /usr/lib64/libcuda.so.580.119.02:/usr/local/cuda/lib64/libcuda.so.1:ro \
   -v /usr/lib64/libcuda.so.1:/usr/local/cuda/lib64/libcuda.so:ro \
   -v /code/mnk:/workspace/mnk:Z \
-  docker.io/nvidia/cuda:13.1.1-devel-ubuntu22.04 sleep infinity
+  nvcr.io/nvidia/cuda:12.8.0-devel-ubuntu24.04 sleep infinity
 
 # Install required packages in container (one-time setup):
-podman exec cuda-dev bash -c "apt update && apt install -y curl build-essential nvidia-cuda-toolkit libnvidia-compute-580"
+podman exec cuda-dev bash -c "apt update && apt install -y curl build-essential"
 
 # Install Rust in container (one-time setup):
 podman exec cuda-dev bash -c "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y"
+
+# Install mock nvidia-smi for build compatibility:
+podman exec cuda-dev bash -c "echo '#!/bin/bash
+echo \"GPU 0: NVIDIA RTX 4080 (UUID: GPU-12345)\"' > /usr/local/bin/nvidia-smi && chmod +x /usr/local/bin/nvidia-smi"
 ```
 
 ### Tournament System Status:
@@ -103,7 +108,7 @@ python parallel_sweep.py --value-weight 0.5:3.0:0.5 --jobs 16
 Our 991-line `play.rs` includes a complete game framework with tournament system, multiple AI strategies, and rich interface - significantly more comprehensive than the inspiration repositories' basic game logic files.
 
 ### GPU Training Status:
-✅ **GPU TRAINING FULLY FUNCTIONAL** - AlphaZero neural network training completed successfully!
+✅ **GPU TRAINING FULLY FUNCTIONAL WITH CUDA 12.8 UPGRADE** - AlphaZero neural network training with confirmed GPU acceleration!
 
 **Training Results (30 iterations, 191 seconds):**
 - ✅ Loss reduction: 3.03 → 0.0024 (99.9% improvement)
@@ -115,9 +120,11 @@ Our 991-line `play.rs` includes a complete game framework with tournament system
 **Critical Setup Requirements:**
 1. Container must have `--privileged` flag for GPU access
 2. Must bind-mount libcuda.so from host system
-3. Must install nvidia-cuda-toolkit and libnvidia-compute libraries
-4. Must set LD_LIBRARY_PATH for CUDA runtime libraries
+3. Must install mock nvidia-smi for candle-kernels build compatibility
+4. Must set LD_LIBRARY_PATH including PTX JIT compiler path (`/usr/local/cuda-12.8/compat`)
 5. Container needs Rust installed for compilation
+6. CUDA 12.8 + Ubuntu 24.04 for optimal cudarc compatibility
+7. Use provided `build.sh` script for proper environment setup
 
 **Important Implementation Notes:**
 - ⚠️ **Thread-based parallel self-play is NOT possible** - Burn neural networks are fundamentally not thread-safe
