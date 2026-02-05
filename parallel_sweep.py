@@ -28,6 +28,7 @@ class ExperimentConfig:
     """Configuration for a single experiment"""
     name: str
     args: str
+    tournament_games: int = 100  # Number of games per tournament matchup
     training_timeout: int = 600  # 10 minutes max for training
     tournament_timeout: int = 900  # 15 minutes max for tournament
 
@@ -178,7 +179,8 @@ class AlphaZeroSweep:
         try:
             # Run tournament directly on host (GPU inference now works perfectly)
             cmd = [
-                "./target/release/mnk_game", "--model-path", model_file
+                "./target/release/mnk_game", "--model-path", model_file,
+                "--tournament-games", str(config.tournament_games)
             ]
             result = subprocess.run(
                 cmd,
@@ -675,6 +677,7 @@ class SweepConfig:
 
     # MCTS parameters
     mcts_simulations: List[int] = None
+    tournament_games: List[int] = None
 
     # Advanced parameters (optional)
     temperature: List[float] = None
@@ -697,6 +700,8 @@ class SweepConfig:
             self.value_weight = [1.0]
         if self.mcts_simulations is None:
             self.mcts_simulations = [25]
+        if self.tournament_games is None:
+            self.tournament_games = [100]
 
         # Advanced parameters default to None (not included in args unless specified)
 
@@ -740,9 +745,9 @@ def generate_experiments(sweep_config: SweepConfig) -> List[ExperimentConfig]:
                     extended_name += f"_{param_name}{param_value}"
                     extended_args += f" --{param_name} {param_value}"
 
-                experiments.append(ExperimentConfig(extended_name, extended_args))
+                experiments.append(ExperimentConfig(extended_name, extended_args, tournament_games=sweep_config.tournament_games[0]))
         else:
-            experiments.append(ExperimentConfig(name, args))
+            experiments.append(ExperimentConfig(name, args, tournament_games=sweep_config.tournament_games[0]))
 
     return experiments
 
@@ -804,6 +809,7 @@ Examples:
     param_group.add_argument('--learning-rate', '-lr', help='Learning rate (default: 0.001)')
     param_group.add_argument('--value-weight', '-vw', help='Value loss weight (default: 1.0)')
     param_group.add_argument('--mcts', '-m', help='MCTS simulations (default: 25)')
+    param_group.add_argument('--tournament-games', '-tg', help='Games per tournament matchup (default: 100)')
 
     # Advanced parameter group
     advanced_group = parser.add_argument_group('advanced hyperparameters')
@@ -836,6 +842,8 @@ Examples:
         sweep_config.value_weight = parse_range(args.value_weight)
     if args.mcts:
         sweep_config.mcts_simulations = parse_int_range(args.mcts)
+    if getattr(args, 'tournament_games', None):
+        sweep_config.tournament_games = parse_int_range(args.tournament_games)
 
     # Advanced parameters
     if args.temperature:
@@ -865,6 +873,8 @@ Examples:
         defaults_used.append(f"   Value weight: {sweep_config.value_weight[0]}")
     if len(sweep_config.mcts_simulations) == 1 and not args.mcts:
         defaults_used.append(f"   MCTS simulations: {sweep_config.mcts_simulations[0]}")
+    if len(sweep_config.tournament_games) == 1 and not getattr(args, 'tournament_games', None):
+        defaults_used.append(f"   Tournament games: {sweep_config.tournament_games[0]}")
 
     if defaults_used:
         for default in defaults_used:

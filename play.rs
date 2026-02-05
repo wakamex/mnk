@@ -22,6 +22,10 @@ struct Args {
     /// Path to the AlphaZero model file
     #[arg(long, default_value = "alphazero_model.bin")]
     model_path: String,
+
+    /// Number of games per tournament matchup
+    #[arg(long, default_value = "10")]
+    tournament_games: usize,
 }
 
 // Backend types now handled by inference_backend module
@@ -1009,7 +1013,7 @@ fn demo_single_game() -> Result<(), String> {
     Ok(())
 }
 
-fn demo_tournament(model_path: &str) -> Result<(), String> {
+fn demo_tournament(model_path: &str, tournament_games: usize) -> Result<(), String> {
     println!("\n=== Tournament Demo ===");
     let config = GameConfig::new(3, 3, 3);
     
@@ -1021,7 +1025,7 @@ fn demo_tournament(model_path: &str) -> Result<(), String> {
         &config,
         MinimaxStrategy::new(3),
         MinimaxStrategy::new(2),
-        10,
+        tournament_games,
         false,
     )?;
     println!("{:8} vs {:8}: {}", "Deep", "Medium", result);
@@ -1031,7 +1035,7 @@ fn demo_tournament(model_path: &str) -> Result<(), String> {
         &config,
         MinimaxStrategy::new(3),
         MinimaxStrategy::new(1),
-        10,
+        tournament_games,
         false,
     )?;
     println!("{:8} vs {:8}: {}", "Deep", "Shallow", result);
@@ -1041,7 +1045,7 @@ fn demo_tournament(model_path: &str) -> Result<(), String> {
         &config,
         MinimaxStrategy::new(3),
         RandomStrategy::new(),
-        10,
+        tournament_games,
         false,
     )?;
     println!("{:8} vs {:8}: {}", "Deep", "Random", result);
@@ -1051,7 +1055,7 @@ fn demo_tournament(model_path: &str) -> Result<(), String> {
         &config,
         MinimaxStrategy::new(2),
         MinimaxStrategy::new(1),
-        10,
+        tournament_games,
         false,
     )?;
     println!("{:8} vs {:8}: {}", "Medium", "Shallow", result);
@@ -1061,7 +1065,7 @@ fn demo_tournament(model_path: &str) -> Result<(), String> {
         &config,
         MinimaxStrategy::new(2),
         RandomStrategy::new(),
-        10,
+        tournament_games,
         false,
     )?;
     println!("{:8} vs {:8}: {}", "Medium", "Random", result);
@@ -1071,7 +1075,7 @@ fn demo_tournament(model_path: &str) -> Result<(), String> {
         &config,
         MinimaxStrategy::new(1),
         RandomStrategy::new(),
-        10,
+        tournament_games,
         false,
     )?;
     println!("{:8} vs {:8}: {}", "Shallow", "Random", result);
@@ -1085,7 +1089,7 @@ fn demo_tournament(model_path: &str) -> Result<(), String> {
         &config,
         AlphaZeroStrategy::new_with_model_path(5, model_path),
         MinimaxStrategy::new(3),
-        10,
+        tournament_games,
         false,
     )?;
     println!("{:8} vs {:8}: {}", "AZ-25", "Deep", result);
@@ -1095,7 +1099,7 @@ fn demo_tournament(model_path: &str) -> Result<(), String> {
         &config,
         AlphaZeroStrategy::new_with_model_path(5, model_path),
         MinimaxStrategy::new(2),
-        10,
+        tournament_games,
         false,
     )?;
     println!("{:8} vs {:8}: {}", "AZ-25", "Medium", result);
@@ -1105,7 +1109,7 @@ fn demo_tournament(model_path: &str) -> Result<(), String> {
         &config,
         AlphaZeroStrategy::new_with_model_path(5, model_path),
         RandomStrategy::new(),
-        10,
+        tournament_games,
         false,
     )?;
     println!("{:8} vs {:8}: {}", "AZ-25", "Random", result);
@@ -1115,7 +1119,7 @@ fn demo_tournament(model_path: &str) -> Result<(), String> {
         &config,
         AlphaZeroStrategy::new_with_model_path(50, model_path),
         AlphaZeroStrategy::new_with_model_path(10, model_path),
-        10,
+        tournament_games,
         false,
     )?;
     println!("{:8} vs {:8}: {}", "AZ-50", "AZ-10", result);
@@ -1186,7 +1190,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     demo_single_game()?;
 
     print_gpu_memory("Before AlphaZero tournaments");
-    demo_tournament(&args.model_path)?;
+    demo_tournament(&args.model_path, args.tournament_games)?;
     print_gpu_memory("After AlphaZero tournaments");
 
     demo_performance()?;
