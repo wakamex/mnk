@@ -6,6 +6,7 @@ use burn::nn::{Linear, LinearConfig, conv::Conv2d, conv::Conv2dConfig,
 use burn::tensor::activation;
 use burn::module::Module;
 use rand::seq::SliceRandom;
+use crate::symmetry::augment_training_data;
 
 #[derive(Module, Debug)]
 pub struct AlphaZeroNet<B: Backend> {
@@ -1142,6 +1143,18 @@ pub fn self_play_game<B: Backend<FloatElem = f32>>(net: &AlphaZeroNet<B>, mcts_s
         board[selected] = Some(player);
         player = 1 - player;
     }
+}
+
+/// Self-play game with 8x symmetry augmentation for data efficiency
+pub fn self_play_game_with_symmetry<B: Backend<FloatElem = f32>>(
+    net: &AlphaZeroNet<B>,
+    mcts_simulations: usize
+) -> Vec<TrainingExample> {
+    // Generate original examples through normal self-play
+    let original_examples = self_play_game(net, mcts_simulations);
+
+    // Apply symmetry augmentation for 8x data multiplication
+    augment_training_data(original_examples)
 }
 
 pub fn self_play_game_with_batched_policy<B: Backend<FloatElem = f32>>(
