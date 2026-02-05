@@ -5,7 +5,6 @@ use burn::grad_clipping::{GradientClipping, GradientClippingConfig};
 use burn::tensor::activation;
 use mnk::alphazero::{AlphaZeroNet, check_winner, board_to_tensor, batch_evaluate_positions, evaluate_vs_random};
 use mnk::unified_mcts::{InterleavedGamesManager, TrainingExample};
-use mnk::self_play::self_play_game;
 use mnk::mcts_bridge; // Enable AlphaZeroNet to work with unified_mcts
 use clap::Parser;
 
@@ -216,7 +215,7 @@ fn main() {
         let mut all_examples = Vec::new();
 
         // Experiment: Use batch evaluation for game initialization
-        let use_batch_optimization = iteration > 1; // Enable after first iteration
+        let use_batch_optimization = true; // Always use batch optimization (InterleavedGamesManager)
         let use_production_batched_mcts = iteration > 5; // Enable production batching after iteration 5
 
         if use_batch_optimization {
@@ -305,25 +304,6 @@ fn main() {
                          games_per_iter,
                          games_per_sec);
                 println!("  Batch size: {}, ALL game states batched!", batch_sizes_to_test[0]);
-            }
-        } else {
-            // Standard sequential approach
-            for _ in 0..games_per_iter {
-                let examples = self_play_game(&net, args.mcts_simulations);
-                all_examples.extend(examples);
-            }
-
-            // Test batch inference capability (demonstration)
-            if iteration == 1 {
-                println!("  Testing batch inference capability...");
-                let test_boards: Vec<Vec<Option<u8>>> = vec![
-                    vec![None; 9], // Empty board
-                    vec![Some(0), None, None, None, None, None, None, None, None], // One move
-                ];
-                let test_players = vec![0, 1];
-
-                let (batch_values, _batch_policies) = batch_evaluate_positions(&net, &test_boards, &test_players);
-                println!("  Batch inference successful: {} positions processed", batch_values.len());
             }
         }
         let selfplay_time = selfplay_start.elapsed();
