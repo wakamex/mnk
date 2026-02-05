@@ -40,8 +40,9 @@ burn-ndarray = { version = "0.17.1" }
 burn-candle = { version = "0.17.1", optional = true }
 
 # Candle - Rust native deep learning (latest version with cudarc 0.19.x)
-candle-core = { version = "0.9.2", features = ["cuda"] }
-candle-nn = { version = "0.9.2", features = ["cuda"] }
+# Temporarily disabled CUDA features due to GCC version incompatibility
+candle-core = { version = "0.9.2" }
+candle-nn = { version = "0.9.2" }
 
 [features]
 default = []

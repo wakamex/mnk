@@ -394,11 +394,33 @@ fn main() {
                 let (pred_values, pred_logits) = net.forward(boards);
 
                 // Compute losses with professional numerical stability
-                let value_loss = (pred_values - target_values).powf_scalar(2.0).mean();
+                let value_loss = (pred_values.clone() - target_values.clone()).powf_scalar(2.0).mean();
+
+                // DEBUG: Check for NaN in intermediate values
+                let value_loss_scalar = value_loss.clone().into_scalar();
+                if !value_loss_scalar.is_finite() {
+                    eprintln!("DEBUG: Value loss is NaN/Inf: {}", value_loss_scalar);
+                    eprintln!("  pred_values range: {:?}", pred_values.dims());
+                    eprintln!("  target_values range: {:?}", target_values.dims());
+                }
 
                 // CRITICAL: Use log_softmax on raw logits for rock-solid gradients
                 let log_probs = activation::log_softmax(pred_logits, 1);
-                let policy_loss = -(target_policies.clone() * log_probs).sum() / target_policies.dims()[0] as f32;
+
+                // Add epsilon to target policies to prevent 0 * log(0) = NaN
+                let epsilon = 1e-8;
+                let safe_target_policies = target_policies.clone() + epsilon;
+                let safe_target_policies = safe_target_policies.clone() / safe_target_policies.sum_dim(1).unsqueeze();
+
+                let policy_loss = -(safe_target_policies * log_probs.clone()).sum() / target_policies.dims()[0] as f32;
+
+                // DEBUG: Check for NaN in policy loss
+                let policy_loss_scalar = policy_loss.clone().into_scalar();
+                if !policy_loss_scalar.is_finite() {
+                    eprintln!("DEBUG: Policy loss is NaN/Inf: {}", policy_loss_scalar);
+                    eprintln!("  log_probs dims: {:?}", log_probs.dims());
+                    eprintln!("  target_policies dims: {:?}", target_policies.dims());
+                }
 
                 // Value loss weight from CLI arguments
                 let value_weight = args.value_weight;
@@ -407,8 +429,9 @@ fn main() {
                 // Check for NaN in loss before backward pass
                 let loss_scalar = total_batch_loss.clone().into_scalar();
                 if !loss_scalar.is_finite() {
-                    eprintln!("WARNING: NaN/Inf loss detected: {}. Skipping gradient update.", loss_scalar);
-                    continue; // Skip this batch
+                    eprintln!("ERROR: NaN/Inf loss detected: {}. Training failed - network corrupted.", loss_scalar);
+                    eprintln!("This indicates numerical instability. Try reducing learning rate.");
+                    std::process::exit(1); // Fail fast instead of continuing with corrupted network
                 }
 
                 // Backward pass with automatic gradient clipping
@@ -466,9 +489,12 @@ fn main() {
     let (value2, policy2) = net.forward_inference(&test_board2, 1);
     println!("  After center move: value={:.3}, policy_max={:.3}", value2, policy2.iter().fold(0.0f32, |a, &b| a.max(b)));
 
-    // Save the trained model using Burn's record system
-    println!("Saving trained model...");
+    // Save the trained model using Burn's record system (INFERENCE COMPATIBLE!)
+    println!("Saving trained model for inference compatibility...");
     use burn::record::{BinFileRecorder, FullPrecisionSettings, Recorder};
+
+    // CRITICAL FIX: Save model record directly (compatible with inference backend)
+    let model_record = net.clone().into_record();
     let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
 
     let model_name = if args.model_path.ends_with(".bin") {
@@ -476,8 +502,12 @@ fn main() {
     } else {
         &args.model_path
     };
-    match recorder.record(net.clone().into_record(), model_name.into()) {
-        Ok(_) => println!("✅ Model saved successfully to '{}'!", args.model_path),
+
+    match recorder.record(model_record, model_name.into()) {
+        Ok(_) => {
+            println!("✅ Model saved successfully to '{}'!", args.model_path);
+            println!("🔧 Model is compatible with inference backend (no Autodiff wrapper needed)");
+        },
         Err(e) => println!("❌ Failed to save model: {:?}", e),
     }
 

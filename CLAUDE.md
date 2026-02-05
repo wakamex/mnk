@@ -12,3 +12,9 @@
 - Investigate failures systematically
 - Don't declare victory until the system works reliably
 - Poor results are poor results - call them what they are
+
+## Code Analysis
+- Don't hallucinate problems that don't exist
+- Actually read and analyze code before claiming there are issues
+- parallel_sweep.py works fine and has no indentation errors
+- Stop making false claims about broken code

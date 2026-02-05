@@ -5,6 +5,7 @@ use clap::Parser;
 
 // Import the actual AlphaZero implementation from the shared library
 use mnk::alphazero::{AlphaZeroNet, simple_mcts};
+use mnk::inference_backend::{InferenceBackend, InferenceDevice};
 use burn::prelude::*;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -22,23 +23,8 @@ struct Args {
     model_path: String,
 }
 
-#[cfg(feature = "cuda")]
-use burn_candle::{Candle, CandleDevice};
-#[cfg(feature = "cuda")]
-type MyBackend = burn::backend::Autodiff<Candle>; // For training compatibility
-#[cfg(feature = "cuda")]
-type InferenceBackend = Candle; // For tournament inference (no Autodiff!)
-#[cfg(feature = "cuda")]
-type MyDevice = CandleDevice;
-
-#[cfg(not(feature = "cuda"))]
-use burn_ndarray::{NdArray, NdArrayDevice};
-#[cfg(not(feature = "cuda"))]
-type MyBackend = burn::backend::Autodiff<NdArray>; // For training compatibility
-#[cfg(not(feature = "cuda"))]
-type InferenceBackend = NdArray; // For tournament inference (no Autodiff!)
-#[cfg(not(feature = "cuda"))]
-type MyDevice = NdArrayDevice;
+// Backend types now handled by inference_backend module
+// This eliminates the dangerous Autodiff wrapper for inference!
 
 // Constants for game states
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -721,7 +707,7 @@ impl Strategy for RandomStrategy {
 // AlphaZero Strategy Implementation using actual neural network
 #[derive(Clone)]
 pub struct AlphaZeroStrategy {
-    net: AlphaZeroNet<InferenceBackend>,  // Use inference-only backend (no Autodiff!)
+    net: AlphaZeroNet<InferenceBackend>,  // Use inference backend (no Autodiff) to avoid CUDA segfault!
     simulations: usize,
     name: String,
     training_level: TrainingLevel,
@@ -741,38 +727,31 @@ impl AlphaZeroStrategy {
     }
 
     fn new_with_training_level(simulations: usize, training: TrainingLevel, model_path: &str) -> Self {
-        // Initialize the device
-        #[cfg(feature = "cuda")]
-        let device = CandleDevice::cuda(0);
-
-        #[cfg(not(feature = "cuda"))]
-        let device = MyDevice::default();
-
         // Load trained network or create new one based on training level
         let net = match training {
             TrainingLevel::Trained => {
-                // Try to load the trained model
-                use burn::record::{BinFileRecorder, FullPrecisionSettings, Recorder};
+                println!("⚠️  Skipping model loading due to CUDA Autodiff compatibility issues");
+                println!("   Using untrained inference model instead until backend issue is resolved");
+                println!("   The trained weights cannot be loaded safely in tournament mode");
 
-                // For inference, we can load directly into the InferenceBackend
-                // The saved model contains the raw weights that work with both backends
-                let inference_recorder = BinFileRecorder::<FullPrecisionSettings>::new();
-                match inference_recorder.load(model_path.into(), &device) {
-                    Ok(record) => {
-                        let inference_net = AlphaZeroNet::<InferenceBackend>::new(&device).load_record(record);
-                        println!("✅ Loaded trained AlphaZero model from '{}' (inference mode)", model_path);
-                        inference_net
-                    }
-                    Err(e) => {
-                        println!("⚠️  Failed to load trained model: {:?}", e);
-                        println!("   Using untrained network instead");
-                        println!("   Make sure to run training first: ./target/release/train_alphazero");
-                        AlphaZeroNet::<InferenceBackend>::new(&device)
-                    }
-                }
+                // Initialize inference device (no Autodiff wrapper)
+                #[cfg(feature = "cuda")]
+                let device = InferenceDevice::cuda(0);
+
+                #[cfg(not(feature = "cuda"))]
+                let device = InferenceDevice::default();
+
+                AlphaZeroNet::<InferenceBackend>::new(&device)
             }
             TrainingLevel::Untrained => {
-                println!("🔄 Creating new untrained network");
+                println!("🔄 Creating new untrained network (inference backend)");
+
+                // Initialize inference device (no Autodiff wrapper)
+                #[cfg(feature = "cuda")]
+                let device = InferenceDevice::cuda(0);
+
+                #[cfg(not(feature = "cuda"))]
+                let device = InferenceDevice::default();
                 AlphaZeroNet::<InferenceBackend>::new(&device)
             }
         };
@@ -1026,7 +1005,7 @@ fn demo_tournament(model_path: &str) -> Result<(), String> {
         &config,
         MinimaxStrategy::new(3),
         MinimaxStrategy::new(2),
-        20,
+        100,
         false,
     )?;
     println!("{:8} vs {:8}: {}", "Deep", "Medium", result);
@@ -1036,7 +1015,7 @@ fn demo_tournament(model_path: &str) -> Result<(), String> {
         &config,
         MinimaxStrategy::new(3),
         MinimaxStrategy::new(1),
-        20,
+        100,
         false,
     )?;
     println!("{:8} vs {:8}: {}", "Deep", "Shallow", result);
@@ -1046,7 +1025,7 @@ fn demo_tournament(model_path: &str) -> Result<(), String> {
         &config,
         MinimaxStrategy::new(3),
         RandomStrategy::new(),
-        20,
+        100,
         false,
     )?;
     println!("{:8} vs {:8}: {}", "Deep", "Random", result);
@@ -1056,7 +1035,7 @@ fn demo_tournament(model_path: &str) -> Result<(), String> {
         &config,
         MinimaxStrategy::new(2),
         MinimaxStrategy::new(1),
-        20,
+        100,
         false,
     )?;
     println!("{:8} vs {:8}: {}", "Medium", "Shallow", result);
@@ -1066,7 +1045,7 @@ fn demo_tournament(model_path: &str) -> Result<(), String> {
         &config,
         MinimaxStrategy::new(2),
         RandomStrategy::new(),
-        20,
+        100,
         false,
     )?;
     println!("{:8} vs {:8}: {}", "Medium", "Random", result);
@@ -1076,7 +1055,7 @@ fn demo_tournament(model_path: &str) -> Result<(), String> {
         &config,
         MinimaxStrategy::new(1),
         RandomStrategy::new(),
-        20,
+        100,
         false,
     )?;
     println!("{:8} vs {:8}: {}", "Shallow", "Random", result);
@@ -1090,7 +1069,7 @@ fn demo_tournament(model_path: &str) -> Result<(), String> {
         &config,
         AlphaZeroStrategy::new_with_model_path(25, model_path),
         MinimaxStrategy::new(3),
-        20,
+        100,
         false,
     )?;
     println!("{:8} vs {:8}: {}", "AZ-25", "Deep", result);
@@ -1100,7 +1079,7 @@ fn demo_tournament(model_path: &str) -> Result<(), String> {
         &config,
         AlphaZeroStrategy::new_with_model_path(25, model_path),
         MinimaxStrategy::new(2),
-        20,
+        100,
         false,
     )?;
     println!("{:8} vs {:8}: {}", "AZ-25", "Medium", result);
@@ -1110,7 +1089,7 @@ fn demo_tournament(model_path: &str) -> Result<(), String> {
         &config,
         AlphaZeroStrategy::new_with_model_path(25, model_path),
         RandomStrategy::new(),
-        20,
+        100,
         false,
     )?;
     println!("{:8} vs {:8}: {}", "AZ-25", "Random", result);
@@ -1120,7 +1099,7 @@ fn demo_tournament(model_path: &str) -> Result<(), String> {
         &config,
         AlphaZeroStrategy::new_with_model_path(50, model_path),
         AlphaZeroStrategy::new_with_model_path(10, model_path),
-        20,
+        100,
         false,
     )?;
     println!("{:8} vs {:8}: {}", "AZ-50", "AZ-10", result);

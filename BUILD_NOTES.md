@@ -115,7 +115,26 @@ Our 991-line `play.rs` includes a complete game framework with tournament system
 - ✅ Win rate vs random: 63.0% (strong performance)
 - ✅ GPU acceleration: ~5-7 seconds per iteration
 - ✅ Stable convergence without overfitting
-- ✅ AlphaZero vs Classical AI tournaments working
+
+### GPU Tournament Status:
+⚠️ **KNOWN ISSUE: CUDA Context Segfault in Tournament Mode**
+
+**Problem:** Tournament system crashes with segmentation fault when attempting to create CUDA neural networks
+**Root Cause:** CUDA context initialization issue in Burn framework during tournament environment
+**Scope:** GPU training works perfectly, CPU tournaments work perfectly, only CUDA inference in tournament fails
+
+**Workaround:** Use CPU-only tournament build:
+```bash
+podman exec cuda-dev bash -c "cd /workspace/mnk && /root/.cargo/bin/cargo build --release --bin mnk_game"
+./target/release/mnk_game --model-path model.bin
+```
+
+**Investigation Results:**
+- ✅ Classical AI tournaments: Fully functional in all modes
+- ✅ CPU AlphaZero tournaments: Fully functional with untrained networks
+- ✅ GPU training: Fully functional with model persistence
+- ❌ GPU AlphaZero inference: Segfault during CUDA context initialization
+- 📝 Issue surfaced after gradient clipping implementation
 
 **Critical Setup Requirements:**
 1. Container must have `--privileged` flag for GPU access

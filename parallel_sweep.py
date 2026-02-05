@@ -18,17 +18,9 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
-from rich.console import Console
-from rich.table import Table
-from rich.progress import Progress, TaskID, TextColumn, BarColumn, TimeElapsedColumn
-from rich.live import Live
-from rich.layout import Layout
 import itertools
 import argparse
 import fcntl
-from rich.panel import Panel
-from rich.text import Text
-from rich.columns import Columns
 
 
 @dataclass
@@ -89,16 +81,9 @@ class AlphaZeroSweep:
         # Intelligent parallelism detection
         if max_parallel_jobs:
             self.max_parallel_jobs = max_parallel_jobs
-        elif self.gpu_memory >= 20000:  # 20GB+ GPU
-            self.max_parallel_jobs = 16
-        elif self.gpu_memory >= 10000:  # 10-20GB GPU
-            self.max_parallel_jobs = 8
-        elif self.gpu_memory >= 6000:   # 6-10GB GPU
-            self.max_parallel_jobs = 4
-        elif self.cpu_cores >= 16:      # High-end CPU only
-            self.max_parallel_jobs = 8
         else:
-            self.max_parallel_jobs = 4
+            # Default to CPU cores - let user override if needed
+            self.max_parallel_jobs = self.cpu_cores
 
         self.results_dir = Path('./sweep_results')
         self.results_dir.mkdir(exist_ok=True)
@@ -106,7 +91,7 @@ class AlphaZeroSweep:
         # Dynamic timeout calculation
         # Base timeouts scaled by parallel load
         self.base_training_timeout = 300  # 5 minutes base
-        self.base_tournament_timeout = 180  # 3 minutes base (increased for reliability)
+        self.base_tournament_timeout = 600  # 10 minutes base (increased for 100+ games)
 
         print(f"🚀 AlphaZero Advanced Sweep Harness")
         print(f"   CPU Cores: {self.cpu_cores}")
@@ -147,7 +132,7 @@ class AlphaZeroSweep:
             # Execute training in container with unique model path
             cmd = [
                 "podman", "exec", "cuda-dev", "bash", "-c",
-                f"cd /workspace/mnk && LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/lib64:/usr/local/nccl/lib:/usr/local/cuda-12/lib64:/usr/local/lib ./target/release/train_alphazero {config.args} --model-path {unique_model}"
+                f"cd /workspace/mnk && LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/lib64:/usr/local/lib ./target/release/train_alphazero {config.args} --model-path {unique_model}"
             ]
             result = subprocess.run(
                 cmd,
@@ -192,8 +177,11 @@ class AlphaZeroSweep:
         work_dir = self.results_dir / config.name
 
         try:
-            # Run tournament on host with direct model path (no file copying needed!)
-            cmd = ["./target/release/mnk_game", "--model-path", model_file]
+            # Run tournament in container to avoid CUDA version mismatch
+            cmd = [
+                "podman", "exec", "cuda-dev", "bash", "-c",
+                f"cd /workspace/mnk && LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/lib64:/usr/local/lib ./target/release/mnk_game --model-path {model_file}"
+            ]
             result = subprocess.run(
                 cmd,
                 capture_output=True,
@@ -255,101 +243,77 @@ class AlphaZeroSweep:
         except:
             return 0
 
-    def create_status_table(self, experiments: List[ExperimentConfig], results: Dict[str, ExperimentResult],
-                          running_training: Dict[str, float], running_tournaments: Dict[str, float]) -> Table:
-        """Create a live status table with real-time updates"""
-        table = Table(show_header=True, header_style="bold magenta")
-        table.add_column("Experiment", style="cyan", width=15)
-        table.add_column("Status", width=12)
-        table.add_column("Training", width=8)
-        table.add_column("Tournament", width=10)
-        table.add_column("vs Random", width=8)
-        table.add_column("vs Deep", width=7)
-        table.add_column("vs Medium", width=9)
-        table.add_column("Time", width=6)
+    def create_status_summary(self, experiments: List[ExperimentConfig], results: Dict[str, ExperimentResult],
+                            running_training: Dict[str, float], running_tournaments: Dict[str, float]) -> str:
+        """Create a text-based status summary for CLI output"""
+        current_time = time.time()
+        completed = len(results)
+        total = len(experiments)
+        success = sum(1 for r in results.values() if r.training_success and r.tournament_success)
 
+        # Real-time activity counts
+        active_training = len(running_training)
+        active_tournaments = len(running_tournaments)
+
+        # Real-time VRAM monitoring
+        current_vram = self.get_current_vram_usage()
+        vram_percentage = f"{current_vram/self.gpu_memory*100:.1f}%" if self.gpu_memory and current_vram else "N/A"
+
+        # Activity status
+        activity_status = []
+        if active_training > 0:
+            activity_status.append(f"{active_training} training")
+        if active_tournaments > 0:
+            activity_status.append(f"{active_tournaments} tournaments")
+        if not activity_status:
+            activity_status.append("idle")
+
+        status = f"Progress: {completed}/{total} | Success: {success}/{completed} | Active: {', '.join(activity_status)} | VRAM: {current_vram}MB ({vram_percentage})"
+        return status
+
+    def print_experiment_status(self, experiments: List[ExperimentConfig], results: Dict[str, ExperimentResult],
+                              running_training: Dict[str, float], running_tournaments: Dict[str, float]):
+        """Print current status of all experiments"""
         current_time = time.time()
 
+        print("\nCurrent Experiment Status:")
+        print("-" * 80)
+        print(f"{'Experiment':<20} {'Status':<12} {'Training':<8} {'Tournament':<10} {'vs Random':<8} {'vs Deep':<7} {'vs Medium':<9}")
+        print("-" * 80)
+
         for exp in experiments:
-            name = exp.name
-            if name in results:
+            name = exp.name[:19] if len(exp.name) > 19 else exp.name
+            if exp.name in results:
                 # Completed experiment
-                r = results[name]
+                r = results[exp.name]
                 status = "✅ Done" if r.training_success and r.tournament_success else "❌ Failed"
                 training_status = f"{r.training_time:.1f}s" if r.training_success else "❌"
                 tournament_status = "✅" if r.tournament_success else "❌"
                 vs_random = r.vs_random if r.tournament_success else "N/A"
                 vs_deep = r.vs_deep if r.tournament_success else "N/A"
                 vs_medium = r.vs_medium if r.tournament_success else "N/A"
-                total_time = f"{r.total_time:.0f}s"
-            elif name in running_training:
+            elif exp.name in running_training:
                 # Currently training
-                elapsed = current_time - running_training[name]
-                status = f"🔄 Training"
+                elapsed = current_time - running_training[exp.name]
+                status = "🔄 Training"
                 training_status = f"{elapsed:.0f}s"
                 tournament_status = "⏳"
                 vs_random = vs_deep = vs_medium = "⏳"
-                total_time = f"{elapsed:.0f}s"
-            elif name in running_tournaments:
+            elif exp.name in running_tournaments:
                 # Currently in tournament
-                elapsed = current_time - running_tournaments[name]
-                status = f"🏆 Tournament"
-                r = results.get(name)
+                elapsed = current_time - running_tournaments[exp.name]
+                status = "🏆 Tournament"
+                r = results.get(exp.name)
                 training_status = f"{r.training_time:.1f}s" if r else "✅"
                 tournament_status = f"{elapsed:.0f}s"
                 vs_random = vs_deep = vs_medium = "🔄"
-                total_time = f"{elapsed:.0f}s"
             else:
                 # Pending
                 status = "⏳ Pending"
                 training_status = tournament_status = "⏳"
                 vs_random = vs_deep = vs_medium = "⏳"
-                total_time = "⏳"
 
-            table.add_row(name, status, training_status, tournament_status, vs_random, vs_deep, vs_medium, total_time)
-
-        return table
-
-    def create_summary_panel(self, experiments: List[ExperimentConfig], results: Dict[str, ExperimentResult],
-                           start_time: float, running_training: Dict[str, float] = None,
-                           running_tournaments: Dict[str, float] = None) -> Panel:
-        """Create a summary panel with real-time statistics and VRAM monitoring"""
-        completed = len(results)
-        total = len(experiments)
-        success = sum(1 for r in results.values() if r.training_success and r.tournament_success)
-        elapsed = time.time() - start_time
-
-        # Real-time activity counts
-        active_training = len(running_training) if running_training else 0
-        active_tournaments = len(running_tournaments) if running_tournaments else 0
-
-        # Real-time VRAM monitoring
-        current_vram = self.get_current_vram_usage()
-        vram_percentage = f"{current_vram/self.gpu_memory*100:.1f}%" if self.gpu_memory and current_vram else "N/A"
-        vram_bar = f"{current_vram}MB / {self.gpu_memory}MB" if self.gpu_memory else f"{current_vram}MB"
-
-        # Activity status
-        activity_status = []
-        if active_training > 0:
-            activity_status.append(f"🔄 {active_training} training")
-        if active_tournaments > 0:
-            activity_status.append(f"🏆 {active_tournaments} tournaments")
-        if not activity_status:
-            activity_status.append("⏸️  idle")
-
-        summary_text = f"""
-[bold cyan]AlphaZero Hyperparameter Sweep[/bold cyan]
-
-📊 Progress: {completed}/{total} experiments completed
-✅ Success: {success}/{completed} experiments successful
-⏱️  Elapsed: {elapsed:.0f}s
-🔥 Active: {', '.join(activity_status)}
-🎮 VRAM: {vram_bar} ({vram_percentage})
-🖥️  Max Jobs: {self.max_parallel_jobs}
-💾 Results: {self.results_dir}
-        """.strip()
-
-        return Panel(summary_text, title="Sweep Status", border_style="bright_blue")
+            print(f"{name:<20} {status:<12} {training_status:<8} {tournament_status:<10} {vs_random:<8} {vs_deep:<7} {vs_medium:<9}")
 
     def calculate_optimal_concurrency(self) -> Tuple[int, int, bool]:
         """Calculate optimal training/tournament concurrency based on VRAM"""
@@ -358,20 +322,22 @@ class AlphaZeroSweep:
 
         # VRAM requirements (in MB) - updated after memory leak fix and tournament analysis
         training_vram_per_job = 300      # Training uses ~300MB per job
-        tournament_vram_per_job = 2000   # Tournament uses up to 2140MB peak (was 800MB estimate)
-        safety_margin = 2000             # Keep 2GB free for overhead
+        tournament_vram_per_job = 1500   # Tournament uses ~1.5GB per job (reduced from 2GB)
+        safety_margin = 1500             # Keep 1.5GB free for overhead (reduced for high-end GPUs)
 
         available_vram = self.gpu_memory - safety_margin
 
-        # Strategy 1: Try concurrent training + tournaments
-        max_tournaments = available_vram // tournament_vram_per_job
-        if max_tournaments >= 1:
-            # Calculate remaining VRAM after tournaments
-            remaining_vram = available_vram - (max_tournaments * tournament_vram_per_job)
+        # Strategy 1: Try concurrent training + tournaments (balanced allocation)
+        # Aim for balanced concurrent jobs: more training than tournaments
+        target_tournaments = min(4, self.max_parallel_jobs // 4)  # Start with fewer tournaments
+
+        for num_tournaments in range(target_tournaments, 0, -1):
+            tournaments_vram = num_tournaments * tournament_vram_per_job
+            remaining_vram = available_vram - tournaments_vram
             max_concurrent_training = min(self.max_parallel_jobs, remaining_vram // training_vram_per_job)
 
-            if max_concurrent_training >= 4:  # Need decent training parallelism
-                return max_concurrent_training, max_tournaments, True
+            if max_concurrent_training >= 8:  # Need decent training parallelism
+                return max_concurrent_training, num_tournaments, True
 
         # Strategy 2: Sequential phases with optimized parallelism
         max_training_only = min(self.max_parallel_jobs, available_vram // training_vram_per_job)
@@ -381,7 +347,6 @@ class AlphaZeroSweep:
 
     def run_sweep(self, experiments: List[ExperimentConfig], sweep_name: str = "sweep") -> pd.DataFrame:
         """Run optimally concurrent sweep: training + tournaments together when VRAM allows"""
-        console = Console()
 
         # Initial setup
         training_timeout, tournament_timeout = self.calculate_timeouts()
@@ -399,169 +364,170 @@ class AlphaZeroSweep:
         training_jobs, tournament_jobs, can_run_concurrent = self.calculate_optimal_concurrency()
 
         if can_run_concurrent:
-            console.print(f"🚀 [bold green]Concurrent Mode: Training ({training_jobs}) + Tournaments ({tournament_jobs})[/bold green]")
-            console.print(f"   GPU Memory: {self.gpu_memory}MB, Estimated usage: {training_jobs * 300 + tournament_jobs * 5200}MB")
+            print(f"🚀 [CONCURRENT MODE] Training ({training_jobs}) + Tournaments ({tournament_jobs})")
+            print(f"   GPU Memory: {self.gpu_memory}MB, Estimated usage: {training_jobs * 300 + tournament_jobs * 5200}MB")
         else:
-            console.print(f"🚀 [bold cyan]Sequential Mode: Training ({training_jobs}) → Tournaments ({tournament_jobs})[/bold cyan]")
-            console.print(f"   GPU Memory: {self.gpu_memory}MB (insufficient for concurrent)")
-
-        # Create layout
-        layout = Layout()
-        layout.split_column(
-            Layout(name="header", size=8),
-            Layout(name="table", ratio=1)
-        )
+            print(f"🚀 [SEQUENTIAL MODE] Training ({training_jobs}) → Tournaments ({tournament_jobs})")
+            print(f"   GPU Memory: {self.gpu_memory}MB (insufficient for concurrent)")
 
         if can_run_concurrent:
             # Concurrent Mode: Training and Tournaments together
             with ProcessPoolExecutor(max_workers=training_jobs + tournament_jobs) as executor:
                 # Phase 1: Submit all training jobs
-                training_futures = {
-                    executor.submit(self.run_training_only, exp): exp
-                    for exp in experiments
-                }
+                print(f"  🚀 Starting {len(experiments)} training jobs...", flush=True)
+                training_futures = {}
+                for i, exp in enumerate(experiments, 1):
+                    print(f"    [{i}/{len(experiments)}] Submitting: {exp.name}", flush=True)
+                    future = executor.submit(self.run_training_only, exp)
+                    training_futures[future] = exp
+                    print(f"    [{i}/{len(experiments)}] ✅ Queued: {exp.name}", flush=True)
+                print(f"  ✅ All {len(experiments)} training jobs submitted", flush=True)
 
                 for future, exp in training_futures.items():
                     running_training[exp.name] = time.time()
 
-                # Initial display setup
-                layout["header"].update(self.create_summary_panel(experiments, final_results, start_time))
-                layout["table"].update(self.create_status_table(experiments, final_results, running_training, {}))
-
                 tournament_futures = {}
                 completed_training = 0
 
-                with Live(layout, refresh_per_second=2, screen=True) as live:
-                    # Process training completions and submit tournaments
-                    for future in as_completed(training_futures):
-                        exp = training_futures[future]
-                        try:
-                            success, train_time, empty_value, error, model_file = future.result()
-                            training_results[exp.name] = (success, train_time, empty_value, error, model_file)
-                            completed_training += 1
+                # Status update interval
+                last_status_update = time.time()
+                status_update_interval = 10  # seconds (more frequent updates)
 
-                            if exp.name in running_training:
-                                del running_training[exp.name]
+                # Process training completions and submit tournaments
+                for future in as_completed(training_futures):
+                    exp = training_futures[future]
+                    try:
+                        success, train_time, empty_value, error, model_file = future.result()
+                        training_results[exp.name] = (success, train_time, empty_value, error, model_file)
+                        completed_training += 1
 
-                            console.print(f"  ✅ Training: {exp.name} - {train_time:.1f}s, value={empty_value:.3f}" if success else f"  ❌ Training: {exp.name} - {error}")
+                        if exp.name in running_training:
+                            del running_training[exp.name]
 
-                            # Immediately submit tournament if training succeeded and we have capacity
-                            active_tournaments = len([f for f in tournament_futures if not f.done()])
-                            if success and model_file and active_tournaments < tournament_jobs:
-                                tournament_future = executor.submit(self.run_tournament_only, exp, model_file)
-                                tournament_futures[tournament_future] = (exp, train_time, empty_value)
-                                running_tournaments[exp.name] = time.time()
-                                console.print(f"  🏆 Started tournament: {exp.name}")
+                        print(f"  ✅ Training: {exp.name} - {train_time:.1f}s, value={empty_value:.3f}" if success else f"  ❌ Training: {exp.name} - {error}")
 
-                            # Create preliminary result for display
-                            final_results[exp.name] = ExperimentResult(
-                                name=exp.name,
-                                args=exp.args,
-                                training_time=train_time,
-                                training_success=success,
-                                empty_board_value=empty_value,
-                                vs_random="🔄" if success and exp.name in running_tournaments else ("⏳" if success else "N/A"),
-                                vs_deep="🔄" if success and exp.name in running_tournaments else ("⏳" if success else "N/A"),
-                                vs_medium="🔄" if success and exp.name in running_tournaments else ("⏳" if success else "N/A"),
-                                tournament_success=False,
-                                total_time=train_time
-                            )
+                        # Immediately submit tournament if training succeeded and we have capacity
+                        active_tournaments = len([f for f in tournament_futures if not f.done()])
+                        if success and model_file and active_tournaments < tournament_jobs:
+                            tournament_future = executor.submit(self.run_tournament_only, exp, model_file)
+                            tournament_futures[tournament_future] = (exp, train_time, empty_value)
+                            running_tournaments[exp.name] = time.time()
+                            print(f"  🏆 Started tournament: {exp.name}")
 
-                            # Update display
-                            layout["header"].update(self.create_summary_panel(experiments, final_results, start_time))
-                            layout["table"].update(self.create_status_table(experiments, final_results, running_training, running_tournaments))
+                        # Create preliminary result for display
+                        final_results[exp.name] = ExperimentResult(
+                            name=exp.name,
+                            args=exp.args,
+                            training_time=train_time,
+                            training_success=success,
+                            empty_board_value=empty_value,
+                            vs_random="🔄" if success and exp.name in running_tournaments else ("⏳" if success else "N/A"),
+                            vs_deep="🔄" if success and exp.name in running_tournaments else ("⏳" if success else "N/A"),
+                            vs_medium="🔄" if success and exp.name in running_tournaments else ("⏳" if success else "N/A"),
+                            tournament_success=False,
+                            total_time=train_time
+                        )
 
-                        except Exception as e:
-                            console.print(f"[red]❌ Training exception in {exp.name}: {e}[/red]")
-                            if exp.name in running_training:
-                                del running_training[exp.name]
+                        # Periodic status updates
+                        current_time = time.time()
+                        if current_time - last_status_update > status_update_interval:
+                            print(f"\n[STATUS] {self.create_status_summary(experiments, final_results, running_training, running_tournaments)}")
+                            last_status_update = current_time
 
-                    # Process tournament completions
-                    for future in as_completed(tournament_futures):
-                        exp, train_time, empty_value = tournament_futures[future]
+                    except Exception as e:
+                        print(f"❌ Training exception in {exp.name}: {e}")
+                        if exp.name in running_training:
+                            del running_training[exp.name]
 
-                        if exp.name in running_tournaments:
-                            del running_tournaments[exp.name]
+                # Process tournament completions
+                for future in as_completed(tournament_futures):
+                    exp, train_time, empty_value = tournament_futures[future]
 
-                        try:
-                            success, vs_random, vs_deep, vs_medium = future.result()
+                    if exp.name in running_tournaments:
+                        del running_tournaments[exp.name]
 
-                            # Update final results
-                            final_results[exp.name] = ExperimentResult(
-                                name=exp.name,
-                                args=exp.args,
-                                training_time=train_time,
-                                training_success=True,
-                                empty_board_value=empty_value,
-                                vs_random=vs_random,
-                                vs_deep=vs_deep,
-                                vs_medium=vs_medium,
-                                tournament_success=success,
-                                total_time=train_time  # Tournament runs concurrent, so don't add time
-                            )
+                    try:
+                        success, vs_random, vs_deep, vs_medium = future.result()
 
-                            if success:
-                                console.print(f"  ✅ Tournament: {exp.name} - Random={vs_random}, Deep={vs_deep}, Medium={vs_medium}")
-                            else:
-                                console.print(f"  ❌ Tournament failed: {exp.name}")
+                        # Update final results
+                        final_results[exp.name] = ExperimentResult(
+                            name=exp.name,
+                            args=exp.args,
+                            training_time=train_time,
+                            training_success=True,
+                            empty_board_value=empty_value,
+                            vs_random=vs_random,
+                            vs_deep=vs_deep,
+                            vs_medium=vs_medium,
+                            tournament_success=success,
+                            total_time=train_time  # Tournament runs concurrent, so don't add time
+                        )
 
-                            # Update display
-                            layout["header"].update(self.create_summary_panel(experiments, final_results, start_time))
-                            layout["table"].update(self.create_status_table(experiments, final_results, running_training, running_tournaments))
+                        if success:
+                            print(f"  ✅ Tournament: {exp.name} - Random={vs_random}, Deep={vs_deep}, Medium={vs_medium}")
+                        else:
+                            print(f"  ❌ Tournament failed: {exp.name}")
 
-                        except Exception as e:
-                            console.print(f"[red]❌ Tournament exception in {exp.name}: {e}[/red]")
+                    except Exception as e:
+                        print(f"❌ Tournament exception in {exp.name}: {e}")
 
         else:
             # Sequential Mode: Training first, then tournaments
             # Phase 1: Parallel Training
             with ProcessPoolExecutor(max_workers=training_jobs) as executor:
-                training_futures = {
-                    executor.submit(self.run_training_only, exp): exp
-                    for exp in experiments
-                }
+                print(f"  🚀 Starting {len(experiments)} training jobs...", flush=True)
+                training_futures = {}
+                for i, exp in enumerate(experiments, 1):
+                    print(f"    [{i}/{len(experiments)}] Submitting: {exp.name}", flush=True)
+                    future = executor.submit(self.run_training_only, exp)
+                    training_futures[future] = exp
+                    print(f"    [{i}/{len(experiments)}] ✅ Queued: {exp.name}", flush=True)
+                print(f"  ✅ All {len(experiments)} training jobs submitted", flush=True)
 
                 for future, exp in training_futures.items():
                     running_training[exp.name] = time.time()
 
-                layout["header"].update(self.create_summary_panel(experiments, final_results, start_time))
-                layout["table"].update(self.create_status_table(experiments, final_results, running_training, {}))
+                # Status update interval
+                last_status_update = time.time()
+                status_update_interval = 10  # seconds (more frequent updates)
 
-                with Live(layout, refresh_per_second=2, screen=True) as live:
-                    for future in as_completed(training_futures):
-                        exp = training_futures[future]
-                        try:
-                            success, train_time, empty_value, error, model_file = future.result()
-                            training_results[exp.name] = (success, train_time, empty_value, error, model_file)
+                for future in as_completed(training_futures):
+                    exp = training_futures[future]
+                    try:
+                        success, train_time, empty_value, error, model_file = future.result()
+                        training_results[exp.name] = (success, train_time, empty_value, error, model_file)
 
-                            if exp.name in running_training:
-                                del running_training[exp.name]
+                        if exp.name in running_training:
+                            del running_training[exp.name]
 
-                            final_results[exp.name] = ExperimentResult(
-                                name=exp.name,
-                                args=exp.args,
-                                training_time=train_time,
-                                training_success=success,
-                                empty_board_value=empty_value,
-                                vs_random="⏳" if success else "N/A",
-                                vs_deep="⏳" if success else "N/A",
-                                vs_medium="⏳" if success else "N/A",
-                                tournament_success=False,
-                                total_time=train_time
-                            )
+                        final_results[exp.name] = ExperimentResult(
+                            name=exp.name,
+                            args=exp.args,
+                            training_time=train_time,
+                            training_success=success,
+                            empty_board_value=empty_value,
+                            vs_random="⏳" if success else "N/A",
+                            vs_deep="⏳" if success else "N/A",
+                            vs_medium="⏳" if success else "N/A",
+                            tournament_success=False,
+                            total_time=train_time
+                        )
 
-                            console.print(f"  ✅ Training: {exp.name} - {train_time:.1f}s, value={empty_value:.3f}" if success else f"  ❌ Training: {exp.name} - {error}")
+                        print(f"  ✅ Training: {exp.name} - {train_time:.1f}s, value={empty_value:.3f}" if success else f"  ❌ Training: {exp.name} - {error}")
 
-                            layout["header"].update(self.create_summary_panel(experiments, final_results, start_time))
-                            layout["table"].update(self.create_status_table(experiments, final_results, running_training, {}))
+                        # Periodic status updates
+                        current_time = time.time()
+                        if current_time - last_status_update > status_update_interval:
+                            print(f"\n[STATUS] {self.create_status_summary(experiments, final_results, running_training, {})}")
+                            last_status_update = current_time
 
-                        except Exception as e:
-                            console.print(f"[red]❌ Exception in {exp.name}: {e}[/red]")
-                            if exp.name in running_training:
-                                del running_training[exp.name]
+                    except Exception as e:
+                        print(f"❌ Exception in {exp.name}: {e}")
+                        if exp.name in running_training:
+                            del running_training[exp.name]
 
             # Phase 2: Parallel Tournaments
-            console.print(f"\n🏆 [bold yellow]Phase 2: Parallel Tournaments ({tournament_jobs} jobs)[/bold yellow]")
+            print(f"\n🏆 [PHASE 2] Parallel Tournaments ({tournament_jobs} jobs)")
             successful_training = [exp for exp in experiments if training_results.get(exp.name, (False,))[0]]
 
             with ProcessPoolExecutor(max_workers=tournament_jobs) as tournament_executor:
@@ -574,51 +540,51 @@ class AlphaZeroSweep:
                         tournament_futures[future] = (exp, train_time, empty_value)
                         running_tournaments[exp.name] = time.time()
 
-                # Initial tournament display
-                layout["header"].update(self.create_summary_panel(experiments, final_results, start_time))
-                layout["table"].update(self.create_status_table(experiments, final_results, {}, running_tournaments))
+                # Status update interval
+                last_status_update = time.time()
 
-                with Live(layout, refresh_per_second=2, screen=True) as live:
-                    for i, future in enumerate(as_completed(tournament_futures), 1):
-                        exp, train_time, empty_value = tournament_futures[future]
+                for i, future in enumerate(as_completed(tournament_futures), 1):
+                    exp, train_time, empty_value = tournament_futures[future]
 
-                        if exp.name in running_tournaments:
-                            del running_tournaments[exp.name]
+                    if exp.name in running_tournaments:
+                        del running_tournaments[exp.name]
 
-                        console.print(f"  🎯 Tournament {i}/{len(tournament_futures)}: {exp.name}")
+                    print(f"  🎯 Tournament {i}/{len(tournament_futures)}: {exp.name}")
 
-                        try:
-                            success, vs_random, vs_deep, vs_medium = future.result()
+                    try:
+                        success, vs_random, vs_deep, vs_medium = future.result()
 
-                            final_results[exp.name] = ExperimentResult(
-                                name=exp.name,
-                                args=exp.args,
-                                training_time=train_time,
-                                training_success=True,
-                                empty_board_value=empty_value,
-                                vs_random=vs_random,
-                                vs_deep=vs_deep,
-                                vs_medium=vs_medium,
-                                tournament_success=success,
-                                total_time=train_time  # Sequential, but report training time only
-                            )
+                        final_results[exp.name] = ExperimentResult(
+                            name=exp.name,
+                            args=exp.args,
+                            training_time=train_time,
+                            training_success=True,
+                            empty_board_value=empty_value,
+                            vs_random=vs_random,
+                            vs_deep=vs_deep,
+                            vs_medium=vs_medium,
+                            tournament_success=success,
+                            total_time=train_time  # Sequential, but report training time only
+                        )
 
-                            if success:
-                                console.print(f"    ✅ Results: Random={vs_random}, Deep={vs_deep}, Medium={vs_medium}")
-                            else:
-                                console.print(f"    ❌ Tournament failed")
+                        if success:
+                            print(f"    ✅ Results: Random={vs_random}, Deep={vs_deep}, Medium={vs_medium}")
+                        else:
+                            print(f"    ❌ Tournament failed")
 
-                        except Exception as e:
-                            console.print(f"[red]❌ Tournament exception in {exp.name}: {e}[/red]")
+                    except Exception as e:
+                        print(f"❌ Tournament exception in {exp.name}: {e}")
 
-                        # Update display
-                        layout["header"].update(self.create_summary_panel(experiments, final_results, start_time))
-                        layout["table"].update(self.create_status_table(experiments, final_results, {}, running_tournaments))
+                    # Periodic status updates
+                    current_time = time.time()
+                    if current_time - last_status_update > status_update_interval:
+                        print(f"\n[STATUS] {self.create_status_summary(experiments, final_results, {}, running_tournaments)}")
+                        last_status_update = current_time
 
         total_time = time.time() - start_time
 
         # Show final results
-        console.print(f"\n[bold green]✅ Sweep completed in {total_time:.1f}s[/bold green]")
+        print(f"\n✅ Sweep completed in {total_time:.1f}s")
 
         # Create results DataFrame
         df = pd.DataFrame([
@@ -630,79 +596,119 @@ class AlphaZeroSweep:
                 'vs_Random': r.vs_random,
                 'vs_Deep': r.vs_deep,
                 'vs_Medium': r.vs_medium,
-                'Status': 'SUCCESS' if r.training_success and r.tournament_success else 'TIMEOUT/FAILED',
+                'Status': 'SUCCESS' if r.training_success and r.tournament_success else 'FAILED',
                 'Total_Time': f"{r.total_time:.1f}s"
             }
             for r in final_results.values()
         ])
 
-        # Save results
+        # Save results with timestamp
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         results_file = self.results_dir / f"{sweep_name}_{timestamp}.csv"
         df.to_csv(results_file, index=False)
 
-        # Save markdown report
-        md_file = self.results_dir / f"{sweep_name}_{timestamp}.md"
-        with open(md_file, 'w') as f:
-            f.write(f"# {sweep_name.title()} Results\n\n")
-            f.write(f"**Date:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"**Parallel Jobs:** {self.max_parallel_jobs}\n")
-            f.write(f"**GPU Memory:** {self.gpu_memory}MB\n" if self.gpu_memory else "**GPU:** Not detected\n")
-            f.write(f"**Total Time:** {total_time:.1f}s\n\n")
-            f.write("## Results\n\n")
-            f.write(df.to_markdown(index=False))
+        print(f"\nResults saved to: {results_file}")
 
-        console.print(f"📊 Results saved to: [cyan]{results_file}[/cyan]")
-        console.print(f"📄 Report saved to: [cyan]{md_file}[/cyan]")
+        # Analysis and summary
+        successful_experiments = df[df['Status'] == 'SUCCESS']
+        failed_experiments = df[df['Status'] == 'FAILED']
 
-        # Display final table
-        console.print("\n[bold]Final Results:[/bold]")
-        final_table = Table(show_header=True)
-        for col in df.columns:
-            final_table.add_column(col, style="cyan" if col == "Experiment" else None)
+        print(f"\n📊 EXPERIMENT SUMMARY")
+        print(f"   Total experiments: {len(df)}")
+        print(f"   Successful: {len(successful_experiments)} ({len(successful_experiments)/len(df)*100:.1f}%)")
+        print(f"   Failed: {len(failed_experiments)} ({len(failed_experiments)/len(df)*100:.1f}%)")
 
-        for _, row in df.iterrows():
-            final_table.add_row(*[str(val) for val in row.tolist()])
+        if len(successful_experiments) > 0:
+            # Best performers analysis
+            print(f"\n🏆 TOP PERFORMERS")
 
-        console.print(final_table)
+            # Try to extract numeric values for analysis, handling non-numeric formats
+            def extract_win_rate(match_result):
+                try:
+                    if 'W' in match_result:
+                        # Format like "5W-0D-0L"
+                        wins = int(match_result.split('W')[0])
+                        return wins
+                    elif '-' in match_result:
+                        # Format like "5-0-0"
+                        wins = int(match_result.split('-')[0])
+                        return wins
+                    else:
+                        return 0
+                except:
+                    return 0
+
+            if not successful_experiments.empty:
+                successful_experiments = successful_experiments.copy()
+                successful_experiments['Random_Wins'] = successful_experiments['vs_Random'].apply(extract_win_rate)
+                successful_experiments['Deep_Wins'] = successful_experiments['vs_Deep'].apply(extract_win_rate)
+                successful_experiments['Medium_Wins'] = successful_experiments['vs_Medium'].apply(extract_win_rate)
+                successful_experiments['Total_Wins'] = (
+                    successful_experiments['Random_Wins'] +
+                    successful_experiments['Deep_Wins'] +
+                    successful_experiments['Medium_Wins']
+                )
+
+                # Top 5 by total wins
+                top_performers = successful_experiments.nlargest(5, 'Total_Wins')
+                for idx, row in top_performers.iterrows():
+                    print(f"   {row['Experiment']}: {row['Total_Wins']} total wins "
+                          f"(R:{row['vs_Random']}, D:{row['vs_Deep']}, M:{row['vs_Medium']})")
+
+        # Display full results table
+        print(f"\n📋 DETAILED RESULTS")
+        print(df.to_string(index=False))
 
         return df
 
 
 @dataclass
 class SweepConfig:
-    """Configuration for parameter sweep ranges"""
+    """Configuration for parameter sweep ranges with advanced options"""
+    # Core training parameters
     iterations: List[int] = None
     games_per_iter: List[int] = None
     epochs: List[int] = None
     batch_size: List[int] = None
+
+    # Optimization parameters
     learning_rate: List[float] = None
     value_weight: List[float] = None
+
+    # MCTS parameters
     mcts_simulations: List[int] = None
 
+    # Advanced parameters (optional)
+    temperature: List[float] = None
+    cpuct: List[float] = None
+
     def __post_init__(self):
+        """Set intelligent defaults for unspecified parameters"""
         # Set defaults if not provided
         if self.iterations is None:
-            self.iterations = [10]
+            self.iterations = [2]
         if self.games_per_iter is None:
             self.games_per_iter = [5]
         if self.epochs is None:
-            self.epochs = [4]
+            self.epochs = [2]
         if self.batch_size is None:
-            self.batch_size = [32]
+            self.batch_size = [1024]
         if self.learning_rate is None:
-            self.learning_rate = [0.001]
+            self.learning_rate = [0.0005]
         if self.value_weight is None:
             self.value_weight = [1.0]
         if self.mcts_simulations is None:
             self.mcts_simulations = [25]
 
+        # Advanced parameters default to None (not included in args unless specified)
+
+
 def generate_experiments(sweep_config: SweepConfig) -> List[ExperimentConfig]:
-    """Generate all possible experiments from parameter ranges"""
+    """Generate all possible experiments from parameter ranges with advanced parameter support"""
     experiments = []
 
-    # Generate all combinations of parameters
-    for combo in itertools.product(
+    # Build parameter combinations
+    param_combinations = [
         sweep_config.iterations,
         sweep_config.games_per_iter,
         sweep_config.epochs,
@@ -710,55 +716,42 @@ def generate_experiments(sweep_config: SweepConfig) -> List[ExperimentConfig]:
         sweep_config.learning_rate,
         sweep_config.value_weight,
         sweep_config.mcts_simulations
-    ):
+    ]
+
+    # Add advanced parameters if specified
+    advanced_params = []
+    if sweep_config.temperature is not None:
+        advanced_params.append(('temperature', sweep_config.temperature))
+    if sweep_config.cpuct is not None:
+        advanced_params.append(('cpuct', sweep_config.cpuct))
+
+    for combo in itertools.product(*param_combinations):
         iterations, games, epochs, batch_size, lr, value_weight, mcts_sims = combo
 
-        # Create experiment name
+        # Base experiment name and args
         name = f"i{iterations}_g{games}_e{epochs}_b{batch_size}_lr{lr}_vw{value_weight}_mcts{mcts_sims}"
-
-        # Build argument string
         args = f"-i {iterations} -g {games} -e {epochs} --batch-size {batch_size} --learning-rate {lr} --value-weight {value_weight} --mcts-simulations {mcts_sims}"
 
-        experiments.append(ExperimentConfig(name, args))
+        # Add advanced parameters if any are specified
+        if advanced_params:
+            for param_combo in itertools.product(*[params[1] for params in advanced_params]):
+                extended_name = name
+                extended_args = args
+
+                for i, (param_name, param_value) in enumerate(zip([p[0] for p in advanced_params], param_combo)):
+                    extended_name += f"_{param_name}{param_value}"
+                    extended_args += f" --{param_name} {param_value}"
+
+                experiments.append(ExperimentConfig(extended_name, extended_args))
+        else:
+            experiments.append(ExperimentConfig(name, args))
 
     return experiments
-
-
-def get_preset_config(preset_name: str) -> SweepConfig:
-    """Get predefined sweep configurations"""
-    presets = {
-        "quick": SweepConfig(
-            value_weight=[0.8, 1.0, 1.2, 2.0],
-            mcts_simulations=[25, 50, 100, 300]
-        ),
-        "value_weight": SweepConfig(
-            iterations=[15],
-            games_per_iter=[8],
-            epochs=[6],
-            value_weight=[0.5, 0.8, 1.0, 1.2, 1.5, 2.0, 2.5, 3.0],
-            mcts_simulations=[50]
-        ),
-        "mcts": SweepConfig(
-            value_weight=[1.0, 1.5],
-            mcts_simulations=[25, 50, 100, 200, 300, 500]
-        ),
-        "comprehensive": SweepConfig(
-            value_weight=[1.0, 1.5, 2.0, 3.0],
-            mcts_simulations=[25, 50, 100, 200]
-        )
-    }
-
-    if preset_name not in presets:
-        available = ", ".join(presets.keys())
-        raise ValueError(f"Unknown preset: {preset_name}. Available: {available}")
-
-    return presets[preset_name]
 
 
 def parse_range(value_str: str) -> List[float]:
     """Parse parameter ranges like '0.5,1.0,1.5' or '0.5:2.0:0.5'"""
     if ':' in value_str:
-        # Range notation: start:end:step
         parts = value_str.split(':')
         start, end = float(parts[0]), float(parts[1])
         step = float(parts[2]) if len(parts) > 2 else 1.0
@@ -769,51 +762,43 @@ def parse_range(value_str: str) -> List[float]:
             current += step
         return values
     else:
-        # List notation: val1,val2,val3
         return [float(x.strip()) for x in value_str.split(',')]
 
 
 def parse_int_range(value_str: str) -> List[int]:
-    """Parse integer parameter ranges"""
+    """Parse integer parameter ranges like '5,10,15' or '5:20:5'"""
     if ':' in value_str:
-        # Range notation: start:end:step
         parts = value_str.split(':')
         start, end = int(parts[0]), int(parts[1])
         step = int(parts[2]) if len(parts) > 2 else 1
         return list(range(start, end + 1, step))
     else:
-        # List notation: val1,val2,val3
         return [int(x.strip()) for x in value_str.split(',')]
 
 
 def main():
-    """Main entry point with flexible parameter specification"""
+    """Main entry point with advanced parameter specification and intelligent defaults"""
     parser = argparse.ArgumentParser(
-        description="AlphaZero Hyperparameter Sweep with Flexible Parameter Ranges",
+        description="Advanced AlphaZero Hyperparameter Sweep with Dynamic Resource Management",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Use preset configuration
-  python parallel_sweep.py --preset quick --jobs 4
+  # Basic sweep with learning rate variations
+  python parallel_sweep.py --learning-rate 0.001,0.01,0.1
 
-  # Custom value weight sweep
-  python parallel_sweep.py --value-weight 0.5,1.0,1.5,2.0 --mcts 25,50,100
+  # Range-based parameter sweep
+  python parallel_sweep.py --iterations 5:20:5 --games 5,10,15
 
-  # Range notation
-  python parallel_sweep.py --value-weight 0.5:2.0:0.5 --mcts 25:200:25
+  # Complex multi-parameter sweep
+  python parallel_sweep.py -i 10,20 -g 5:15:5 --batch-size 16,32,64 --mcts 25,50,100
 
-  # Single parameter
-  python parallel_sweep.py --value-weight 1.0 --mcts 25:300:25 --learning-rate 0.001
-
-Parameter format:
-  - Lists: 1,2,3 or 0.5,1.0,1.5
-  - Ranges: start:end:step (e.g., 1:5:1 = [1,2,3,4,5] or 0.5:2.0:0.5 = [0.5,1.0,1.5,2.0])
-  - Single: just the value (e.g., 1.0)
-"""
+  # Advanced parameters
+  python parallel_sweep.py --temperature 0.8,1.0,1.2 --cpuct 1.0,1.5,2.0
+        """
     )
 
-    # Parameter groups
-    param_group = parser.add_argument_group('hyperparameters')
+    # Core parameter groups
+    param_group = parser.add_argument_group('core hyperparameters')
     param_group.add_argument('--iterations', '-i', help='Training iterations (default: 10)')
     param_group.add_argument('--games', '-g', help='Games per iteration (default: 5)')
     param_group.add_argument('--epochs', '-e', help='Training epochs (default: 4)')
@@ -822,61 +807,145 @@ Parameter format:
     param_group.add_argument('--value-weight', '-vw', help='Value loss weight (default: 1.0)')
     param_group.add_argument('--mcts', '-m', help='MCTS simulations (default: 25)')
 
-    # Preset and execution options
-    parser.add_argument('--preset', '-p', choices=['quick', 'value_weight', 'mcts', 'comprehensive'],
-                       help='Use predefined parameter set')
-    parser.add_argument('--jobs', '-j', type=int, help='Max parallel jobs (auto-detect if not specified)')
-    parser.add_argument('--output-dir', '-o', help='Output directory for results')
-    parser.add_argument('--dry-run', action='store_true', help='Show experiments that would be run without executing')
+    # Advanced parameter group
+    advanced_group = parser.add_argument_group('advanced hyperparameters')
+    advanced_group.add_argument('--temperature', '-t', help='MCTS temperature (optional)')
+    advanced_group.add_argument('--cpuct', '-c', help='MCTS CPUCT exploration parameter (optional)')
+
+    # Execution control
+    control_group = parser.add_argument_group('execution control')
+    control_group.add_argument('--jobs', '-j', type=int, help='Max parallel jobs (auto-detect if not specified)')
+    control_group.add_argument('--dry-run', action='store_true', help='Show experiments that would be run without executing')
+    control_group.add_argument('--sweep-name', default='advanced_sweep', help='Name for this sweep (affects output files)')
 
     args = parser.parse_args()
 
-    # Create sweep configuration
-    if args.preset:
-        sweep_config = get_preset_config(args.preset)
-        sweep_name = args.preset
-    else:
-        # Build custom configuration from parameters
-        sweep_config = SweepConfig()
+    # Build advanced configuration
+    sweep_config = SweepConfig()
 
-        if args.iterations:
-            sweep_config.iterations = parse_int_range(args.iterations)
-        if args.games:
-            sweep_config.games_per_iter = parse_int_range(args.games)
-        if args.epochs:
-            sweep_config.epochs = parse_int_range(args.epochs)
-        if args.batch_size:
-            sweep_config.batch_size = parse_int_range(args.batch_size)
-        if args.learning_rate:
-            sweep_config.learning_rate = parse_range(args.learning_rate)
-        if args.value_weight:
-            sweep_config.value_weight = parse_range(args.value_weight)
-        if args.mcts:
-            sweep_config.mcts_simulations = parse_int_range(args.mcts)
+    # Core parameters
+    if args.iterations:
+        sweep_config.iterations = parse_int_range(args.iterations)
+    if args.games:
+        sweep_config.games_per_iter = parse_int_range(args.games)
+    if args.epochs:
+        sweep_config.epochs = parse_int_range(args.epochs)
+    if args.batch_size:
+        sweep_config.batch_size = parse_int_range(args.batch_size)
+    if args.learning_rate:
+        sweep_config.learning_rate = parse_range(args.learning_rate)
+    if args.value_weight:
+        sweep_config.value_weight = parse_range(args.value_weight)
+    if args.mcts:
+        sweep_config.mcts_simulations = parse_int_range(args.mcts)
 
-        sweep_name = "custom"
+    # Advanced parameters
+    if args.temperature:
+        sweep_config.temperature = parse_range(args.temperature)
+    if args.cpuct:
+        sweep_config.cpuct = parse_range(args.cpuct)
 
-    # Generate experiments
+    # Generate experiments with advanced parameter support
     experiments = generate_experiments(sweep_config)
 
+    print(f"📋 Generated {len(experiments)} experiments from parameter combinations")
+
+    # Show default values for parameters not being swept
+    print(f"\n📝 Default parameters (not swept):")
+    defaults_used = []
+    if len(sweep_config.iterations) == 1 and not args.iterations:
+        defaults_used.append(f"   Iterations: {sweep_config.iterations[0]}")
+    if len(sweep_config.games_per_iter) == 1 and not args.games:
+        defaults_used.append(f"   Games per iteration: {sweep_config.games_per_iter[0]}")
+    if len(sweep_config.epochs) == 1 and not args.epochs:
+        defaults_used.append(f"   Epochs: {sweep_config.epochs[0]}")
+    if len(sweep_config.batch_size) == 1 and not args.batch_size:
+        defaults_used.append(f"   Batch size: {sweep_config.batch_size[0]}")
+    if len(sweep_config.learning_rate) == 1 and not args.learning_rate:
+        defaults_used.append(f"   Learning rate: {sweep_config.learning_rate[0]}")
+    if len(sweep_config.value_weight) == 1 and not args.value_weight:
+        defaults_used.append(f"   Value weight: {sweep_config.value_weight[0]}")
+    if len(sweep_config.mcts_simulations) == 1 and not args.mcts:
+        defaults_used.append(f"   MCTS simulations: {sweep_config.mcts_simulations[0]}")
+
+    if defaults_used:
+        for default in defaults_used:
+            print(default)
+    else:
+        print("   (All parameters are being swept)")
+
+    # Show what is being swept
+    print(f"\n🔄 Parameters being swept:")
+    if len(sweep_config.iterations) > 1:
+        print(f"   Iterations: {sweep_config.iterations}")
+    if len(sweep_config.games_per_iter) > 1:
+        print(f"   Games per iteration: {sweep_config.games_per_iter}")
+    if len(sweep_config.epochs) > 1:
+        print(f"   Epochs: {sweep_config.epochs}")
+    if len(sweep_config.batch_size) > 1:
+        print(f"   Batch size: {sweep_config.batch_size}")
+    if len(sweep_config.learning_rate) > 1:
+        print(f"   Learning rate: {sweep_config.learning_rate}")
+    if len(sweep_config.value_weight) > 1:
+        print(f"   Value weight: {sweep_config.value_weight}")
+    if len(sweep_config.mcts_simulations) > 1:
+        print(f"   MCTS simulations: {sweep_config.mcts_simulations}")
+    if sweep_config.temperature and len(sweep_config.temperature) > 1:
+        print(f"   Temperature: {sweep_config.temperature}")
+    if sweep_config.cpuct and len(sweep_config.cpuct) > 1:
+        print(f"   CPUCT: {sweep_config.cpuct}")
+
     if args.dry_run:
-        print(f"\n🔍 Dry run: {len(experiments)} experiments would be generated:")
-        for exp in experiments[:10]:  # Show first 10
+        print(f"\nWould run {len(experiments)} experiments:")
+        for exp in experiments:
             print(f"  {exp.name}: {exp.args}")
-        if len(experiments) > 10:
-            print(f"  ... and {len(experiments) - 10} more")
+
+        # Show parameter space analysis
+        total_combinations = 1
+        param_counts = {
+            'iterations': len(sweep_config.iterations),
+            'games_per_iter': len(sweep_config.games_per_iter),
+            'epochs': len(sweep_config.epochs),
+            'batch_size': len(sweep_config.batch_size),
+            'learning_rate': len(sweep_config.learning_rate),
+            'value_weight': len(sweep_config.value_weight),
+            'mcts_simulations': len(sweep_config.mcts_simulations)
+        }
+
+        for param, count in param_counts.items():
+            total_combinations *= count
+
+        print(f"\n📊 Parameter space analysis:")
+        for param, count in param_counts.items():
+            print(f"   {param}: {count} values")
+
+        if sweep_config.temperature:
+            print(f"   temperature: {len(sweep_config.temperature)} values")
+        if sweep_config.cpuct:
+            print(f"   cpuct: {len(sweep_config.cpuct)} values")
+
+        print(f"   Total combinations: {len(experiments)}")
         return
 
-    # Create sweep harness
+    # Create advanced sweep harness
     sweep = AlphaZeroSweep(args.jobs)
 
-    # Run sweep
-    output_dir = args.output_dir or f"sweep_results/{sweep_name}_{int(time.time())}"
-    results_df = sweep.run_sweep(experiments, sweep_name)
+    # Estimate runtime
+    estimated_time_per_exp = 8 * 60  # 8 minutes per experiment (training + tournament)
+    if sweep.gpu_memory >= 20000:
+        estimated_time_per_exp = 5 * 60  # 5 minutes on high-end GPU
+    elif sweep.gpu_memory >= 10000:
+        estimated_time_per_exp = 6 * 60  # 6 minutes on mid-range GPU
 
-    # Display summary
-    print("\n📊 Results Summary:")
-    print(results_df.to_string(index=False))
+    total_estimated_time = (len(experiments) * estimated_time_per_exp) / sweep.max_parallel_jobs
+    print(f"⏱️  Estimated total time: {total_estimated_time/60:.1f} minutes ({total_estimated_time/3600:.1f} hours)")
+
+    # Run advanced sweep
+    results_df = sweep.run_sweep(experiments, args.sweep_name)
+
+    print(f"\n🎯 Advanced sweep completed successfully!")
+    print(f"   Results saved with timestamp")
+    print(f"   Check ./sweep_results/ directory for detailed logs")
 
 
 if __name__ == "__main__":
