@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::time::Instant;
+use clap::Parser;
 
 // Import the actual AlphaZero implementation from the shared library
 use mnk::alphazero::{AlphaZeroNet, simple_mcts};
@@ -12,17 +13,30 @@ pub enum TrainingLevel {
     Untrained,
 }
 
+#[derive(Parser)]
+#[command(name = "mnk_game")]
+#[command(about = "M,N,K Game with AlphaZero AI")]
+struct Args {
+    /// Path to the AlphaZero model file
+    #[arg(long, default_value = "alphazero_model.bin")]
+    model_path: String,
+}
+
 #[cfg(feature = "cuda")]
 use burn_candle::{Candle, CandleDevice};
 #[cfg(feature = "cuda")]
-type MyBackend = burn::backend::Autodiff<Candle>;
+type MyBackend = burn::backend::Autodiff<Candle>; // For training compatibility
+#[cfg(feature = "cuda")]
+type InferenceBackend = Candle; // For tournament inference (no Autodiff!)
 #[cfg(feature = "cuda")]
 type MyDevice = CandleDevice;
 
 #[cfg(not(feature = "cuda"))]
 use burn_ndarray::{NdArray, NdArrayDevice};
 #[cfg(not(feature = "cuda"))]
-type MyBackend = burn::backend::Autodiff<NdArray>;
+type MyBackend = burn::backend::Autodiff<NdArray>; // For training compatibility
+#[cfg(not(feature = "cuda"))]
+type InferenceBackend = NdArray; // For tournament inference (no Autodiff!)
 #[cfg(not(feature = "cuda"))]
 type MyDevice = NdArrayDevice;
 
@@ -707,7 +721,7 @@ impl Strategy for RandomStrategy {
 // AlphaZero Strategy Implementation using actual neural network
 #[derive(Clone)]
 pub struct AlphaZeroStrategy {
-    net: AlphaZeroNet<MyBackend>,
+    net: AlphaZeroNet<InferenceBackend>,  // Use inference-only backend (no Autodiff!)
     simulations: usize,
     name: String,
     training_level: TrainingLevel,
@@ -715,14 +729,18 @@ pub struct AlphaZeroStrategy {
 
 impl AlphaZeroStrategy {
     pub fn new(simulations: usize) -> Self {
-        Self::new_with_training_level(simulations, TrainingLevel::Trained)
+        Self::new_with_training_level(simulations, TrainingLevel::Trained, "alphazero_model")
     }
 
     pub fn new_untrained(simulations: usize) -> Self {
-        Self::new_with_training_level(simulations, TrainingLevel::Untrained)
+        Self::new_with_training_level(simulations, TrainingLevel::Untrained, "alphazero_model")
     }
 
-    fn new_with_training_level(simulations: usize, training: TrainingLevel) -> Self {
+    pub fn new_with_model_path(simulations: usize, model_path: &str) -> Self {
+        Self::new_with_training_level(simulations, TrainingLevel::Trained, model_path)
+    }
+
+    fn new_with_training_level(simulations: usize, training: TrainingLevel, model_path: &str) -> Self {
         // Initialize the device
         #[cfg(feature = "cuda")]
         let device = CandleDevice::cuda(0);
@@ -735,25 +753,27 @@ impl AlphaZeroStrategy {
             TrainingLevel::Trained => {
                 // Try to load the trained model
                 use burn::record::{BinFileRecorder, FullPrecisionSettings, Recorder};
-                let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
 
-                match recorder.load("alphazero_model".into(), &device) {
+                // For inference, we can load directly into the InferenceBackend
+                // The saved model contains the raw weights that work with both backends
+                let inference_recorder = BinFileRecorder::<FullPrecisionSettings>::new();
+                match inference_recorder.load(model_path.into(), &device) {
                     Ok(record) => {
-                        let loaded_net = AlphaZeroNet::<MyBackend>::new(&device).load_record(record);
-                        println!("✅ Loaded trained AlphaZero model from 'alphazero_model.bin'");
-                        loaded_net
+                        let inference_net = AlphaZeroNet::<InferenceBackend>::new(&device).load_record(record);
+                        println!("✅ Loaded trained AlphaZero model from '{}' (inference mode)", model_path);
+                        inference_net
                     }
                     Err(e) => {
                         println!("⚠️  Failed to load trained model: {:?}", e);
                         println!("   Using untrained network instead");
                         println!("   Make sure to run training first: ./target/release/train_alphazero");
-                        AlphaZeroNet::<MyBackend>::new(&device)
+                        AlphaZeroNet::<InferenceBackend>::new(&device)
                     }
                 }
             }
             TrainingLevel::Untrained => {
                 println!("🔄 Creating new untrained network");
-                AlphaZeroNet::<MyBackend>::new(&device)
+                AlphaZeroNet::<InferenceBackend>::new(&device)
             }
         };
 
@@ -994,7 +1014,7 @@ fn demo_single_game() -> Result<(), String> {
     Ok(())
 }
 
-fn demo_tournament() -> Result<(), String> {
+fn demo_tournament(model_path: &str) -> Result<(), String> {
     println!("\n=== Tournament Demo ===");
     let config = GameConfig::new(3, 3, 3);
     
@@ -1068,7 +1088,7 @@ fn demo_tournament() -> Result<(), String> {
     // AlphaZero vs Deep Minimax
     let result = play_tournament(
         &config,
-        AlphaZeroStrategy::new(25),
+        AlphaZeroStrategy::new_with_model_path(25, model_path),
         MinimaxStrategy::new(3),
         20,
         false,
@@ -1078,7 +1098,7 @@ fn demo_tournament() -> Result<(), String> {
     // AlphaZero vs Medium Minimax
     let result = play_tournament(
         &config,
-        AlphaZeroStrategy::new(25),
+        AlphaZeroStrategy::new_with_model_path(25, model_path),
         MinimaxStrategy::new(2),
         20,
         false,
@@ -1088,7 +1108,7 @@ fn demo_tournament() -> Result<(), String> {
     // AlphaZero vs Random
     let result = play_tournament(
         &config,
-        AlphaZeroStrategy::new(25),
+        AlphaZeroStrategy::new_with_model_path(25, model_path),
         RandomStrategy::new(),
         20,
         false,
@@ -1098,8 +1118,8 @@ fn demo_tournament() -> Result<(), String> {
     // Different AlphaZero simulation counts
     let result = play_tournament(
         &config,
-        AlphaZeroStrategy::new(50),
-        AlphaZeroStrategy::new(10),
+        AlphaZeroStrategy::new_with_model_path(50, model_path),
+        AlphaZeroStrategy::new_with_model_path(10, model_path),
         20,
         false,
     )?;
@@ -1158,17 +1178,41 @@ fn demo_performance() -> Result<(), String> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args = Args::parse();
+
+    // Print GPU memory usage at start
+    print_gpu_memory("Tournament start");
+
     println!("Functional M,N,K Game Implementation in Rust");
     println!("{}", "=".repeat(45));
-    
+
     // Run demonstrations
     demo_board_analysis()?;
     demo_single_game()?;
-    demo_tournament()?;
+
+    print_gpu_memory("Before AlphaZero tournaments");
+    demo_tournament(&args.model_path)?;
+    print_gpu_memory("After AlphaZero tournaments");
+
     demo_performance()?;
-    
+
+    print_gpu_memory("Tournament end");
     println!("\nDemo completed successfully!");
     Ok(())
+}
+
+fn print_gpu_memory(stage: &str) {
+    use std::process::Command;
+    if let Ok(output) = Command::new("nvidia-smi")
+        .args(&["--query-gpu=memory.used", "--format=csv,noheader,nounits"])
+        .output()
+    {
+        if let Ok(memory_str) = String::from_utf8(output.stdout) {
+            if let Ok(memory_mb) = memory_str.trim().parse::<u32>() {
+                println!("🔍 GPU Memory at {}: {}MB", stage, memory_mb);
+            }
+        }
+    }
 }
 
 // Add this to Cargo.toml dependencies:

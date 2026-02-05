@@ -7,6 +7,8 @@
 
 # Neural network models and training artifacts
 *.bin
+alphazero_model*.bin
+model*.bin
 
 # CUDA build artifacts
 *.cu.o
@@ -37,3 +39,10 @@ fix_cuda_math.h
 
 # Test artifacts
 test_*.rs
+
+# Sweep results and logs
+sweep_results/
+__pycache__/
+*.pyc
+memory_log.csv
+tournament_test.log

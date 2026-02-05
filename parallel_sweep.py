@@ -106,7 +106,7 @@ class AlphaZeroSweep:
         # Dynamic timeout calculation
         # Base timeouts scaled by parallel load
         self.base_training_timeout = 300  # 5 minutes base
-        self.base_tournament_timeout = 120  # 2 minutes base for testing
+        self.base_tournament_timeout = 180  # 3 minutes base (increased for reliability)
 
         print(f"🚀 AlphaZero Advanced Sweep Harness")
         print(f"   CPU Cores: {self.cpu_cores}")
@@ -192,11 +192,8 @@ class AlphaZeroSweep:
         work_dir = self.results_dir / config.name
 
         try:
-            # Run tournament in container - copy unique model to expected filename
-            cmd = [
-                "podman", "exec", "cuda-dev", "bash", "-c",
-                f"cd /workspace/mnk && cp {model_file} alphazero_model.bin && LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/lib64:/usr/local/nccl/lib:/usr/local/cuda-12/lib64:/usr/local/lib ./target/release/mnk_game && rm alphazero_model.bin"
-            ]
+            # Run tournament on host with direct model path (no file copying needed!)
+            cmd = ["./target/release/mnk_game", "--model-path", model_file]
             result = subprocess.run(
                 cmd,
                 capture_output=True,
@@ -204,25 +201,35 @@ class AlphaZeroSweep:
                 timeout=config.tournament_timeout
             )
 
-            # Debug: save command output for failed tournaments
-            if result.returncode != 0:
-                with open(work_dir / 'tournament_debug.log', 'w') as f:
-                    f.write(f"Command: {' '.join(cmd)}\n")
-                    f.write(f"Return code: {result.returncode}\n")
-                    f.write(f"STDOUT:\n{result.stdout}\n")
-                    f.write(f"STDERR:\n{result.stderr}\n")
+            # Debug: save ALL tournament output for analysis
+            debug_file = work_dir / 'tournament_output.log'
+            with open(debug_file, 'w') as f:
+                f.write(f"Command: {' '.join(cmd)}\n")
+                f.write(f"Return code: {result.returncode}\n")
+                f.write(f"STDOUT:\n{result.stdout}\n")
+                f.write(f"STDERR:\n{result.stderr}\n")
 
             if result.returncode == 0:
                 output = result.stdout
 
-                # Parse tournament results with improved regex
-                vs_random_match = re.search(r'AZ-25.*vs Random.*?\(([^)]+)\)', output)
-                vs_deep_match = re.search(r'AZ-25.*vs Deep.*?\(([^)]+)\)', output)
-                vs_medium_match = re.search(r'AZ-25.*vs Medium.*?\(([^)]+)\)', output)
+                # Parse tournament results with fixed regex (single backslash)
+                vs_random_match = re.search(r'AZ-25.*vs.*Random.*\(([^)]+)\)', output, re.IGNORECASE)
+                vs_deep_match = re.search(r'AZ-25.*vs.*Deep.*\(([^)]+)\)', output, re.IGNORECASE)
+                vs_medium_match = re.search(r'AZ-25.*vs.*Medium.*\(([^)]+)\)', output, re.IGNORECASE)
 
                 vs_random = vs_random_match.group(1) if vs_random_match else "N/A"
                 vs_deep = vs_deep_match.group(1) if vs_deep_match else "N/A"
                 vs_medium = vs_medium_match.group(1) if vs_medium_match else "N/A"
+
+                # Debug: log parsing failures
+                if vs_random == "N/A" or vs_deep == "N/A" or vs_medium == "N/A":
+                    with open(debug_file.with_suffix('.parse_debug.log'), 'w') as f:
+                        f.write(f"PARSING FAILED FOR: {config.name}\n")
+                        f.write(f"vs_random: {vs_random} (found: {bool(vs_random_match)})\n")
+                        f.write(f"vs_deep: {vs_deep} (found: {bool(vs_deep_match)})\n")
+                        f.write(f"vs_medium: {vs_medium} (found: {bool(vs_medium_match)})\n")
+                        f.write(f"Output length: {len(output)} chars\n")
+                        f.write(f"Contains AZ-25: {'AZ-25' in output}\n")
 
                 # Save tournament log
                 with open(work_dir / 'tournament.log', 'w') as f:
@@ -349,10 +356,10 @@ class AlphaZeroSweep:
         if not self.gpu_memory:
             return self.max_parallel_jobs, 1, False  # Conservative fallback
 
-        # VRAM requirements (in MB) - conservative estimates
+        # VRAM requirements (in MB) - updated after memory leak fix and tournament analysis
         training_vram_per_job = 300      # Training uses ~300MB per job
-        tournament_vram_per_job = 6000   # Tournament uses ~4.2GB but be conservative
-        safety_margin = 3000             # Keep 3GB free for overhead
+        tournament_vram_per_job = 2000   # Tournament uses up to 2140MB peak (was 800MB estimate)
+        safety_margin = 2000             # Keep 2GB free for overhead
 
         available_vram = self.gpu_memory - safety_margin
 
@@ -580,35 +587,33 @@ class AlphaZeroSweep:
 
                         console.print(f"  🎯 Tournament {i}/{len(tournament_futures)}: {exp.name}")
 
-                    try:
-                        success, vs_random, vs_deep, vs_medium = future.result()
+                        try:
+                            success, vs_random, vs_deep, vs_medium = future.result()
 
-                        final_results[exp.name] = ExperimentResult(
-                            name=exp.name,
-                            args=exp.args,
-                            training_time=train_time,
-                            training_success=True,
-                            empty_board_value=empty_value,
-                            vs_random=vs_random,
-                            vs_deep=vs_deep,
-                            vs_medium=vs_medium,
-                            tournament_success=success,
-                            total_time=train_time  # Sequential, but report training time only
-                        )
+                            final_results[exp.name] = ExperimentResult(
+                                name=exp.name,
+                                args=exp.args,
+                                training_time=train_time,
+                                training_success=True,
+                                empty_board_value=empty_value,
+                                vs_random=vs_random,
+                                vs_deep=vs_deep,
+                                vs_medium=vs_medium,
+                                tournament_success=success,
+                                total_time=train_time  # Sequential, but report training time only
+                            )
 
-                        if success:
-                            console.print(f"    ✅ Results: Random={vs_random}, Deep={vs_deep}, Medium={vs_medium}")
-                        else:
-                            console.print(f"    ❌ Tournament failed")
+                            if success:
+                                console.print(f"    ✅ Results: Random={vs_random}, Deep={vs_deep}, Medium={vs_medium}")
+                            else:
+                                console.print(f"    ❌ Tournament failed")
+
+                        except Exception as e:
+                            console.print(f"[red]❌ Tournament exception in {exp.name}: {e}[/red]")
 
                         # Update display
                         layout["header"].update(self.create_summary_panel(experiments, final_results, start_time))
                         layout["table"].update(self.create_status_table(experiments, final_results, {}, running_tournaments))
-
-                    except Exception as e:
-                        console.print(f"    💥 Tournament error: {e}")
-                        if exp.name in running_tournaments:
-                            del running_tournaments[exp.name]
 
         total_time = time.time() - start_time
 
