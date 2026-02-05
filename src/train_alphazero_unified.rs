@@ -124,7 +124,7 @@ struct Args {
     iterations: usize,
 
     /// Number of games per iteration
-    #[arg(short, long, default_value = "10")]
+    #[arg(short, long, default_value = "1000")]
     games_per_iter: usize,
 
     /// Number of training epochs per iteration

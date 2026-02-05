@@ -95,6 +95,12 @@ cargo build --release --features cuda
 ```bash
 # Automated hyperparameter optimization
 python3 parallel_sweep.py --training-jobs 4 --tournament-jobs 2 --concurrent
+
+# CPU tournaments (default) with high parallelism - keeps GPU free for training
+python3 parallel_sweep.py --jobs 4 --tournament-jobs 16 --cpu-tournaments
+
+# GPU tournaments (lower parallelism due to GPU memory)
+python3 parallel_sweep.py --jobs 4 --tournament-jobs 2 --no-cpu-tournaments
 ```
 
 ## Key Features
@@ -115,6 +121,7 @@ python3 parallel_sweep.py --training-jobs 4 --tournament-jobs 2 --concurrent
 - Experience replay with augmented training data
 - Automatic model checkpointing and validation
 - Configurable hyperparameters (learning rate, batch size, MCTS simulations)
+- Optimal default: 1000 games per iteration (based on sweep results)
 
 ### Evaluation System
 - Tournament play against multiple strategies (Random, Deep, Medium)
@@ -164,6 +171,13 @@ Iteration 1: 95 → 760 examples (8x symmetry)
 - **GPU Training**: 1130+ games/sec (batch size 512+), 0.7s total time
 - **CPU Training**: 400-611 games/sec (batch size 64), 6.5s total time
 - **GPU Advantage**: 5-9x faster training, especially for longer runs
+
+### Tournament Performance (GPU vs CPU)
+- **Single GPU Tournament**: ~7.4 games/sec
+- **Single CPU Tournament**: ~4.5 games/sec
+- **GPU Advantage (single)**: 1.64x faster for single tournaments
+- **CPU Advantage (parallel)**: Scales to 16+ concurrent tournaments without GPU memory contention
+- **Recommended**: Use `--cpu-tournaments` (default) to free GPU for training while running many parallel tournaments
 
 ### Build Requirements
 GPU acceleration requires container build:

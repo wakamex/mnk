@@ -77,7 +77,7 @@ class GPUInfo:
 class AlphaZeroSweep:
     """Advanced hyperparameter sweep with intelligent resource management"""
 
-    def __init__(self, max_parallel_jobs: Optional[int] = None):
+    def __init__(self, max_parallel_jobs: Optional[int] = None, cpu_tournaments: bool = True, tournament_jobs: Optional[int] = None):
         self.gpu_memory = GPUInfo.get_gpu_memory()
         self.cpu_cores = GPUInfo.get_cpu_cores()
 
@@ -90,6 +90,18 @@ class AlphaZeroSweep:
 
         self.results_dir = Path('./sweep_results')
         self.results_dir.mkdir(exist_ok=True)
+
+        # Tournament execution settings
+        self.cpu_tournaments = cpu_tournaments
+        # Default: use more tournament jobs for CPU (no GPU memory constraint)
+        if tournament_jobs:
+            self.tournament_jobs = tournament_jobs
+        elif cpu_tournaments:
+            # CPU tournaments can use many more parallel jobs
+            self.tournament_jobs = min(16, self.cpu_cores // 2)  # Use half the CPU cores, max 16
+        else:
+            # GPU tournaments are limited by memory
+            self.tournament_jobs = min(2, self.max_parallel_jobs)  # Conservative for GPU
 
         # Dynamic timeout calculation
         # Base timeouts scaled by parallel load
@@ -185,17 +197,35 @@ class AlphaZeroSweep:
         try:
             tournament_start = time.time()
 
-            # Run tournament directly on host (GPU inference now works perfectly)
+            # Choose CPU or GPU binary based on configuration
+            if self.cpu_tournaments and os.path.exists("./target/release/mnk_game_cpu"):
+                binary = "./target/release/mnk_game_cpu"
+            else:
+                binary = "./target/release/mnk_game"
+
             cmd = [
-                "./target/release/mnk_game", "--model-path", model_file,
+                binary, "--model-path", model_file,
                 "--tournament-games", str(config.tournament_games)
             ]
-            result = subprocess.run(
+
+            # Use Popen for better process control
+            process = subprocess.Popen(
                 cmd,
-                capture_output=True,
-                text=True,
-                timeout=config.tournament_timeout
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
             )
+
+            try:
+                stdout, stderr = process.communicate(timeout=config.tournament_timeout)
+                returncode = process.returncode
+            except subprocess.TimeoutExpired:
+                print(f"    ⚠️ Tournament timeout for {config.name}, killing process...")
+                process.kill()
+                stdout, stderr = process.communicate()
+                return False, 0.0, "TIMEOUT", "TIMEOUT", "TIMEOUT"
+
+            result = subprocess.CompletedProcess(cmd, returncode, stdout, stderr)
 
             tournament_time = time.time() - tournament_start
 
@@ -375,19 +405,29 @@ class AlphaZeroSweep:
         running_training = {}
         running_tournaments = {}
 
-        # Calculate optimal concurrency strategy
-        training_jobs, tournament_jobs, can_run_concurrent = self.calculate_optimal_concurrency()
-
-        if can_run_concurrent:
-            print(f"🚀 [CONCURRENT MODE] Training ({training_jobs}) + Tournaments ({tournament_jobs})")
-            print(f"   GPU Memory: {self.gpu_memory}MB, Estimated usage: {training_jobs * 300 + tournament_jobs * 5200}MB")
+        # Determine concurrency strategy based on tournament type
+        if self.cpu_tournaments:
+            # CPU tournaments: always use sequential mode with high parallelism
+            training_jobs = self.max_parallel_jobs
+            actual_tournament_jobs = self.tournament_jobs
+            can_run_concurrent = False  # Sequential is better for CPU/GPU split
+            print(f"🚀 [CPU TOURNAMENT MODE] GPU Training ({training_jobs}) → CPU Tournaments ({actual_tournament_jobs})")
+            print(f"   Using CPU for tournaments allows maximum parallelism")
         else:
-            print(f"🚀 [SEQUENTIAL MODE] Training ({training_jobs}) → Tournaments ({tournament_jobs})")
-            print(f"   GPU Memory: {self.gpu_memory}MB (insufficient for concurrent)")
+            # GPU tournaments: use calculated optimal concurrency
+            training_jobs, calculated_tournament_jobs, can_run_concurrent = self.calculate_optimal_concurrency()
+            actual_tournament_jobs = calculated_tournament_jobs  # Use calculated for GPU
+
+            if can_run_concurrent:
+                print(f"🚀 [GPU CONCURRENT MODE] Training ({training_jobs}) + Tournaments ({actual_tournament_jobs})")
+                print(f"   GPU Memory: {self.gpu_memory}MB, Estimated usage: {training_jobs * 300 + actual_tournament_jobs * 5200}MB")
+            else:
+                print(f"🚀 [GPU SEQUENTIAL MODE] Training ({training_jobs}) → Tournaments ({actual_tournament_jobs})")
+                print(f"   GPU Memory: {self.gpu_memory}MB (insufficient for concurrent)")
 
         if can_run_concurrent:
             # Concurrent Mode: Training and Tournaments together
-            with ProcessPoolExecutor(max_workers=training_jobs + tournament_jobs) as executor:
+            with ProcessPoolExecutor(max_workers=training_jobs + actual_tournament_jobs) as executor:
                 # Phase 1: Submit all training jobs
                 print(f"  🚀 Starting {len(experiments)} training jobs...", flush=True)
                 training_futures = {}
@@ -424,7 +464,7 @@ class AlphaZeroSweep:
 
                         # Try to submit tournament immediately if we have capacity
                         active_tournaments = len([f for f in tournament_futures if not f.done()])
-                        if success and model_file and active_tournaments < tournament_jobs:
+                        if success and model_file and active_tournaments < actual_tournament_jobs:
                             tournament_future = executor.submit(self.run_tournament_only, exp, model_file)
                             tournament_futures[tournament_future] = (exp, train_time, empty_value)
                             running_tournaments[exp.name] = time.time()
@@ -468,25 +508,40 @@ class AlphaZeroSweep:
                 all_tournament_futures = list(tournament_futures.keys())
                 pending_queue = list(tournaments_pending)
 
-                while all_tournament_futures or pending_queue:
+                print(f"  ⏳ Processing tournaments ({self.tournament_jobs} jobs max)...")
+                poll_count = 0
+                max_polls = 600  # Max 10 minutes of waiting
+
+                while (all_tournament_futures or pending_queue) and poll_count < max_polls:
                     # Submit pending tournaments if we have capacity
-                    while pending_queue and len([f for f in all_tournament_futures if not f.done()]) < tournament_jobs:
+                    active_count = len([f for f in all_tournament_futures if not f.done()])
+                    while pending_queue and active_count < self.tournament_jobs:
                         exp, train_time, empty_value, model_file = pending_queue.pop(0)
                         print(f"  🏆 Starting queued tournament: {exp.name}")
                         future = executor.submit(self.run_tournament_only, exp, model_file)
                         tournament_futures[future] = (exp, train_time, empty_value)
                         all_tournament_futures.append(future)
-                        if exp.name in running_tournaments:
+                        if exp.name not in running_tournaments:
                             running_tournaments[exp.name] = time.time()
+                        active_count += 1
 
                     # Wait for next tournament to complete
                     if all_tournament_futures:
                         done_futures = [f for f in all_tournament_futures if f.done()]
 
                         if not done_futures:
-                            # Wait for at least one to complete
+                            # Wait and show status periodically
                             import time as time_module
                             time_module.sleep(1)
+                            poll_count += 1
+
+                            if poll_count % 10 == 0:  # Status every 10 seconds
+                                active_names = []
+                                for f in all_tournament_futures:
+                                    if not f.done() and f in tournament_futures:
+                                        exp, _, _ = tournament_futures[f]
+                                        active_names.append(exp.name)
+                                print(f"  ⏳ [{poll_count}s] Waiting for {len([f for f in all_tournament_futures if not f.done()])} tournaments: {', '.join(active_names[:3])}...")
                             continue
 
                         for future in done_futures:
@@ -501,7 +556,8 @@ class AlphaZeroSweep:
                                 del running_tournaments[exp.name]
 
                             try:
-                                success, tournament_games_per_sec, vs_random, vs_deep, vs_medium = future.result()
+                                # Add timeout to future.result() to avoid infinite wait
+                                success, tournament_games_per_sec, vs_random, vs_deep, vs_medium = future.result(timeout=1)
 
                                 # Update final results
                                 training_games_per_sec = training_results[exp.name][3] if exp.name in training_results else 0.0
@@ -527,6 +583,10 @@ class AlphaZeroSweep:
 
                             except Exception as e:
                                 print(f"❌ Tournament exception in {exp.name}: {e}")
+
+                if poll_count >= max_polls:
+                    print(f"  ❌ Tournament processing timed out after {max_polls} seconds")
+                    print(f"  ❌ {len([f for f in all_tournament_futures if not f.done()])} tournaments still running")
 
         else:
             # Sequential Mode: Training first, then tournaments
@@ -586,10 +646,10 @@ class AlphaZeroSweep:
                             del running_training[exp.name]
 
             # Phase 2: Parallel Tournaments
-            print(f"\n🏆 [PHASE 2] Parallel Tournaments ({tournament_jobs} jobs)")
+            print(f"\n🏆 [PHASE 2] Parallel Tournaments ({self.tournament_jobs} jobs)")
             successful_training = [exp for exp in experiments if training_results.get(exp.name, (False,))[0]]
 
-            with ProcessPoolExecutor(max_workers=tournament_jobs) as tournament_executor:
+            with ProcessPoolExecutor(max_workers=self.tournament_jobs) as tournament_executor:
                 tournament_futures = {}
                 running_tournaments = {}
                 for exp in successful_training:
@@ -751,7 +811,7 @@ class SweepConfig:
         if self.iterations is None:
             self.iterations = [5]
         if self.games_per_iter is None:
-            self.games_per_iter = [100]
+            self.games_per_iter = [1000]
         if self.epochs is None:
             self.epochs = [2]
         if self.batch_size is None:
@@ -881,6 +941,9 @@ Examples:
     # Execution control
     control_group = parser.add_argument_group('execution control')
     control_group.add_argument('--jobs', '-j', type=int, help='Max parallel jobs (auto-detect if not specified)')
+    control_group.add_argument('--cpu-tournaments', action='store_true', default=True, help='Run tournaments on CPU instead of GPU (default: True)')
+    control_group.add_argument('--gpu-tournaments', dest='cpu_tournaments', action='store_false', help='Run tournaments on GPU instead of CPU')
+    control_group.add_argument('--tournament-jobs', type=int, help='Number of parallel tournament jobs (default: same as --jobs)')
     control_group.add_argument('--dry-run', action='store_true', help='Show experiments that would be run without executing')
     control_group.add_argument('--sweep-name', default='advanced_sweep', help='Name for this sweep (affects output files)')
 
@@ -998,7 +1061,11 @@ Examples:
         return
 
     # Create advanced sweep harness
-    sweep = AlphaZeroSweep(args.jobs)
+    sweep = AlphaZeroSweep(
+        max_parallel_jobs=args.jobs,
+        cpu_tournaments=args.cpu_tournaments,
+        tournament_jobs=args.tournament_jobs
+    )
 
     # Estimate runtime
     estimated_time_per_exp = 8 * 60  # 8 minutes per experiment (training + tournament)
