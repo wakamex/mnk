@@ -407,12 +407,12 @@ class AlphaZeroSweep:
 
         # Determine concurrency strategy based on tournament type
         if self.cpu_tournaments:
-            # CPU tournaments: always use sequential mode with high parallelism
+            # CPU tournaments: run concurrently since they don't compete for GPU
             training_jobs = self.max_parallel_jobs
             actual_tournament_jobs = self.tournament_jobs
-            can_run_concurrent = False  # Sequential is better for CPU/GPU split
-            print(f"🚀 [CPU TOURNAMENT MODE] GPU Training ({training_jobs}) → CPU Tournaments ({actual_tournament_jobs})")
-            print(f"   Using CPU for tournaments allows maximum parallelism")
+            can_run_concurrent = True  # CPU tournaments can overlap with GPU training
+            print(f"🚀 [CPU TOURNAMENT MODE] GPU Training ({training_jobs}) + CPU Tournaments ({actual_tournament_jobs})")
+            print(f"   Tournaments start immediately when training completes (no GPU contention)")
         else:
             # GPU tournaments: use calculated optimal concurrency
             training_jobs, calculated_tournament_jobs, can_run_concurrent = self.calculate_optimal_concurrency()
