@@ -730,28 +730,41 @@ impl AlphaZeroStrategy {
         // Load trained network or create new one based on training level
         let net = match training {
             TrainingLevel::Trained => {
-                println!("⚠️  Skipping model loading due to CUDA Autodiff compatibility issues");
-                println!("   Using untrained inference model instead until backend issue is resolved");
-                println!("   The trained weights cannot be loaded safely in tournament mode");
+                // FIXED: Load using the same backend as training (Autodiff) to prevent segfault
+                use burn::record::{BinFileRecorder, FullPrecisionSettings, Recorder};
 
-                // Initialize inference device (no Autodiff wrapper)
+                // Initialize device (same as training)
                 #[cfg(feature = "cuda")]
                 let device = InferenceDevice::cuda(0);
 
                 #[cfg(not(feature = "cuda"))]
                 let device = InferenceDevice::default();
 
-                AlphaZeroNet::<InferenceBackend>::new(&device)
+                let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
+                match recorder.load(model_path.into(), &device) {
+                    Ok(record) => {
+                        let trained_net = AlphaZeroNet::<InferenceBackend>::new(&device).load_record(record);
+                        println!("✅ Loaded trained AlphaZero model from '{}' (using consistent Autodiff backend)", model_path);
+                        trained_net
+                    }
+                    Err(e) => {
+                        println!("⚠️  Failed to load trained model: {:?}", e);
+                        println!("   Using untrained network instead");
+                        println!("   Make sure to run training first: ./target/release/train_alphazero");
+                        AlphaZeroNet::<InferenceBackend>::new(&device)
+                    }
+                }
             }
             TrainingLevel::Untrained => {
-                println!("🔄 Creating new untrained network (inference backend)");
+                println!("🔄 Creating new untrained network (using Autodiff backend for consistency)");
 
-                // Initialize inference device (no Autodiff wrapper)
+                // Initialize device (same as training)
                 #[cfg(feature = "cuda")]
                 let device = InferenceDevice::cuda(0);
 
                 #[cfg(not(feature = "cuda"))]
                 let device = InferenceDevice::default();
+
                 AlphaZeroNet::<InferenceBackend>::new(&device)
             }
         };
@@ -795,8 +808,14 @@ impl Strategy for AlphaZeroStrategy {
         let alphazero_board = self.game_state_to_alphazero_board(state, config);
         let current_player = self.current_player_to_u8(state.current_player);
 
-        // Use MCTS to get policy distribution
-        let policy = simple_mcts(&self.net, &alphazero_board, current_player, self.simulations);
+        // CRITICAL FIX: Use valid() mode to prevent memory leak in inference
+        // This switches to inference mode which doesn't track gradients
+        use burn::module::AutodiffModule;
+        let policy = {
+            // Create inference-only network to prevent gradient tracking
+            let inference_net = self.net.valid();
+            simple_mcts(&inference_net, &alphazero_board, current_player, self.simulations)
+        };
 
         // Convert policy to move by finding the best legal move
         let valid_moves = generate_valid_moves(state, config);

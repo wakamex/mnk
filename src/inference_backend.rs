@@ -5,14 +5,14 @@ use burn::prelude::*;
 use crate::alphazero::AlphaZeroNet;
 use burn::record::{BinFileRecorder, FullPrecisionSettings, Recorder};
 
-// Inference backends (no Autodiff wrapper)
+// EMERGENCY FIX: Use training backend for inference to avoid CUDA segfault
 #[cfg(feature = "cuda")]
-pub use burn_candle::Candle as InferenceBackend;
+pub type InferenceBackend = burn::backend::Autodiff<burn_candle::Candle>;
 #[cfg(feature = "cuda")]
 pub use burn_candle::CandleDevice as InferenceDevice;
 
 #[cfg(not(feature = "cuda"))]
-pub use burn_ndarray::NdArray as InferenceBackend;
+pub type InferenceBackend = burn::backend::Autodiff<burn_ndarray::NdArray>;
 #[cfg(not(feature = "cuda"))]
 pub use burn_ndarray::NdArrayDevice as InferenceDevice;
 
