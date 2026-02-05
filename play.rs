@@ -5,6 +5,7 @@ use clap::Parser;
 
 // Import the actual AlphaZero implementation from the shared library
 use mnk::alphazero::AlphaZeroNet;
+use mnk::network::{Network, NetworkType};
 use mnk::unified_mcts::fallback_mcts;
 use mnk::inference_backend::{InferenceBackend, InferenceDevice};
 use burn::prelude::*;
@@ -712,7 +713,7 @@ impl Strategy for RandomStrategy {
 // AlphaZero Strategy Implementation using actual neural network
 #[derive(Clone)]
 pub struct AlphaZeroStrategy {
-    net: AlphaZeroNet<InferenceBackend>,  // Use inference backend (no Autodiff) to avoid CUDA segfault!
+    net: Network<InferenceBackend>,  // Use Network enum to support both CNN and Transformer
     simulations: usize,
     name: String,
     training_level: TrainingLevel,
@@ -748,20 +749,21 @@ impl AlphaZeroStrategy {
                 let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
                 match recorder.load(model_path.into(), &device) {
                     Ok(record) => {
-                        let trained_net = AlphaZeroNet::<InferenceBackend>::new(&device, 3).load_record(record);
-                        println!("✅ Loaded trained AlphaZero model from '{}' (using consistent Autodiff backend)", model_path);
+                        // Load as Network enum (matches training save format)
+                        let trained_net = Network::<InferenceBackend>::new(NetworkType::Cnn, &device, 3).load_record(record);
+                        println!("✅ Loaded trained model from '{}' (using Network enum)", model_path);
                         trained_net
                     }
                     Err(e) => {
                         println!("⚠️  Failed to load trained model: {:?}", e);
                         println!("   Using untrained network instead");
                         println!("   Make sure to run training first: ./target/release/train_alphazero");
-                        AlphaZeroNet::<InferenceBackend>::new(&device, 3)
+                        Network::<InferenceBackend>::new(NetworkType::Cnn, &device, 3)
                     }
                 }
             }
             TrainingLevel::Untrained => {
-                println!("🔄 Creating new untrained network (using Autodiff backend for consistency)");
+                println!("🔄 Creating new untrained network");
 
                 // Initialize device (same as training)
                 #[cfg(feature = "cuda")]
@@ -770,7 +772,7 @@ impl AlphaZeroStrategy {
                 #[cfg(not(feature = "cuda"))]
                 let device = InferenceDevice::default();
 
-                AlphaZeroNet::<InferenceBackend>::new(&device, 3)
+                Network::<InferenceBackend>::new(NetworkType::Cnn, &device, 3)
             }
         };
 
@@ -1019,7 +1021,7 @@ pub fn play_interleaved_tournament(
 
     let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
     let net = match recorder.load(model_path.into(), &device) {
-        Ok(record) => AlphaZeroNet::<InferenceBackend>::new(&device, 3).load_record(record),
+        Ok(record) => Network::<InferenceBackend>::new(NetworkType::Cnn, &device, 3).load_record(record),
         Err(e) => return Err(format!("Failed to load model from {}: {:?}", model_path, e)),
     };
 
