@@ -3,6 +3,8 @@ mod alphazero;
 use burn::prelude::*;
 use burn::backend::Autodiff;
 use burn::optim::{AdamConfig, Optimizer, GradientsParams};
+use burn::grad_clipping::{GradientClipping, GradientClippingConfig};
+use burn::tensor::activation;
 use alphazero::*;
 use clap::Parser;
 
@@ -138,7 +140,7 @@ struct Args {
     learning_rate: f64,
 
     /// Value loss weight (vs policy loss weight of 1.0)
-    #[arg(long, default_value = "1.5")]
+    #[arg(long, default_value = "1.0")]
     value_weight: f32,
 
     /// MCTS simulations per position during self-play
@@ -180,7 +182,11 @@ fn main() {
     let device = MyDevice::default();
 
     let mut net = AlphaZeroNet::<MyBackend>::new(&device);
-    let mut optimizer = AdamConfig::new().init();
+
+    // Configure optimizer with gradient clipping for stability
+    let mut optimizer = AdamConfig::new()
+        .with_grad_clipping(Some(GradientClippingConfig::Norm(1.0)))
+        .init();
 
     // Training hyperparameters from CLI arguments
     let iterations = args.iterations;
@@ -384,20 +390,31 @@ fn main() {
                     &device
                 ).reshape([batch.len(), 9]);
 
-                // Forward pass
-                let (pred_values, pred_policies) = net.forward(boards);
+                // Forward pass - now returns (values, logits)
+                let (pred_values, pred_logits) = net.forward(boards);
 
-                // Compute loss with increased value weight
+                // Compute losses with professional numerical stability
                 let value_loss = (pred_values - target_values).powf_scalar(2.0).mean();
-                let policy_loss = -(target_policies * pred_policies.clone().log()).sum() / pred_policies.dims()[0] as f32;
+
+                // CRITICAL: Use log_softmax on raw logits for rock-solid gradients
+                let log_probs = activation::log_softmax(pred_logits, 1);
+                let policy_loss = -(target_policies.clone() * log_probs).sum() / target_policies.dims()[0] as f32;
 
                 // Value loss weight from CLI arguments
                 let value_weight = args.value_weight;
                 let total_batch_loss = value_loss.clone() * value_weight + policy_loss.clone();
 
-                // Backward pass
+                // Check for NaN in loss before backward pass
+                let loss_scalar = total_batch_loss.clone().into_scalar();
+                if !loss_scalar.is_finite() {
+                    eprintln!("WARNING: NaN/Inf loss detected: {}. Skipping gradient update.", loss_scalar);
+                    continue; // Skip this batch
+                }
+
+                // Backward pass with automatic gradient clipping
                 let gradients = total_batch_loss.backward();
                 let gradients = GradientsParams::from_grads(gradients, &net);
+
                 net = optimizer.step(learning_rate, net, gradients);
 
                 epoch_loss += total_batch_loss.into_scalar();

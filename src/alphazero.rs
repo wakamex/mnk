@@ -6,7 +6,7 @@ use burn::nn::{Linear, LinearConfig, conv::Conv2d, conv::Conv2dConfig,
 use burn::tensor::activation;
 use burn::module::Module;
 use rand::seq::SliceRandom;
-use crate::symmetry::augment_training_data;
+// use crate::symmetry; // Temporarily commented for build test
 
 #[derive(Module, Debug)]
 pub struct AlphaZeroNet<B: Backend> {
@@ -62,10 +62,10 @@ impl<B: Backend> AlphaZeroNet<B> {
         let x = activation::relu(self.conv2.forward(x));
         let x = activation::relu(self.conv3.forward(x)); // [batch_size, 128, 3, 3]
 
-        // Policy head
+        // Policy head - CRITICAL: Return raw logits, not probabilities
         let policy_x = activation::relu(self.policy_conv.forward(x.clone())); // [batch_size, 4, 3, 3]
         let policy_x = policy_x.flatten(1, 3); // Flatten from dim 1 to 3 -> [batch_size, 4*3*3]
-        let policy = activation::softmax(self.policy_fc.forward(policy_x), 1); // [batch_size, 9]
+        let policy_logits = self.policy_fc.forward(policy_x); // [batch_size, 9] - RAW LOGITS
 
         // Value head
         let value_x = activation::relu(self.value_conv.forward(x)); // [batch_size, 2, 3, 3]
@@ -73,7 +73,7 @@ impl<B: Backend> AlphaZeroNet<B> {
         let value_x = activation::relu(self.value_fc1.forward(value_x)); // [batch_size, 64]
         let value = activation::tanh(self.value_fc2.forward(value_x)); // [batch_size, 1]
 
-        (value, policy)
+        (value, policy_logits)
     }
 
     pub fn forward_inference(&self, board: &[Option<u8>], player: u8) -> (f32, Vec<f32>)
@@ -81,7 +81,10 @@ impl<B: Backend> AlphaZeroNet<B> {
         B: Backend<FloatElem = f32>,
     {
         let input = board_to_tensor(board, player, &self.conv1.devices()[0]);
-        let (value, policy) = self.forward(input);
+        let (value, policy_logits) = self.forward(input);
+
+        // CRITICAL: Convert logits to probabilities for MCTS inference
+        let policy = activation::softmax(policy_logits, 1);
 
         // Convert to scalar and vector
         let value_scalar: f32 = value.clone().into_scalar();
@@ -125,8 +128,11 @@ impl<B: Backend> AlphaZeroNet<B> {
         let batch_input = Tensor::<B, 1>::from_floats(batch_data.as_slice(), device)
             .reshape([batch_size, 9]);
 
-        // Forward pass for entire batch
-        let (batch_values, batch_policies) = self.forward(batch_input);
+        // Forward pass for entire batch - returns logits
+        let (batch_values, batch_policy_logits) = self.forward(batch_input);
+
+        // Convert logits to probabilities for MCTS inference
+        let batch_policies = activation::softmax(batch_policy_logits, 1);
 
         // Extract results for each position
         let mut values = Vec::with_capacity(batch_size);
@@ -463,7 +469,8 @@ impl GameInProgress {
             policy.iter()
                 .enumerate()
                 .filter(|(i, _)| self.board[*i].is_none())
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                .filter(|(_, prob)| prob.is_finite()) // Filter out NaN/infinite values
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
                 .map(|(i, _)| i)
                 .ok_or("No valid moves found")?
         };
@@ -1145,17 +1152,17 @@ pub fn self_play_game<B: Backend<FloatElem = f32>>(net: &AlphaZeroNet<B>, mcts_s
     }
 }
 
-/// Self-play game with 8x symmetry augmentation for data efficiency
-pub fn self_play_game_with_symmetry<B: Backend<FloatElem = f32>>(
-    net: &AlphaZeroNet<B>,
-    mcts_simulations: usize
-) -> Vec<TrainingExample> {
-    // Generate original examples through normal self-play
-    let original_examples = self_play_game(net, mcts_simulations);
-
-    // Apply symmetry augmentation for 8x data multiplication
-    augment_training_data(original_examples)
-}
+// /// Self-play game with 8x symmetry augmentation for data efficiency
+// pub fn self_play_game_with_symmetry<B: Backend<FloatElem = f32>>(
+//     net: &AlphaZeroNet<B>,
+//     mcts_simulations: usize
+// ) -> Vec<TrainingExample> {
+//     // Generate original examples through normal self-play
+//     let original_examples = self_play_game(net, mcts_simulations);
+//
+//     // Apply symmetry augmentation for 8x data multiplication
+//     symmetry::augment_training_data(original_examples)
+// }
 
 pub fn self_play_game_with_batched_policy<B: Backend<FloatElem = f32>>(
     net: &AlphaZeroNet<B>,

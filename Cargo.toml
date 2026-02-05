@@ -15,6 +15,11 @@ path = "src/train_alphazero_unified.rs"
 name = "run_diagnostics"
 path = "src/run_diagnostics.rs"
 
+[[bin]]
+name = "test_minibt4"
+path = "test_minibt4.rs"
+
+
 [lib]
 name = "mnk"
 path = "src/lib.rs"
