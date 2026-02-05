@@ -1,11 +1,12 @@
-mod alphazero;
-
 use burn::prelude::*;
 use burn::backend::Autodiff;
 use burn::optim::{AdamConfig, Optimizer, GradientsParams};
 use burn::grad_clipping::{GradientClipping, GradientClippingConfig};
 use burn::tensor::activation;
-use alphazero::*;
+use mnk::alphazero::{AlphaZeroNet, check_winner, board_to_tensor, batch_evaluate_positions, evaluate_vs_random};
+use mnk::unified_mcts::{InterleavedGamesManager, TrainingExample};
+use mnk::self_play::self_play_game;
+use mnk::mcts_bridge; // Enable AlphaZeroNet to work with unified_mcts
 use clap::Parser;
 
 // GPU backend configuration
@@ -254,7 +255,7 @@ fn main() {
 
                 // Override the batch size in the optimized implementation
                 let batch_start = std::time::Instant::now();
-                match interleaved_manager.run_simulations_with_batch_size(games_per_iter, test_batch_size) {
+                match interleaved_manager.run_simulations_with_batch_size::<MyBackend>(games_per_iter, test_batch_size) {
                     Ok(game_training_examples) => {
                         let batch_time = batch_start.elapsed();
                         let games_per_sec = games_per_iter as f32 / batch_time.as_secs_f32();

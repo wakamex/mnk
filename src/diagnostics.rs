@@ -1,5 +1,6 @@
 // AlphaZero Model Diagnostics
-use crate::alphazero::*;
+use crate::alphazero::AlphaZeroNet;
+use crate::unified_mcts::TrainingExample;
 use burn::prelude::*;
 
 #[cfg(feature = "cuda")]

@@ -18,3 +18,10 @@
 - Actually read and analyze code before claiming there are issues
 - parallel_sweep.py works fine and has no indentation errors
 - Stop making false claims about broken code
+
+## Module Organization (Updated)
+- MCTS implementation is now in `src/unified_mcts.rs` as a standalone module
+- `InterleavedGamesManager` and related types moved to unified_mcts for consistency
+- `alphazero.rs` cleaned up to focus on neural network implementation
+- All MCTS functions use the standalone unified_mcts module
+- Bridge pattern used in `mcts_bridge.rs` to avoid circular dependencies

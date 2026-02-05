@@ -129,11 +129,10 @@ class AlphaZeroSweep:
         try:
             training_start = time.time()
 
-            # Execute training in container with unique model path
+            # Execute training directly on host (CUDA context works fine here)
             cmd = [
-                "podman", "exec", "cuda-dev", "bash", "-c",
-                f"cd /workspace/mnk && LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/lib64:/usr/local/lib ./target/release/train_alphazero {config.args} --model-path {unique_model}"
-            ]
+                "./target/release/train_alphazero"
+            ] + config.args.split() + ["--model-path", unique_model]
             result = subprocess.run(
                 cmd,
                 capture_output=True,
@@ -177,10 +176,9 @@ class AlphaZeroSweep:
         work_dir = self.results_dir / config.name
 
         try:
-            # Run tournament in container to avoid CUDA version mismatch
+            # Run tournament directly on host (GPU inference now works perfectly)
             cmd = [
-                "podman", "exec", "cuda-dev", "bash", "-c",
-                f"cd /workspace/mnk && LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/lib64:/usr/local/lib ./target/release/mnk_game --model-path {model_file}"
+                "./target/release/mnk_game", "--model-path", model_file
             ]
             result = subprocess.run(
                 cmd,

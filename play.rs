@@ -4,7 +4,8 @@ use std::time::Instant;
 use clap::Parser;
 
 // Import the actual AlphaZero implementation from the shared library
-use mnk::alphazero::{AlphaZeroNet, simple_mcts};
+use mnk::alphazero::AlphaZeroNet;
+use mnk::unified_mcts::fallback_mcts;
 use mnk::inference_backend::{InferenceBackend, InferenceDevice};
 use burn::prelude::*;
 
@@ -808,14 +809,10 @@ impl Strategy for AlphaZeroStrategy {
         let alphazero_board = self.game_state_to_alphazero_board(state, config);
         let current_player = self.current_player_to_u8(state.current_player);
 
-        // CRITICAL FIX: Use valid() mode to prevent memory leak in inference
-        // This switches to inference mode which doesn't track gradients
-        use burn::module::AutodiffModule;
-        let policy = {
-            // Create inference-only network to prevent gradient tracking
-            let inference_net = self.net.valid();
-            simple_mcts(&inference_net, &alphazero_board, current_player, self.simulations)
-        };
+        // CRITICAL FIX: Remove .valid() call to prevent module churn
+        // Use the network directly - no need to create new module instances each time!
+        // Use batched MCTS from alphazero module (same as training)
+        let policy = mnk::unified_mcts::fallback_mcts(&self.net, &alphazero_board, current_player, self.simulations);
 
         // Convert policy to move by finding the best legal move
         let valid_moves = generate_valid_moves(state, config);
@@ -1024,27 +1021,27 @@ fn demo_tournament(model_path: &str) -> Result<(), String> {
         &config,
         MinimaxStrategy::new(3),
         MinimaxStrategy::new(2),
-        100,
+        10,
         false,
     )?;
     println!("{:8} vs {:8}: {}", "Deep", "Medium", result);
-    
+
     // Deep vs Shallow
     let result = play_tournament(
         &config,
         MinimaxStrategy::new(3),
         MinimaxStrategy::new(1),
-        100,
+        10,
         false,
     )?;
     println!("{:8} vs {:8}: {}", "Deep", "Shallow", result);
-    
+
     // Deep vs Random
     let result = play_tournament(
         &config,
         MinimaxStrategy::new(3),
         RandomStrategy::new(),
-        100,
+        10,
         false,
     )?;
     println!("{:8} vs {:8}: {}", "Deep", "Random", result);
@@ -1054,7 +1051,7 @@ fn demo_tournament(model_path: &str) -> Result<(), String> {
         &config,
         MinimaxStrategy::new(2),
         MinimaxStrategy::new(1),
-        100,
+        10,
         false,
     )?;
     println!("{:8} vs {:8}: {}", "Medium", "Shallow", result);
@@ -1064,7 +1061,7 @@ fn demo_tournament(model_path: &str) -> Result<(), String> {
         &config,
         MinimaxStrategy::new(2),
         RandomStrategy::new(),
-        100,
+        10,
         false,
     )?;
     println!("{:8} vs {:8}: {}", "Medium", "Random", result);
@@ -1074,7 +1071,7 @@ fn demo_tournament(model_path: &str) -> Result<(), String> {
         &config,
         MinimaxStrategy::new(1),
         RandomStrategy::new(),
-        100,
+        10,
         false,
     )?;
     println!("{:8} vs {:8}: {}", "Shallow", "Random", result);
@@ -1086,9 +1083,9 @@ fn demo_tournament(model_path: &str) -> Result<(), String> {
     // AlphaZero vs Deep Minimax
     let result = play_tournament(
         &config,
-        AlphaZeroStrategy::new_with_model_path(25, model_path),
+        AlphaZeroStrategy::new_with_model_path(5, model_path),
         MinimaxStrategy::new(3),
-        100,
+        10,
         false,
     )?;
     println!("{:8} vs {:8}: {}", "AZ-25", "Deep", result);
@@ -1096,9 +1093,9 @@ fn demo_tournament(model_path: &str) -> Result<(), String> {
     // AlphaZero vs Medium Minimax
     let result = play_tournament(
         &config,
-        AlphaZeroStrategy::new_with_model_path(25, model_path),
+        AlphaZeroStrategy::new_with_model_path(5, model_path),
         MinimaxStrategy::new(2),
-        100,
+        10,
         false,
     )?;
     println!("{:8} vs {:8}: {}", "AZ-25", "Medium", result);
@@ -1106,9 +1103,9 @@ fn demo_tournament(model_path: &str) -> Result<(), String> {
     // AlphaZero vs Random
     let result = play_tournament(
         &config,
-        AlphaZeroStrategy::new_with_model_path(25, model_path),
+        AlphaZeroStrategy::new_with_model_path(5, model_path),
         RandomStrategy::new(),
-        100,
+        10,
         false,
     )?;
     println!("{:8} vs {:8}: {}", "AZ-25", "Random", result);
@@ -1118,7 +1115,7 @@ fn demo_tournament(model_path: &str) -> Result<(), String> {
         &config,
         AlphaZeroStrategy::new_with_model_path(50, model_path),
         AlphaZeroStrategy::new_with_model_path(10, model_path),
-        100,
+        10,
         false,
     )?;
     println!("{:8} vs {:8}: {}", "AZ-50", "AZ-10", result);

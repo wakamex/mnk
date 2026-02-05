@@ -19,6 +19,18 @@ path = "src/run_diagnostics.rs"
 name = "test_minibt4"
 path = "test_minibt4.rs"
 
+[[bin]]
+name = "test_minimal_inference"
+path = "test_minimal_inference.rs"
+
+[[bin]]
+name = "test_ultra_minimal"
+path = "test_ultra_minimal.rs"
+
+[[bin]]
+name = "test_training_style_inference"
+path = "test_training_style_inference.rs"
+
 
 [lib]
 name = "mnk"
