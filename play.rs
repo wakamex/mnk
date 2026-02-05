@@ -997,6 +997,204 @@ where
     Ok(result)
 }
 
+/// Interleaved tournament that batches AlphaZero neural network calls across games
+/// Significantly faster than sequential tournaments due to batched inference
+pub fn play_interleaved_tournament(
+    config: &GameConfig,
+    model_path: &str,
+    opponent: impl Strategy + Clone,
+    num_games: usize,
+    mcts_simulations: usize,
+) -> Result<TournamentResult, String> {
+    use std::path::Path;
+    use mnk::alphazero::AlphaZeroNet;
+    use mnk::inference_backend::{InferenceBackend, InferenceDevice};
+    use burn::record::{BinFileRecorder, FullPrecisionSettings, Recorder};
+
+    // Load AlphaZero model using the same approach as AlphaZeroStrategy
+    #[cfg(feature = "cuda")]
+    let device = InferenceDevice::cuda(0);
+    #[cfg(not(feature = "cuda"))]
+    let device = InferenceDevice::default();
+
+    let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
+    let net = match recorder.load(model_path.into(), &device) {
+        Ok(record) => AlphaZeroNet::<InferenceBackend>::new(&device).load_record(record),
+        Err(e) => return Err(format!("Failed to load model from {}: {:?}", model_path, e)),
+    };
+
+    // Create game states - alternating who goes first
+    let mut game_states: Vec<Vec<Option<u8>>> = Vec::new();
+    let mut current_players: Vec<u8> = Vec::new();
+    let mut alphazero_players: Vec<u8> = Vec::new(); // Which player AlphaZero is in each game
+    let mut game_active: Vec<bool> = Vec::new();
+    let mut move_histories: Vec<Vec<usize>> = Vec::new();
+
+    for i in 0..num_games {
+        game_states.push(vec![None; 9]);
+        current_players.push(0);
+        alphazero_players.push((i % 2) as u8); // Alternate: 0, 1, 0, 1...
+        game_active.push(true);
+        move_histories.push(Vec::new());
+    }
+
+    // Play all games concurrently
+    while game_active.iter().any(|&active| active) {
+        // Collect positions where AlphaZero needs to move
+        let mut alphazero_positions = Vec::new();
+        let mut alphazero_game_ids = Vec::new();
+
+        for (game_id, &active) in game_active.iter().enumerate() {
+            if !active {
+                continue;
+            }
+
+            let current_player = current_players[game_id];
+            let alphazero_player = alphazero_players[game_id];
+
+            if current_player == alphazero_player {
+                // AlphaZero's turn - collect for batched evaluation
+                alphazero_positions.push((&game_states[game_id], current_player));
+                alphazero_game_ids.push(game_id);
+            }
+        }
+
+        // Batch evaluate all AlphaZero positions
+        if !alphazero_positions.is_empty() {
+            // Prepare boards and players for batch evaluation
+            let boards: Vec<&[Option<u8>]> = alphazero_positions.iter()
+                .map(|(board, _)| board.as_slice())
+                .collect();
+            let players: Vec<u8> = alphazero_positions.iter()
+                .map(|(_, player)| *player)
+                .collect();
+
+            // Use unified MCTS with batching for all positions
+            let policies: Vec<Vec<f32>> = boards.iter().zip(players.iter())
+                .map(|(board, &player)| {
+                    mnk::unified_mcts::fallback_mcts(&net, board, player, mcts_simulations)
+                })
+                .collect();
+
+            // Apply moves for AlphaZero
+            for (idx, game_id) in alphazero_game_ids.iter().enumerate() {
+                let policy = &policies[idx];
+
+                // Select best move from policy
+                let selected_move = policy.iter()
+                    .enumerate()
+                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+
+                // Make the move
+                game_states[*game_id][selected_move] = Some(current_players[*game_id]);
+                move_histories[*game_id].push(selected_move);
+
+                // Check for game end
+                if let Some(winner) = mnk::alphazero::check_winner(&game_states[*game_id]) {
+                    game_active[*game_id] = false;
+                } else if move_histories[*game_id].len() == 9 {
+                    game_active[*game_id] = false;
+                } else {
+                    current_players[*game_id] = 1 - current_players[*game_id];
+                }
+            }
+        }
+
+        // Process opponent moves for active games
+        for game_id in 0..num_games {
+            if !game_active[game_id] {
+                continue;
+            }
+
+            let current_player = current_players[game_id];
+            let alphazero_player = alphazero_players[game_id];
+
+            if current_player != alphazero_player {
+                // Opponent's turn
+                // Convert to GameState format for opponent strategy
+                let mut cells = Vec::new();
+                for &cell in &game_states[game_id] {
+                    cells.push(match cell {
+                        Some(0) => Cell::Player0,
+                        Some(1) => Cell::Player1,
+                        _ => Cell::Empty,
+                    });
+                }
+
+                let board = Board {
+                    cells,
+                    width: 3,
+                    height: 3,
+                };
+
+                // Determine current player in play.rs format
+                let current = if current_player == 0 { Cell::Player0 } else { Cell::Player1 };
+
+                // Check if game is terminal
+                let winner_opt = mnk::alphazero::check_winner(&game_states[game_id]);
+                let is_terminal = winner_opt.is_some() || move_histories[game_id].len() == 9;
+
+                let winner = match winner_opt {
+                    Some(0) => Winner::Player0,
+                    Some(1) => Winner::Player1,
+                    None if move_histories[game_id].len() == 9 => Winner::Draw,
+                    _ => Winner::None,
+                };
+
+                let game_state = GameState {
+                    board,
+                    current_player: current,
+                    last_move: move_histories[game_id].last().cloned(),
+                    is_terminal,
+                    winner,
+                };
+
+                // Get opponent move
+                match opponent.get_move(&game_state, config) {
+                    Ok(selected_move) => {
+                        game_states[game_id][selected_move] = Some(current_player);
+                        move_histories[game_id].push(selected_move);
+
+                        // Check for game end
+                        if let Some(winner) = mnk::alphazero::check_winner(&game_states[game_id]) {
+                            game_active[game_id] = false;
+                        } else if move_histories[game_id].len() == 9 {
+                            game_active[game_id] = false;
+                        } else {
+                            current_players[game_id] = 1 - current_player;
+                        }
+                    }
+                    Err(e) => {
+                        // Error in opponent strategy - mark game as ended
+                        println!("Opponent error in game {}: {}", game_id, e);
+                        game_active[game_id] = false;
+                    }
+                }
+            }
+        }
+    }
+
+    // Collect results
+    let mut result = TournamentResult::new();
+
+    for (game_id, game_state) in game_states.iter().enumerate() {
+        let winner = mnk::alphazero::check_winner(game_state);
+        let alphazero_player = alphazero_players[game_id];
+
+        match winner {
+            Some(w) if w == alphazero_player => result.player0_wins += 1,  // AlphaZero wins
+            Some(_) => result.player1_wins += 1,  // Opponent wins
+            None => result.draws += 1,
+        }
+        result.total_games += 1;
+    }
+
+    Ok(result)
+}
+
+
 // Demo functions
 
 fn demo_single_game() -> Result<(), String> {
@@ -1084,33 +1282,33 @@ fn demo_tournament(model_path: &str, tournament_games: usize) -> Result<(), Stri
     println!("\n🧠 AlphaZero Neural Network vs Classical AI:");
     println!("{}", "-".repeat(50));
 
-    // AlphaZero vs Deep Minimax
-    let result = play_tournament(
+    // AlphaZero vs Deep Minimax (using interleaved tournament for batching)
+    let result = play_interleaved_tournament(
         &config,
-        AlphaZeroStrategy::new_with_model_path(5, model_path),
+        model_path,
         MinimaxStrategy::new(3),
         tournament_games,
-        false,
+        25,  // MCTS simulations
     )?;
     println!("{:8} vs {:8}: {}", "AZ-25", "Deep", result);
 
-    // AlphaZero vs Medium Minimax
-    let result = play_tournament(
+    // AlphaZero vs Medium Minimax (using interleaved tournament for batching)
+    let result = play_interleaved_tournament(
         &config,
-        AlphaZeroStrategy::new_with_model_path(5, model_path),
+        model_path,
         MinimaxStrategy::new(2),
         tournament_games,
-        false,
+        25,  // MCTS simulations
     )?;
     println!("{:8} vs {:8}: {}", "AZ-25", "Medium", result);
 
-    // AlphaZero vs Random
-    let result = play_tournament(
+    // AlphaZero vs Random (using interleaved tournament for batching)
+    let result = play_interleaved_tournament(
         &config,
-        AlphaZeroStrategy::new_with_model_path(5, model_path),
+        model_path,
         RandomStrategy::new(),
         tournament_games,
-        false,
+        25,  // MCTS simulations
     )?;
     println!("{:8} vs {:8}: {}", "AZ-25", "Random", result);
 

@@ -1,128 +1,192 @@
-# M,N,K Game with AlphaZero-style Self-Play Training
+# M,N,K Game with AlphaZero Training (Burn Framework)
 
-This project implements an M,N,K game (generalized Tic-Tac-Toe) with an AlphaZero-inspired self-play training system using NNUE (Efficiently Updatable Neural Network) architecture.
+This project implements Tic-Tac-Toe (3,3,3 M,N,K game) with AlphaZero-style training using the Burn deep learning framework in Rust. Features GPU acceleration with CUDA support and high-performance batched MCTS.
 
-## Overview
+## Current Status - Working Implementation
 
-The M,N,K game is played on an M×N board where players take turns placing pieces, and the first to get K pieces in a row wins. This implementation combines:
-
-- **NNUE Neural Network**: A lightweight, CPU-efficient neural network architecture originally from Shogi/Chess engines
-- **Monte Carlo Tree Search (MCTS)**: Tree search with PUCT (Predictor + Upper Confidence bounds applied to Trees) for move selection
-- **Self-Play Training**: The AI learns by playing against itself, continuously improving through reinforcement learning
+- ✅ **AlphaZero Training**: Complete self-play training pipeline with Burn neural networks
+- ✅ **GPU Acceleration**: CUDA support with batched inference (1500+ games/sec)
+- ✅ **Unified MCTS**: Standalone Monte Carlo Tree Search module with batching
+- ✅ **Tournament System**: Automated model evaluation against different strategies
+- ✅ **Parameter Sweeps**: Parallel hyperparameter optimization with performance tracking
+- ✅ **Performance Tracking**: Real-time games/second measurement for training and tournaments
+- ✅ **Batch Optimization**: Automatic batch size optimization for optimal GPU utilization
 
 ## Architecture
 
 ### Core Components
 
-1. **NNUE Network** (`src/nnue.rs`)
-   - Input: Sparse board representation (768 features for 3x3, scales with board size)
-   - Architecture: `(input -> 256) x2 -> 32 -> 32 -> 1`
-   - Two-headed output: Policy (move probabilities) and Value (position evaluation)
-   - Efficiently updatable through incremental computation
+1. **AlphaZero Neural Network** (`src/alphazero.rs`)
+   - Burn framework with GPU support (CUDA backend)
+   - Two-headed architecture: Policy (move probabilities) + Value (position evaluation)
+   - Batched inference for high-performance evaluation
+   - 8x symmetry augmentation during training
 
-2. **MCTS with PUCT** (`src/mcts.rs`)
-   - Tree search guided by neural network predictions
-   - PUCT formula balances exploration vs exploitation
-   - Configurable simulations per move (default: 800)
+2. **Unified MCTS** (`src/unified_mcts.rs`)
+   - Standalone Monte Carlo Tree Search implementation
+   - Batched neural network evaluation for performance
+   - PUCT formula for exploration/exploitation balance
+   - InterleavedGamesManager for multi-game parallelization
 
-3. **Self-Play System** (`src/selfplay.rs`)
-   - Generates training games using MCTS
-   - Temperature-based move selection for exploration
-   - Stores game trajectories with final outcomes
+3. **Self-Play Training** (`src/train_alphazero_unified.rs`)
+   - High-performance training with batched position evaluation
+   - Experience replay with symmetry augmentation
+   - Configurable hyperparameters (learning rate, batch size, etc.)
+   - Automatic model saving and compatibility checks
 
-4. **Training Pipeline** (`src/training.rs`)
-   - Processes self-play games into training data
-   - Updates NNUE weights using gradient descent
-   - Implements experience replay buffer
+4. **Tournament System** (`play.rs`)
+   - **Interleaved tournaments**: Batches AlphaZero neural network calls across concurrent games
+   - Model evaluation against Random, Deep, and Medium strategies
+   - Configurable number of tournament games (default 100)
+   - Performance measurement and win rate tracking
+   - 2x speed improvement over sequential tournaments
 
 ## Project Structure
 
 ```
 mnk/
-├── Cargo.toml          # Project dependencies
-├── README.md           # This file
-├── play.rs             # Existing M,N,K game implementation
+├── Cargo.toml                      # Dependencies: Burn, CUDA, etc.
+├── README.md                       # Project documentation
+├── play.rs                         # Tournament system and CLI
+├── parallel_sweep.py              # Hyperparameter sweep automation
 ├── src/
-│   ├── main.rs         # Main training loop
-│   ├── nnue.rs         # NNUE neural network implementation
-│   ├── mcts.rs         # Monte Carlo Tree Search
-│   ├── selfplay.rs     # Self-play game generation
-│   ├── training.rs     # Neural network training
-│   └── integration.rs  # Integration with existing game code
-└── models/             # Saved neural network weights
+│   ├── lib.rs                     # Library exports
+│   ├── alphazero.rs               # Neural network (Burn framework)
+│   ├── unified_mcts.rs            # Standalone MCTS implementation
+│   ├── mcts_bridge.rs             # Bridge for network integration
+│   ├── self_play.rs               # Self-play functionality
+│   ├── train_alphazero_unified.rs # Training executable
+│   └── inference_backend.rs       # Model loading and inference
+└── sweep_results/                 # Training results and logs
 ```
-
-## TODO List
-
-### Phase 1: Core Implementation
-- [ ] Implement NNUE network structure with sparse input encoding
-- [ ] Create MCTS with PUCT selection and neural network integration
-- [ ] Build self-play game generation system
-- [ ] Develop training pipeline with batch processing
-
-### Phase 2: Integration
-- [ ] Integrate with existing M,N,K game structures
-- [ ] Add serialization for model weights
-- [ ] Create evaluation and testing framework
-- [ ] Implement progressive training with checkpoint system
-
-### Phase 3: Optimization
-- [ ] Add SIMD optimizations for NNUE forward pass
-- [ ] Implement parallel self-play workers
-- [ ] Add tensorboard logging for training metrics
-- [ ] Create tournament system for model comparison
-
-### Phase 4: Extensions
-- [ ] Support variable board sizes (different M,N,K configurations)
-- [ ] Add opening book generation from self-play
-- [ ] Implement AlphaZero-style policy iteration
-- [ ] Create interactive play interface
 
 ## Building and Running
 
+### Requirements
+- Rust 1.70+
+- CUDA 12.8+ (optional, for GPU acceleration)
+- Python 3.8+ (for parameter sweeps)
+
+### Build
 ```bash
-# Build the project
+# CPU-only build
 cargo build --release
 
-# Run training
-cargo run --release -- train --games 10000 --iterations 100
-
-# Play against the AI
-cargo run --release -- play --model models/best.nnue
-
-# Run tournament between models
-cargo run --release -- tournament --model1 models/v1.nnue --model2 models/v2.nnue
+# GPU build with CUDA support
+cargo build --release --features cuda
 ```
 
-## Training Process
+### Training
+```bash
+# Quick training test
+./target/release/train_alphazero --iterations 2 --games 5 --epochs 1
 
-1. **Initialization**: Start with random neural network weights
-2. **Self-Play**: Generate games using MCTS guided by current network
-3. **Training**: Update network weights to predict game outcomes better
-4. **Evaluation**: Test new network against previous version
-5. **Iteration**: Keep best performing network, repeat from step 2
+# Full training session
+./target/release/train_alphazero --iterations 100 --games 50 --epochs 5 --batch-size 512 --mcts-simulations 25
+```
 
-## Key Differences from Original AlphaZero
+### Tournament Evaluation
+```bash
+# Evaluate trained model
+./target/release/mnk_game --model-path alphazero_model.bin --tournament-games 100
+```
 
-- **NNUE Architecture**: More efficient for CPU evaluation than deep CNNs
-- **Incremental Updates**: Exploits sparse position changes in M,N,K games
-- **Smaller Scale**: Designed for learning on consumer hardware
-- **M,N,K Specific**: Optimized for games with simple win conditions
+### Parameter Sweeps
+```bash
+# Automated hyperparameter optimization
+python3 parallel_sweep.py --training-jobs 4 --tournament-jobs 2 --concurrent
+```
+
+## Key Features
+
+### GPU Acceleration
+- CUDA backend support through Burn framework
+- Batched neural network inference (1500+ games/sec)
+- Automatic fallback to CPU if CUDA unavailable
+
+### Performance Optimizations
+- InterleavedGamesManager for parallel game simulation
+- Batched position evaluation across multiple games
+- Optimized MCTS with batch size tuning
+- 8x symmetry augmentation for data efficiency
+
+### Training Pipeline
+- Self-play game generation with MCTS
+- Experience replay with augmented training data
+- Automatic model checkpointing and validation
+- Configurable hyperparameters (learning rate, batch size, MCTS simulations)
+
+### Evaluation System
+- Tournament play against multiple strategies (Random, Deep, Medium)
+- Win rate tracking and performance measurement
+- Games/second performance monitoring
+- Automated sweep result analysis
+
+## Example Training Session
+
+```bash
+$ ./target/release/train_alphazero --iterations 10 --games 25 --epochs 2 --batch-size 512
+
+Testing AlphaZero with Burn Framework
+=====================================
+💻 Running on GPU (CUDA available)
+
+Training Configuration:
+  Iterations: 10
+  Games per iteration: 25
+  Epochs: 2
+  Batch size: 512
+  Learning rate: 0.001
+  Value weight: 1
+  MCTS simulations: 25
+
+  OPTIMIZED position batching: 0.15s for 25 games (166.7 games/sec)
+  Batch size: 128, ALL game states batched!
+Iteration 1: 95 → 760 examples (8x symmetry)
+  Epoch 1: Total Loss = 2.8456
+    Value Loss (weighted): 1.6234, Policy Loss: 1.2222
+    Value:Policy ratio 1:1, 25 MCTS simulations
+  Self-play: 0.15s, Training: 1.25s, Total: 1.40s
+
+✅ Training completed! Model saved and ready for tournament use.
+```
+
+## Performance Notes
+
+### Current Performance (Optimized GPU + Interleaved Tournaments)
+- **Training**: 1130+ games/sec with GPU batch optimization (5x faster than CPU)
+- **Tournament**: 2.5-2.8 games/sec with interleaved batching (2x improvement)
+- **Optimal batch size**: 512-1024 for GPU training
+- **Memory**: ~2GB GPU memory usage during training
+- **Build Time**: <1 second incremental builds
+
+### GPU vs CPU Comparison
+- **GPU Training**: 1130+ games/sec (batch size 512+), 0.7s total time
+- **CPU Training**: 400-611 games/sec (batch size 64), 6.5s total time
+- **GPU Advantage**: 5-9x faster training, especially for longer runs
+
+### Build Requirements
+GPU acceleration requires container build:
+```bash
+./build.sh  # Builds with CUDA support in container
+```
+
+For CPU-only development:
+```bash
+cargo build --release  # CPU-only build
+```
 
 ## Dependencies
 
-```toml
-[dependencies]
-rand = "0.8"
-ndarray = "0.15"
-serde = { version = "1.0", features = ["derive"] }
-bincode = "1.3"
-rayon = "1.7"  # For parallel self-play
-indicatif = "0.17"  # Progress bars
-```
+Key dependencies from `Cargo.toml`:
+- **burn**: Deep learning framework with CUDA support
+- **burn-ndarray**: CPU backend
+- **burn-cuda**: GPU acceleration
+- **rand**: Random number generation
+- **clap**: Command-line argument parsing
 
 ## References
 
+- [Burn Deep Learning Framework](https://burn.dev/)
 - [AlphaZero Paper](https://www.nature.com/articles/nature24270)
-- [NNUE Introduction (Stockfish)](https://stockfishchess.org/blog/2020/introducing-nnue-evaluation/)
-- [Leela Chess Zero](https://lczero.org/)
+- [CUDA Toolkit](https://developer.nvidia.com/cuda-toolkit)

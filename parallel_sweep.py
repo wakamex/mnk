@@ -41,10 +41,12 @@ class ExperimentResult:
     training_time: float
     training_success: bool
     empty_board_value: float
+    training_games_per_sec: float  # Training performance
     vs_random: str
     vs_deep: str
     vs_medium: str
     tournament_success: bool
+    tournament_games_per_sec: float  # Tournament performance
     total_time: float
 
 
@@ -149,34 +151,40 @@ class AlphaZeroSweep:
                 match = re.search(r'Empty board evaluation: value=([0-9.-]+)', output)
                 empty_board_value = float(match.group(1)) if match else 0.0
 
+                # Parse training performance (games/sec from batch optimization)
+                perf_match = re.search(r'OPTIMIZED position batching: [0-9.]+s for [0-9]+ games \(([0-9.]+) games/sec\)', output)
+                training_games_per_sec = float(perf_match.group(1)) if perf_match else 0.0
+
                 # Check if model was successfully created
                 if Path(unique_model).exists():
                     # Save training log
                     with open(work_dir / 'training.log', 'w') as f:
                         f.write(output)
 
-                    return True, training_time, empty_board_value, "", unique_model
+                    return True, training_time, empty_board_value, training_games_per_sec, "", unique_model
                 else:
                     # Save stdout and stderr for debugging
                     with open(work_dir / 'training.log', 'w') as f:
                         f.write("STDOUT:\n" + result.stdout + "\n\nSTDERR:\n" + result.stderr)
-                    return False, training_time, 0.0, f"Training failed - no model produced. Check {work_dir}/training.log", ""
+                    return False, training_time, 0.0, 0.0, f"Training failed - no model produced. Check {work_dir}/training.log", ""
             else:
                 # Save stdout and stderr for debugging
                 with open(work_dir / 'training.log', 'w') as f:
                     f.write("STDOUT:\n" + result.stdout + "\n\nSTDERR:\n" + result.stderr)
-                return False, training_time, 0.0, f"Training failed with code {result.returncode}. Check {work_dir}/training.log", ""
+                return False, training_time, 0.0, 0.0, f"Training failed with code {result.returncode}. Check {work_dir}/training.log", ""
 
         except subprocess.TimeoutExpired:
-            return False, config.training_timeout, 0.0, "Training timeout", ""
+            return False, config.training_timeout, 0.0, 0.0, "Training timeout", ""
         except Exception as e:
-            return False, 0.0, 0.0, str(e), ""
+            return False, 0.0, 0.0, 0.0, str(e), ""
 
-    def run_tournament_only(self, config: ExperimentConfig, model_file: str = "alphazero_model.bin") -> Tuple[bool, str, str, str]:
+    def run_tournament_only(self, config: ExperimentConfig, model_file: str = "alphazero_model.bin") -> Tuple[bool, float, str, str, str]:
         """Run only the tournament phase of an experiment with isolated model file"""
         work_dir = self.results_dir / config.name
 
         try:
+            tournament_start = time.time()
+
             # Run tournament directly on host (GPU inference now works perfectly)
             cmd = [
                 "./target/release/mnk_game", "--model-path", model_file,
@@ -188,6 +196,8 @@ class AlphaZeroSweep:
                 text=True,
                 timeout=config.tournament_timeout
             )
+
+            tournament_time = time.time() - tournament_start
 
             # Debug: save ALL tournament output for analysis
             debug_file = work_dir / 'tournament_output.log'
@@ -219,18 +229,23 @@ class AlphaZeroSweep:
                         f.write(f"Output length: {len(output)} chars\n")
                         f.write(f"Contains AZ-25: {'AZ-25' in output}\n")
 
+                # Calculate tournament performance (approximate total games)
+                # Each tournament has 6 matchups with config.tournament_games each
+                total_tournament_games = 6 * config.tournament_games
+                tournament_games_per_sec = total_tournament_games / tournament_time if tournament_time > 0 else 0.0
+
                 # Save tournament log
                 with open(work_dir / 'tournament.log', 'w') as f:
                     f.write(output)
 
-                return True, vs_random, vs_deep, vs_medium
+                return True, tournament_games_per_sec, vs_random, vs_deep, vs_medium
             else:
-                return False, "FAILED", "FAILED", "FAILED"
+                return False, 0.0, "FAILED", "FAILED", "FAILED"
 
         except subprocess.TimeoutExpired:
-            return False, "TIMEOUT", "TIMEOUT", "TIMEOUT"
+            return False, 0.0, "TIMEOUT", "TIMEOUT", "TIMEOUT"
         except Exception as e:
-            return False, "ERROR", "ERROR", "ERROR"
+            return False, 0.0, "ERROR", "ERROR", "ERROR"
 
     def get_current_vram_usage(self) -> int:
         """Get current GPU memory usage in MB"""
@@ -397,14 +412,14 @@ class AlphaZeroSweep:
                 for future in as_completed(training_futures):
                     exp = training_futures[future]
                     try:
-                        success, train_time, empty_value, error, model_file = future.result()
-                        training_results[exp.name] = (success, train_time, empty_value, error, model_file)
+                        success, train_time, empty_value, training_games_per_sec, error, model_file = future.result()
+                        training_results[exp.name] = (success, train_time, empty_value, training_games_per_sec, error, model_file)
                         completed_training += 1
 
                         if exp.name in running_training:
                             del running_training[exp.name]
 
-                        print(f"  ✅ Training: {exp.name} - {train_time:.1f}s, value={empty_value:.3f}" if success else f"  ❌ Training: {exp.name} - {error}")
+                        print(f"  ✅ Training: {exp.name} - {train_time:.1f}s, value={empty_value:.3f}, {training_games_per_sec:.1f} games/sec" if success else f"  ❌ Training: {exp.name} - {error}")
 
                         # Immediately submit tournament if training succeeded and we have capacity
                         active_tournaments = len([f for f in tournament_futures if not f.done()])
@@ -425,7 +440,9 @@ class AlphaZeroSweep:
                             vs_deep="🔄" if success and exp.name in running_tournaments else ("⏳" if success else "N/A"),
                             vs_medium="🔄" if success and exp.name in running_tournaments else ("⏳" if success else "N/A"),
                             tournament_success=False,
-                            total_time=train_time
+                            total_time=train_time,
+                            training_games_per_sec=training_games_per_sec,
+                            tournament_games_per_sec=0.0  # Not yet available
                         )
 
                         # Periodic status updates
@@ -447,9 +464,10 @@ class AlphaZeroSweep:
                         del running_tournaments[exp.name]
 
                     try:
-                        success, vs_random, vs_deep, vs_medium = future.result()
+                        success, tournament_games_per_sec, vs_random, vs_deep, vs_medium = future.result()
 
                         # Update final results
+                        training_games_per_sec = training_results[exp.name][3] if exp.name in training_results else 0.0
                         final_results[exp.name] = ExperimentResult(
                             name=exp.name,
                             args=exp.args,
@@ -460,11 +478,13 @@ class AlphaZeroSweep:
                             vs_deep=vs_deep,
                             vs_medium=vs_medium,
                             tournament_success=success,
-                            total_time=train_time  # Tournament runs concurrent, so don't add time
+                            total_time=train_time,  # Tournament runs concurrent, so don't add time
+                            training_games_per_sec=training_games_per_sec,
+                            tournament_games_per_sec=tournament_games_per_sec
                         )
 
                         if success:
-                            print(f"  ✅ Tournament: {exp.name} - Random={vs_random}, Deep={vs_deep}, Medium={vs_medium}")
+                            print(f"  ✅ Tournament: {exp.name} - Random={vs_random}, Deep={vs_deep}, Medium={vs_medium}, {tournament_games_per_sec:.1f} games/sec")
                         else:
                             print(f"  ❌ Tournament failed: {exp.name}")
 
@@ -494,8 +514,8 @@ class AlphaZeroSweep:
                 for future in as_completed(training_futures):
                     exp = training_futures[future]
                     try:
-                        success, train_time, empty_value, error, model_file = future.result()
-                        training_results[exp.name] = (success, train_time, empty_value, error, model_file)
+                        success, train_time, empty_value, training_games_per_sec, error, model_file = future.result()
+                        training_results[exp.name] = (success, train_time, empty_value, training_games_per_sec, error, model_file)
 
                         if exp.name in running_training:
                             del running_training[exp.name]
@@ -510,10 +530,12 @@ class AlphaZeroSweep:
                             vs_deep="⏳" if success else "N/A",
                             vs_medium="⏳" if success else "N/A",
                             tournament_success=False,
-                            total_time=train_time
+                            total_time=train_time,
+                            training_games_per_sec=training_games_per_sec,
+                            tournament_games_per_sec=0.0  # Not yet available
                         )
 
-                        print(f"  ✅ Training: {exp.name} - {train_time:.1f}s, value={empty_value:.3f}" if success else f"  ❌ Training: {exp.name} - {error}")
+                        print(f"  ✅ Training: {exp.name} - {train_time:.1f}s, value={empty_value:.3f}, {training_games_per_sec:.1f} games/sec" if success else f"  ❌ Training: {exp.name} - {error}")
 
                         # Periodic status updates
                         current_time = time.time()
@@ -534,7 +556,7 @@ class AlphaZeroSweep:
                 tournament_futures = {}
                 running_tournaments = {}
                 for exp in successful_training:
-                    train_success, train_time, empty_value, error, model_file = training_results[exp.name]
+                    train_success, train_time, empty_value, training_games_per_sec, error, model_file = training_results[exp.name]
                     if model_file:
                         future = tournament_executor.submit(self.run_tournament_only, exp, model_file)
                         tournament_futures[future] = (exp, train_time, empty_value)
@@ -552,8 +574,9 @@ class AlphaZeroSweep:
                     print(f"  🎯 Tournament {i}/{len(tournament_futures)}: {exp.name}")
 
                     try:
-                        success, vs_random, vs_deep, vs_medium = future.result()
+                        success, tournament_games_per_sec, vs_random, vs_deep, vs_medium = future.result()
 
+                        training_games_per_sec = training_results[exp.name][3] if exp.name in training_results else 0.0
                         final_results[exp.name] = ExperimentResult(
                             name=exp.name,
                             args=exp.args,
@@ -564,11 +587,13 @@ class AlphaZeroSweep:
                             vs_deep=vs_deep,
                             vs_medium=vs_medium,
                             tournament_success=success,
-                            total_time=train_time  # Sequential, but report training time only
+                            total_time=train_time,  # Sequential, but report training time only
+                            training_games_per_sec=training_games_per_sec,
+                            tournament_games_per_sec=tournament_games_per_sec
                         )
 
                         if success:
-                            print(f"    ✅ Results: Random={vs_random}, Deep={vs_deep}, Medium={vs_medium}")
+                            print(f"    ✅ Results: Random={vs_random}, Deep={vs_deep}, Medium={vs_medium}, {tournament_games_per_sec:.1f} games/sec")
                         else:
                             print(f"    ❌ Tournament failed")
 
@@ -733,7 +758,7 @@ def generate_experiments(sweep_config: SweepConfig) -> List[ExperimentConfig]:
 
         # Base experiment name and args
         name = f"i{iterations}_g{games}_e{epochs}_b{batch_size}_lr{lr}_vw{value_weight}_mcts{mcts_sims}"
-        args = f"-i {iterations} -g {games} -e {epochs} --batch-size {batch_size} --learning-rate {lr} --value-weight {value_weight} --mcts-simulations {mcts_sims}"
+        args = f"-i {iterations} --games-per-iter {games} -e {epochs} --batch-size {batch_size} --learning-rate {lr} --value-weight {value_weight} --mcts-simulations {mcts_sims}"
 
         # Add advanced parameters if any are specified
         if advanced_params:

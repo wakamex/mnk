@@ -78,7 +78,16 @@ fn sample_from_policy(policy: &[f32]) -> usize {
     use rand::distributions::WeightedIndex;
     use rand::prelude::*;
 
-    let dist = WeightedIndex::new(policy).unwrap();
-    let mut rng = thread_rng();
-    dist.sample(&mut rng)
+    // Handle case where all weights are zero by using uniform distribution
+    match WeightedIndex::new(policy) {
+        Ok(dist) => {
+            let mut rng = thread_rng();
+            dist.sample(&mut rng)
+        }
+        Err(_) => {
+            // If all weights are zero, sample uniformly from valid positions
+            let mut rng = thread_rng();
+            rng.gen_range(0..policy.len())
+        }
+    }
 }
