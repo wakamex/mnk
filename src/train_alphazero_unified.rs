@@ -379,14 +379,10 @@ fn main() {
                  training_time.as_secs_f32(),
                  iter_time.as_secs_f32());
 
-        // Evaluation every 5 iterations
-        let vs_random = if iteration % 5 == 0 {
-            let win_rate = evaluate_vs_random::<MyBackend, _>(&net);
-            println!("  Evaluating vs random player... Win rate: {:.1}%", win_rate * 100.0);
-            Some(win_rate)
-        } else {
-            None
-        };
+        // Evaluate every iteration (~0.5s overhead, gives continuous quality signal)
+        let win_rate = evaluate_vs_random::<MyBackend, _>(&net);
+        println!("  vs Random: {:.1}%", win_rate * 100.0);
+        let vs_random = Some(win_rate);
 
         // Write CSV row
         if let Some(ref mut w) = csv_writer {
