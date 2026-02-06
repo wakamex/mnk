@@ -42,9 +42,21 @@ With batched MCTS (interleaved multi-game self-play with batch NN inference):
 
 | Metric | Value |
 |--------|-------|
-| Self-play throughput | 350-400 games/sec |
-| Training loss (20 iter) | 2.7 → 0.9 |
-| Win rate vs random (20 iter) | 87% |
+| Self-play throughput | 370-415 games/sec |
+| Training loss (30 iter) | 2.75 → 0.83 |
+| Value loss | 0.55 → 0.01 |
+| Policy loss | 2.20 → 0.81 |
+| Total training time | 268s (30 iter × 1000 games) |
+
+## Tournament Results (30 iter, defaults)
+
+| Matchup | W-L-D | Score |
+|---------|-------|-------|
+| AZ-25 vs Random | 85-8-7 | 88.5% |
+| AZ-25 vs Medium (depth 2) | 0-26-74 | 37.0% |
+| AZ-25 vs Deep (depth 3) | 0-50-50 | 25.0% |
+
+Model has learned solid defensive play (draws against perfect minimax) but doesn't exploit opponent mistakes — policy is too passive. Value head converged well (loss 0.01); policy head plateaued (loss 0.81).
 
 ## Training Details
 
