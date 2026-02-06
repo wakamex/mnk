@@ -786,7 +786,11 @@ class AlphaZeroSweep:
 
 @dataclass
 class SweepConfig:
-    """Configuration for parameter sweep ranges with advanced options"""
+    """Configuration for parameter sweep ranges.
+
+    None means 'not specified' — the binary's own default will be used.
+    Only tournament_games has a sweep-side default (it's not a training binary param).
+    """
     # Core training parameters
     iterations: List[int] = None
     games_per_iter: List[int] = None
@@ -799,6 +803,11 @@ class SweepConfig:
 
     # MCTS parameters
     mcts_simulations: List[int] = None
+
+    # Network architecture
+    net_type: List[str] = None
+
+    # Sweep-only settings (not training binary params)
     tournament_games: List[int] = None
 
     # Advanced parameters (optional)
@@ -806,70 +815,37 @@ class SweepConfig:
     cpuct: List[float] = None
 
     def __post_init__(self):
-        """Set intelligent defaults for unspecified parameters"""
-        # Set defaults if not provided
-        if self.iterations is None:
-            self.iterations = [5]
-        if self.games_per_iter is None:
-            self.games_per_iter = [1000]
-        if self.epochs is None:
-            self.epochs = [2]
-        if self.batch_size is None:
-            self.batch_size = [1024]
-        if self.learning_rate is None:
-            self.learning_rate = [0.0005]
-        if self.value_weight is None:
-            self.value_weight = [1.0]
-        if self.mcts_simulations is None:
-            self.mcts_simulations = [25]
         if self.tournament_games is None:
             self.tournament_games = [100]
 
-        # Advanced parameters default to None (not included in args unless specified)
-
 
 def generate_experiments(sweep_config: SweepConfig) -> List[ExperimentConfig]:
-    """Generate all possible experiments from parameter ranges with advanced parameter support"""
+    """Generate experiments from parameter ranges. Only includes parameters
+    explicitly set by the user — unset parameters use binary defaults."""
+    # Collect active (user-specified) parameters
+    active = []
+    for config_attr, _, binary_flag, prefix, _, _ in PARAM_TABLE:
+        values = getattr(sweep_config, config_attr, None)
+        if values is not None:
+            active.append((binary_flag, prefix, values))
+
+    tournament_games = sweep_config.tournament_games[0]
+
+    if not active:
+        return [ExperimentConfig("defaults", "", tournament_games=tournament_games)]
+
     experiments = []
-
-    # Build parameter combinations
-    param_combinations = [
-        sweep_config.iterations,
-        sweep_config.games_per_iter,
-        sweep_config.epochs,
-        sweep_config.batch_size,
-        sweep_config.learning_rate,
-        sweep_config.value_weight,
-        sweep_config.mcts_simulations
-    ]
-
-    # Add advanced parameters if specified
-    advanced_params = []
-    if sweep_config.temperature is not None:
-        advanced_params.append(('temperature', sweep_config.temperature))
-    if sweep_config.cpuct is not None:
-        advanced_params.append(('cpuct', sweep_config.cpuct))
-
-    for combo in itertools.product(*param_combinations):
-        iterations, games, epochs, batch_size, lr, value_weight, mcts_sims = combo
-
-        # Base experiment name and args
-        name = f"i{iterations}_g{games}_e{epochs}_b{batch_size}_lr{lr}_vw{value_weight}_mcts{mcts_sims}"
-        args = f"-i {iterations} --games-per-iter {games} -e {epochs} --batch-size {batch_size} --learning-rate {lr} --value-weight {value_weight} --mcts-simulations {mcts_sims}"
-
-        # Add advanced parameters if any are specified
-        if advanced_params:
-            for param_combo in itertools.product(*[params[1] for params in advanced_params]):
-                extended_name = name
-                extended_args = args
-
-                for i, (param_name, param_value) in enumerate(zip([p[0] for p in advanced_params], param_combo)):
-                    extended_name += f"_{param_name}{param_value}"
-                    extended_args += f" --{param_name} {param_value}"
-
-                experiments.append(ExperimentConfig(extended_name, extended_args, tournament_games=sweep_config.tournament_games[0]))
-        else:
-            experiments.append(ExperimentConfig(name, args, tournament_games=sweep_config.tournament_games[0]))
+    for combo in itertools.product(*[a[2] for a in active]):
+        name_parts = []
+        args_parts = []
+        for (flag, prefix, _), value in zip(active, combo):
+            name_parts.append(f"{prefix}{value}")
+            args_parts.append(f"{flag} {value}")
+        experiments.append(ExperimentConfig(
+            name="_".join(name_parts),
+            args=" ".join(args_parts),
+            tournament_games=tournament_games,
+        ))
 
     return experiments
 
@@ -901,6 +877,47 @@ def parse_int_range(value_str: str) -> List[int]:
         return [int(x.strip()) for x in value_str.split(',')]
 
 
+# Maps sweep parameters to binary CLI flags for arg generation and defaults display.
+# No defaults stored here — the binary owns all defaults via clap.
+# (config_attr, argparse_dest, binary_flag, name_prefix, display_name, value_type)
+PARAM_TABLE = [
+    ("iterations",      "iterations",    "--iterations",         "i",    "Iterations",          "int"),
+    ("games_per_iter",  "games",         "--games-per-iter",     "g",    "Games per iteration", "int"),
+    ("epochs",          "epochs",        "--epochs",             "e",    "Epochs",              "int"),
+    ("batch_size",      "batch_size",    "--batch-size",         "b",    "Batch size",          "int"),
+    ("learning_rate",   "learning_rate", "--learning-rate",      "lr",   "Learning rate",       "float"),
+    ("value_weight",    "value_weight",  "--value-weight",       "vw",   "Value weight",        "float"),
+    ("mcts_simulations","mcts",          "--mcts-simulations",   "mcts", "MCTS simulations",    "int"),
+    ("net_type",        "net_type",      "--net-type",           "net",  "Network type",        "str"),
+    ("temperature",     "temperature",   "--temperature",        "temp", "Temperature",         "float"),
+    ("cpuct",           "cpuct",         "--cpuct",              "cpuct","CPUCT",               "float"),
+]
+
+VALUE_PARSERS = {
+    "int": parse_int_range,
+    "float": parse_range,
+    "str": lambda s: [x.strip() for x in s.split(",")],
+}
+
+
+def query_binary_defaults() -> Dict[str, str]:
+    """Parse parameter defaults from train_alphazero --help output.
+    Returns dict mapping long flag name (e.g. 'iterations') to default value string."""
+    try:
+        result = subprocess.run(
+            ["./target/release/train_alphazero", "--help"],
+            capture_output=True, text=True, timeout=5
+        )
+        defaults = {}
+        for line in result.stdout.splitlines():
+            m = re.search(r'--(\S+).*\[default:\s*([^\]]+)\]', line)
+            if m:
+                defaults[m.group(1)] = m.group(2).strip()
+        return defaults
+    except Exception:
+        return {}
+
+
 def main():
     """Main entry point with advanced parameter specification and intelligent defaults"""
     parser = argparse.ArgumentParser(
@@ -917,26 +934,32 @@ Examples:
   # Complex multi-parameter sweep
   python parallel_sweep.py -i 10,20 -g 5:15:5 --batch-size 16,32,64 --mcts 25,50,100
 
+  # Compare CNN vs Transformer architectures
+  python parallel_sweep.py --net-type cnn,transformer -i 20 --learning-rate 0.01,0.05
+
   # Advanced parameters
   python parallel_sweep.py --temperature 0.8,1.0,1.2 --cpuct 1.0,1.5,2.0
+
+  Unspecified parameters use the binary's own defaults (queried at startup).
         """
     )
 
-    # Core parameter groups
-    param_group = parser.add_argument_group('core hyperparameters')
-    param_group.add_argument('--iterations', '-i', help='Training iterations (default: 10)')
-    param_group.add_argument('--games', '-g', help='Games per iteration (default: 5)')
-    param_group.add_argument('--epochs', '-e', help='Training epochs (default: 4)')
-    param_group.add_argument('--batch-size', '-b', help='Batch size (default: 32)')
-    param_group.add_argument('--learning-rate', '-lr', help='Learning rate (default: 0.001)')
-    param_group.add_argument('--value-weight', '-vw', help='Value loss weight (default: 1.0)')
-    param_group.add_argument('--mcts', '-m', help='MCTS simulations (default: 25)')
+    # Training hyperparameters — defaults come from the binary, not duplicated here
+    param_group = parser.add_argument_group('training hyperparameters')
+    param_group.add_argument('--iterations', '-i', help='Training iterations')
+    param_group.add_argument('--games', '-g', help='Games per iteration')
+    param_group.add_argument('--epochs', '-e', help='Training epochs')
+    param_group.add_argument('--batch-size', '-b', help='Batch size')
+    param_group.add_argument('--learning-rate', '-lr', help='Learning rate')
+    param_group.add_argument('--value-weight', '-vw', help='Value loss weight')
+    param_group.add_argument('--mcts', '-m', help='MCTS simulations per move')
+    param_group.add_argument('--net-type', help='Network architecture: cnn, transformer')
     param_group.add_argument('--tournament-games', '-tg', help='Games per tournament matchup (default: 100)')
 
     # Advanced parameter group
     advanced_group = parser.add_argument_group('advanced hyperparameters')
-    advanced_group.add_argument('--temperature', '-t', help='MCTS temperature (optional)')
-    advanced_group.add_argument('--cpuct', '-c', help='MCTS CPUCT exploration parameter (optional)')
+    advanced_group.add_argument('--temperature', '-t', help='MCTS temperature')
+    advanced_group.add_argument('--cpuct', '-c', help='MCTS CPUCT exploration parameter')
 
     # Execution control
     control_group = parser.add_argument_group('execution control')
@@ -949,114 +972,63 @@ Examples:
 
     args = parser.parse_args()
 
-    # Build advanced configuration
+    # Build sweep config — None means "use binary default"
     sweep_config = SweepConfig()
-
-    # Core parameters
-    if args.iterations:
-        sweep_config.iterations = parse_int_range(args.iterations)
-    if args.games:
-        sweep_config.games_per_iter = parse_int_range(args.games)
-    if args.epochs:
-        sweep_config.epochs = parse_int_range(args.epochs)
-    if args.batch_size:
-        sweep_config.batch_size = parse_int_range(args.batch_size)
-    if args.learning_rate:
-        sweep_config.learning_rate = parse_range(args.learning_rate)
-    if args.value_weight:
-        sweep_config.value_weight = parse_range(args.value_weight)
-    if args.mcts:
-        sweep_config.mcts_simulations = parse_int_range(args.mcts)
+    for config_attr, arg_dest, _, _, _, value_type in PARAM_TABLE:
+        raw = getattr(args, arg_dest, None)
+        if raw:
+            setattr(sweep_config, config_attr, VALUE_PARSERS[value_type](raw))
     if getattr(args, 'tournament_games', None):
         sweep_config.tournament_games = parse_int_range(args.tournament_games)
 
-    # Advanced parameters
-    if args.temperature:
-        sweep_config.temperature = parse_range(args.temperature)
-    if args.cpuct:
-        sweep_config.cpuct = parse_range(args.cpuct)
+    # Query binary for actual defaults (single source of truth)
+    binary_defaults = query_binary_defaults()
 
-    # Generate experiments with advanced parameter support
+    # Generate experiments
     experiments = generate_experiments(sweep_config)
 
-    print(f"📋 Generated {len(experiments)} experiments from parameter combinations")
+    print(f"Generated {len(experiments)} experiments from parameter combinations")
 
-    # Show default values for parameters not being swept
-    print(f"\n📝 Default parameters (not swept):")
-    defaults_used = []
-    if len(sweep_config.iterations) == 1 and not args.iterations:
-        defaults_used.append(f"   Iterations: {sweep_config.iterations[0]}")
-    if len(sweep_config.games_per_iter) == 1 and not args.games:
-        defaults_used.append(f"   Games per iteration: {sweep_config.games_per_iter[0]}")
-    if len(sweep_config.epochs) == 1 and not args.epochs:
-        defaults_used.append(f"   Epochs: {sweep_config.epochs[0]}")
-    if len(sweep_config.batch_size) == 1 and not args.batch_size:
-        defaults_used.append(f"   Batch size: {sweep_config.batch_size[0]}")
-    if len(sweep_config.learning_rate) == 1 and not args.learning_rate:
-        defaults_used.append(f"   Learning rate: {sweep_config.learning_rate[0]}")
-    if len(sweep_config.value_weight) == 1 and not args.value_weight:
-        defaults_used.append(f"   Value weight: {sweep_config.value_weight[0]}")
-    if len(sweep_config.mcts_simulations) == 1 and not args.mcts:
-        defaults_used.append(f"   MCTS simulations: {sweep_config.mcts_simulations[0]}")
-    if len(sweep_config.tournament_games) == 1 and not getattr(args, 'tournament_games', None):
-        defaults_used.append(f"   Tournament games: {sweep_config.tournament_games[0]}")
+    # Show parameters using binary defaults (not specified in this sweep)
+    print(f"\nParameters using binary defaults (not swept):")
+    has_defaults = False
+    for config_attr, _, binary_flag, _, display_name, _ in PARAM_TABLE:
+        if getattr(sweep_config, config_attr) is None:
+            flag_key = binary_flag.lstrip('-')
+            default_val = binary_defaults.get(flag_key, '?')
+            print(f"   {display_name}: {default_val}")
+            has_defaults = True
+    if not has_defaults:
+        print("   (All parameters explicitly set)")
 
-    if defaults_used:
-        for default in defaults_used:
-            print(default)
-    else:
-        print("   (All parameters are being swept)")
+    # Show swept parameters (multiple values)
+    swept = [(dn, getattr(sweep_config, ca))
+             for ca, _, _, _, dn, _ in PARAM_TABLE
+             if getattr(sweep_config, ca) is not None and len(getattr(sweep_config, ca)) > 1]
+    if swept:
+        print(f"\nParameters being swept:")
+        for display_name, values in swept:
+            print(f"   {display_name}: {values}")
 
-    # Show what is being swept
-    print(f"\n🔄 Parameters being swept:")
-    if len(sweep_config.iterations) > 1:
-        print(f"   Iterations: {sweep_config.iterations}")
-    if len(sweep_config.games_per_iter) > 1:
-        print(f"   Games per iteration: {sweep_config.games_per_iter}")
-    if len(sweep_config.epochs) > 1:
-        print(f"   Epochs: {sweep_config.epochs}")
-    if len(sweep_config.batch_size) > 1:
-        print(f"   Batch size: {sweep_config.batch_size}")
-    if len(sweep_config.learning_rate) > 1:
-        print(f"   Learning rate: {sweep_config.learning_rate}")
-    if len(sweep_config.value_weight) > 1:
-        print(f"   Value weight: {sweep_config.value_weight}")
-    if len(sweep_config.mcts_simulations) > 1:
-        print(f"   MCTS simulations: {sweep_config.mcts_simulations}")
-    if sweep_config.temperature and len(sweep_config.temperature) > 1:
-        print(f"   Temperature: {sweep_config.temperature}")
-    if sweep_config.cpuct and len(sweep_config.cpuct) > 1:
-        print(f"   CPUCT: {sweep_config.cpuct}")
+    # Show fixed overrides (single value, explicitly set by user)
+    fixed = [(dn, getattr(sweep_config, ca))
+             for ca, _, _, _, dn, _ in PARAM_TABLE
+             if getattr(sweep_config, ca) is not None and len(getattr(sweep_config, ca)) == 1]
+    if fixed:
+        print(f"\nFixed parameter overrides:")
+        for display_name, values in fixed:
+            print(f"   {display_name}: {values[0]}")
 
     if args.dry_run:
         print(f"\nWould run {len(experiments)} experiments:")
         for exp in experiments:
             print(f"  {exp.name}: {exp.args}")
 
-        # Show parameter space analysis
-        total_combinations = 1
-        param_counts = {
-            'iterations': len(sweep_config.iterations),
-            'games_per_iter': len(sweep_config.games_per_iter),
-            'epochs': len(sweep_config.epochs),
-            'batch_size': len(sweep_config.batch_size),
-            'learning_rate': len(sweep_config.learning_rate),
-            'value_weight': len(sweep_config.value_weight),
-            'mcts_simulations': len(sweep_config.mcts_simulations)
-        }
-
-        for param, count in param_counts.items():
-            total_combinations *= count
-
-        print(f"\n📊 Parameter space analysis:")
-        for param, count in param_counts.items():
-            print(f"   {param}: {count} values")
-
-        if sweep_config.temperature:
-            print(f"   temperature: {len(sweep_config.temperature)} values")
-        if sweep_config.cpuct:
-            print(f"   cpuct: {len(sweep_config.cpuct)} values")
-
+        print(f"\nParameter space analysis:")
+        for config_attr, _, _, _, display_name, _ in PARAM_TABLE:
+            values = getattr(sweep_config, config_attr)
+            if values is not None:
+                print(f"   {display_name}: {len(values)} value{'s' if len(values) > 1 else ''}")
         print(f"   Total combinations: {len(experiments)}")
         return
 

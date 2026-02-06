@@ -17,14 +17,11 @@ The model draws against perfect minimax but never wins. Policy head has plateaue
 
 ## Known Issues to Fix First
 
-### 1. Sweep framework defaults are stale
-`parallel_sweep.py` defaults were set for Adam optimizer:
-- `learning_rate = [0.0005]` -- should be `[0.01]` for SGD
-- `epochs = [2]` -- current training default is 8
-- `mcts_simulations = [25]` -- current default is 50
+### ~~1. Sweep framework defaults are stale~~ FIXED
+Sweep framework no longer duplicates binary defaults. Non-swept params are omitted from the command line so the binary uses its own clap defaults. Sweep queries binary `--help` at startup for display.
 
-### 2. Sweep framework lacks `--net-type` support
-Cannot sweep CNN vs Transformer. Need to add `--net-type` as a sweep parameter in `SweepConfig`, `generate_experiments()`, and the argparse CLI.
+### ~~2. Sweep framework lacks `--net-type` support~~ FIXED
+Added `--net-type cnn,transformer` to sweep framework via `PARAM_TABLE`.
 
 ### 3. Transformer batch inference is not actually batched
 In `network.rs`, the Transformer's `forward_batch_inference()` loops over positions sequentially. This will make Transformer self-play much slower than CNN. Needs a real batched forward pass (same pattern as CNN).
@@ -32,7 +29,7 @@ In `network.rs`, the Transformer's `forward_batch_inference()` loops over positi
 ## Experiment Phases
 
 ### Phase 0: Framework Fixes
-Fix issues #1-3 above before running any sweeps. Verify with `--dry-run`.
+~~Fix issues #1-2~~ Done. Remaining: fix Transformer batch inference (#3) before running Transformer sweeps.
 
 ### Phase 1: CNN Hyperparameter Sensitivity (quick, 1-2 hours)
 Goal: find which hyperparameters matter most for CNN quality-per-second.
