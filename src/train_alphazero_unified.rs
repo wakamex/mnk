@@ -155,6 +155,10 @@ struct Args {
     /// Board width (transformer supports variable sizes, cnn only supports 3)
     #[arg(long, default_value = "3")]
     board_width: usize,
+
+    /// Path for CSV training log (iteration metrics with wall-clock time)
+    #[arg(long)]
+    csv_log: Option<String>,
 }
 
 fn main() {
@@ -221,7 +225,15 @@ fn main() {
     println!("  MCTS simulations: {}", args.mcts_simulations);
     println!();
 
-    // Test GPU: basic tensor and network forward pass
+    // CSV training log
+    let mut csv_writer = args.csv_log.as_ref().map(|path| {
+        let file = std::fs::File::create(path).expect("Failed to create CSV log file");
+        let mut w = std::io::BufWriter::new(file);
+        use std::io::Write;
+        writeln!(w, "iteration,wall_clock_s,selfplay_s,training_s,games_per_sec,value_loss,policy_loss,vs_random").unwrap();
+        w
+    });
+
     let start_time = std::time::Instant::now();
 
     for iteration in 1..=iterations {
@@ -231,25 +243,21 @@ fn main() {
         let selfplay_start = std::time::Instant::now();
         let mut all_examples = Vec::new();
 
-        {
-            let batch_start = std::time::Instant::now();
-            let game_training_examples = mnk::unified_mcts::generate_training_data_batched::<MyBackend, _>(
-                &net, games_per_iter, args.mcts_simulations, 2, 64
-            );
-            let batch_time = batch_start.elapsed();
-            let games_per_sec = games_per_iter as f32 / batch_time.as_secs_f32();
-
-            for game_examples in game_training_examples {
-                all_examples.extend(game_examples);
-            }
-
-            println!("  Self-play: {:.3}s for {} games ({:.1} games/sec, {} MCTS sims, batched)",
-                     batch_time.as_secs_f32(),
-                     games_per_iter,
-                     games_per_sec,
-                     args.mcts_simulations);
-        }
+        let game_training_examples = mnk::unified_mcts::generate_training_data_batched::<MyBackend, _>(
+            &net, games_per_iter, args.mcts_simulations, 2, 64
+        );
         let selfplay_time = selfplay_start.elapsed();
+        let iter_games_per_sec = games_per_iter as f32 / selfplay_time.as_secs_f32();
+
+        for game_examples in game_training_examples {
+            all_examples.extend(game_examples);
+        }
+
+        println!("  Self-play: {:.3}s for {} games ({:.1} games/sec, {} MCTS sims, batched)",
+                 selfplay_time.as_secs_f32(),
+                 games_per_iter,
+                 iter_games_per_sec,
+                 args.mcts_simulations);
 
         let original_count = all_examples.len();
 
@@ -265,6 +273,8 @@ fn main() {
 
         // Training loop
         let training_start = std::time::Instant::now();
+        let mut final_value_loss = 0.0f32;
+        let mut final_policy_loss = 0.0f32;
 
         for epoch in 0..epochs {
             use rand::seq::SliceRandom;
@@ -352,11 +362,13 @@ fn main() {
                 num_batches += 1;
             }
 
+            final_value_loss = epoch_value_loss / num_batches as f32;
+            final_policy_loss = epoch_policy_loss / num_batches as f32;
+
             if epoch == 0 || epoch == epochs - 1 {
-                let avg_vl = epoch_value_loss / num_batches as f32;
-                let avg_pl = epoch_policy_loss / num_batches as f32;
                 println!("  Epoch {}: value_loss={:.4}, policy_loss={:.4}, total={:.4}",
-                         epoch + 1, avg_vl, avg_pl, avg_vl * args.value_weight + avg_pl);
+                         epoch + 1, final_value_loss, final_policy_loss,
+                         final_value_loss * args.value_weight + final_policy_loss);
             }
         }
         let training_time = training_start.elapsed();
@@ -368,9 +380,25 @@ fn main() {
                  iter_time.as_secs_f32());
 
         // Evaluation every 5 iterations
-        if iteration % 5 == 0 {
+        let vs_random = if iteration % 5 == 0 {
             let win_rate = evaluate_vs_random::<MyBackend, _>(&net);
             println!("  Evaluating vs random player... Win rate: {:.1}%", win_rate * 100.0);
+            Some(win_rate)
+        } else {
+            None
+        };
+
+        // Write CSV row
+        if let Some(ref mut w) = csv_writer {
+            use std::io::Write;
+            let wall_clock = start_time.elapsed().as_secs_f32();
+            let vs_random_str = vs_random.map_or(String::new(), |v| format!("{:.4}", v));
+            writeln!(w, "{},{:.2},{:.3},{:.3},{:.1},{:.4},{:.4},{}",
+                     iteration, wall_clock,
+                     selfplay_time.as_secs_f32(), training_time.as_secs_f32(),
+                     iter_games_per_sec, final_value_loss, final_policy_loss,
+                     vs_random_str).unwrap();
+            w.flush().unwrap();
         }
     }
 

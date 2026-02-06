@@ -140,6 +140,7 @@ class AlphaZeroSweep:
         # Create unique model filename to avoid conflicts - replace dots with underscores to avoid Burn recorder issues
         safe_name = config.name.replace(".", "_")
         unique_model = f"alphazero_model_{safe_name}.bin"
+        csv_log = str(work_dir / 'training_log.csv')
 
         try:
             training_start = time.time()
@@ -147,7 +148,7 @@ class AlphaZeroSweep:
             # Execute training directly on host (CUDA context works fine here)
             cmd = [
                 "./target/release/train_alphazero"
-            ] + config.args.split() + ["--model-path", unique_model]
+            ] + config.args.split() + ["--model-path", unique_model, "--csv-log", csv_log]
             result = subprocess.run(
                 cmd,
                 capture_output=True,
@@ -158,14 +159,20 @@ class AlphaZeroSweep:
             training_time = time.time() - training_start
 
             if result.returncode == 0:
-                # Parse training results
+                # Parse training results from stdout
                 output = result.stdout
                 match = re.search(r'Empty board evaluation: value=([0-9.-]+)', output)
                 empty_board_value = float(match.group(1)) if match else 0.0
 
-                # Parse training performance (games/sec from batch optimization)
-                perf_match = re.search(r'OPTIMIZED position batching: [0-9.]+s for [0-9]+ games \(([0-9.]+) games/sec\)', output)
-                training_games_per_sec = float(perf_match.group(1)) if perf_match else 0.0
+                # Read metrics from CSV log (more reliable than regex on stdout)
+                training_games_per_sec = 0.0
+                if Path(csv_log).exists():
+                    try:
+                        log_df = pd.read_csv(csv_log)
+                        if not log_df.empty:
+                            training_games_per_sec = log_df['games_per_sec'].mean()
+                    except Exception:
+                        pass
 
                 # Check if model was successfully created
                 if Path(unique_model).exists():
@@ -175,12 +182,10 @@ class AlphaZeroSweep:
 
                     return True, training_time, empty_board_value, training_games_per_sec, "", unique_model
                 else:
-                    # Save stdout and stderr for debugging
                     with open(work_dir / 'training.log', 'w') as f:
                         f.write("STDOUT:\n" + result.stdout + "\n\nSTDERR:\n" + result.stderr)
                     return False, training_time, 0.0, 0.0, f"Training failed - no model produced. Check {work_dir}/training.log", ""
             else:
-                # Save stdout and stderr for debugging
                 with open(work_dir / 'training.log', 'w') as f:
                     f.write("STDOUT:\n" + result.stdout + "\n\nSTDERR:\n" + result.stderr)
                 return False, training_time, 0.0, 0.0, f"Training failed with code {result.returncode}. Check {work_dir}/training.log", ""
