@@ -93,19 +93,7 @@ impl<B: Backend<FloatElem = f32>> Network<B> {
     pub fn forward_batch_inference(&self, boards: &[&[Option<u8>]], players: &[u8]) -> (Vec<f32>, Vec<Vec<f32>>) {
         match self {
             Network::Cnn(net) => net.forward_batch_inference(boards, players),
-            Network::Transformer(net) => {
-                // Batch inference for transformer
-                let mut values = Vec::with_capacity(boards.len());
-                let mut policies = Vec::with_capacity(boards.len());
-
-                for (&board, &player) in boards.iter().zip(players.iter()) {
-                    let (v, p) = crate::minibt4::evaluate_position(net, board, player, net.current_board_width());
-                    values.push(v);
-                    policies.push(p);
-                }
-
-                (values, policies)
-            }
+            Network::Transformer(net) => net.forward_batch_inference(boards, players),
         }
     }
 

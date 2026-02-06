@@ -23,13 +23,13 @@ Sweep framework no longer duplicates binary defaults. Non-swept params are omitt
 ### ~~2. Sweep framework lacks `--net-type` support~~ FIXED
 Added `--net-type cnn,transformer` to sweep framework via `PARAM_TABLE`.
 
-### 3. Transformer batch inference is not actually batched
-In `network.rs`, the Transformer's `forward_batch_inference()` loops over positions sequentially. This will make Transformer self-play much slower than CNN. Needs a real batched forward pass (same pattern as CNN).
+### ~~3. Transformer batch inference is not actually batched~~ FIXED
+Added `forward_batch_inference()` to `MiniBT4Net` — single forward pass for all positions in the batch, same pattern as CNN.
 
 ## Experiment Phases
 
 ### Phase 0: Framework Fixes
-~~Fix issues #1-2~~ Done. Remaining: fix Transformer batch inference (#3) before running Transformer sweeps.
+All three issues fixed. Ready to run sweeps.
 
 ### Phase 1: CNN Hyperparameter Sensitivity (quick, 1-2 hours)
 Goal: find which hyperparameters matter most for CNN quality-per-second.
@@ -124,4 +124,4 @@ Derived metrics to compute from sweep CSVs:
 
 **Transformer** (~800K params): 4 layers, 8 heads, d_model=128, 2D positional encoding. Supports 3x3 to 15x15. ~20x more parameters than CNN. Potentially better for larger boards but may be overkill for 3x3.
 
-**Transformer gap**: `forward_batch_inference()` in `network.rs` is sequential (loops over positions one at a time). Must fix before meaningful comparison -- otherwise Transformer self-play will be artificially slow.
+**Transformer batching**: `forward_batch_inference()` now uses a single forward pass for the full batch, same as CNN.

@@ -143,6 +143,51 @@ impl<B: Backend> MiniBT4Net<B> {
     }
 }
 
+impl<B: Backend<FloatElem = f32>> MiniBT4Net<B> {
+    /// Batch inference: single forward pass for multiple positions
+    pub fn forward_batch_inference(&self, boards: &[&[Option<u8>]], players: &[u8]) -> (Vec<f32>, Vec<Vec<f32>>) {
+        assert_eq!(boards.len(), players.len());
+
+        if boards.is_empty() {
+            return (vec![], vec![]);
+        }
+
+        let device = self.input_proj.devices()[0].clone();
+        let batch_size = boards.len();
+        let board_size = self.current_board_width * self.current_board_width;
+
+        // Build batch input tensor [batch_size, board_size]
+        let mut batch_data = vec![0.0f32; batch_size * board_size];
+        for (batch_idx, (&board, &player)) in boards.iter().zip(players.iter()).enumerate() {
+            for (cell_idx, &cell) in board.iter().enumerate() {
+                batch_data[batch_idx * board_size + cell_idx] = match cell {
+                    Some(p) if p == player => 1.0,
+                    Some(_) => -1.0,
+                    None => 0.0,
+                };
+            }
+        }
+
+        let batch_input = Tensor::<B, 1>::from_floats(batch_data.as_slice(), &device)
+            .reshape([batch_size, board_size]);
+
+        // Single forward pass for entire batch
+        let (batch_values, batch_policies) = self.forward(batch_input, self.current_board_width);
+
+        // Bulk GPU->CPU transfer
+        let values_data = batch_values.to_data();
+        let values: Vec<f32> = values_data.as_slice::<f32>().unwrap().iter().copied().collect();
+
+        let policies_data = batch_policies.to_data();
+        let policies_slice = policies_data.as_slice::<f32>().unwrap();
+        let policies: Vec<Vec<f32>> = (0..batch_size)
+            .map(|i| policies_slice[i * board_size..(i + 1) * board_size].to_vec())
+            .collect();
+
+        (values, policies)
+    }
+}
+
 /// Create MiniBT4 network for specific board size
 pub fn create_minibt4_net<B: Backend>(device: &B::Device, board_width: usize) -> MiniBT4Net<B> {
     MiniBT4Net::new_for_board(device, board_width)
