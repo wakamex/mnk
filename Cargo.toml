@@ -11,11 +11,6 @@ path = "play.rs"
 name = "train_alphazero"
 path = "src/train_alphazero_unified.rs"
 
-[[bin]]
-name = "run_diagnostics"
-path = "src/run_diagnostics.rs"
-
-
 [lib]
 name = "mnk"
 path = "src/lib.rs"
@@ -33,18 +28,8 @@ ndarray = { version = "0.15", features = ["serde-1"] }
 # Burn - Deep learning framework
 burn = { version = "0.17.1", features = ["ndarray", "autodiff"] }
 burn-ndarray = { version = "0.17.1" }
-burn-candle = { version = "0.17.1", optional = true }
 burn-cuda = { version = "0.17.1", optional = true }
-burn-wgpu = { version = "0.17.1", optional = true }
-
-# Candle - Rust native deep learning
-candle-core = { version = "0.9.2" }
-candle-nn = { version = "0.9.2" }
 
 [features]
 default = []
 cuda = ["burn-cuda"]
-burn-cuda-native = ["burn-cuda"]
-candle-cuda = ["candle-core/cuda", "candle-nn/cuda", "burn-candle/cuda"]
-wgpu = ["burn-wgpu"]
-metal = ["candle-core/metal"]

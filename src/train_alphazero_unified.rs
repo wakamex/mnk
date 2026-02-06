@@ -1,6 +1,8 @@
 use burn::prelude::*;
 use burn::backend::Autodiff;
-use burn::optim::{AdamConfig, Optimizer, GradientsParams};
+use burn::optim::{SgdConfig, Optimizer, GradientsParams};
+use burn::optim::momentum::MomentumConfig;
+use burn::optim::decay::WeightDecayConfig;
 use burn::grad_clipping::{GradientClippingConfig};
 use burn::tensor::activation;
 use mnk::alphazero::evaluate_vs_random;
@@ -15,18 +17,12 @@ use burn_cuda::{Cuda, CudaDevice};
 #[cfg(feature = "cuda")]
 type MyBackend = Autodiff<Cuda>;
 
-#[cfg(feature = "cuda")]
-type InferenceBackend = Cuda;
-
 // CPU backend fallback
 #[cfg(not(feature = "cuda"))]
 use burn_ndarray::{NdArray, NdArrayDevice};
 
 #[cfg(not(feature = "cuda"))]
 type MyBackend = Autodiff<NdArray>;
-
-#[cfg(not(feature = "cuda"))]
-type InferenceBackend = NdArray;
 
 
 // Symmetry augmentation for 8x data efficiency
@@ -136,8 +132,8 @@ struct Args {
     #[arg(short, long, default_value = "1024")]
     batch_size: usize,
 
-    /// Learning rate for optimizer
-    #[arg(long, default_value = "0.0005")]
+    /// Learning rate for optimizer (SGD default: 0.01)
+    #[arg(long, default_value = "0.01")]
     learning_rate: f64,
 
     /// Value loss weight (vs policy loss weight of 1.0)
@@ -197,9 +193,15 @@ fn main() {
 
     let mut net = Network::<MyBackend>::new(net_type, &device, board_width);
 
-    // Configure optimizer with gradient clipping for stability
-    let mut optimizer = AdamConfig::new()
-        .with_grad_clipping(Some(GradientClippingConfig::Norm(1.0)))
+    // SGD with momentum (matches AlphaZero paper)
+    let mut optimizer = SgdConfig::new()
+        .with_momentum(Some(MomentumConfig {
+            momentum: 0.9,
+            dampening: 0.0,
+            nesterov: false,
+        }))
+        .with_weight_decay(Some(WeightDecayConfig::new(1e-4)))
+        .with_gradient_clipping(Some(GradientClippingConfig::Norm(1.0)))
         .init();
 
     // Training hyperparameters from CLI arguments
@@ -231,8 +233,8 @@ fn main() {
 
         {
             let batch_start = std::time::Instant::now();
-            let game_training_examples = mnk::unified_mcts::generate_training_data::<MyBackend, _>(
-                &net, games_per_iter, args.mcts_simulations, 2
+            let game_training_examples = mnk::unified_mcts::generate_training_data_batched::<MyBackend, _>(
+                &net, games_per_iter, args.mcts_simulations, 2, 64
             );
             let batch_time = batch_start.elapsed();
             let games_per_sec = games_per_iter as f32 / batch_time.as_secs_f32();
@@ -241,7 +243,7 @@ fn main() {
                 all_examples.extend(game_examples);
             }
 
-            println!("  Self-play: {:.3}s for {} games ({:.1} games/sec, {} MCTS sims)",
+            println!("  Self-play: {:.3}s for {} games ({:.1} games/sec, {} MCTS sims, batched)",
                      batch_time.as_secs_f32(),
                      games_per_iter,
                      games_per_sec,
@@ -263,13 +265,13 @@ fn main() {
 
         // Training loop
         let training_start = std::time::Instant::now();
-        let mut total_loss = 0.0;
 
         for epoch in 0..epochs {
             use rand::seq::SliceRandom;
             all_examples.shuffle(&mut rand::thread_rng());
 
-            let mut epoch_loss = 0.0;
+            let mut epoch_value_loss = 0.0f32;
+            let mut epoch_policy_loss = 0.0f32;
             let mut num_batches = 0;
 
             for batch_start in (0..all_examples.len()).step_by(batch_size) {
@@ -282,7 +284,6 @@ fn main() {
                 let mut policy_targets: Vec<f32> = Vec::new();
 
                 for ex in batch {
-                    // Convert board to tensor format
                     let mut input = vec![0.0f32; 9];
                     for (i, &cell) in ex.board.iter().enumerate() {
                         input[i] = match cell {
@@ -312,74 +313,51 @@ fn main() {
                     &device
                 ).reshape([batch.len(), 9]);
 
-                // Forward pass - now returns (values, logits)
+                // Forward pass
                 let (pred_values, pred_logits) = net.forward(boards);
 
-                // Compute losses with professional numerical stability
-                let value_loss = (pred_values.clone() - target_values.clone()).powf_scalar(2.0).mean();
+                // Value loss: MSE
+                let value_loss = (pred_values - target_values).powf_scalar(2.0).mean();
 
-                // DEBUG: Check for NaN in intermediate values
-                let value_loss_scalar = value_loss.clone().into_scalar();
-                if !value_loss_scalar.is_finite() {
-                    eprintln!("DEBUG: Value loss is NaN/Inf: {}", value_loss_scalar);
-                    eprintln!("  pred_values range: {:?}", pred_values.dims());
-                    eprintln!("  target_values range: {:?}", target_values.dims());
-                }
-
-                // CRITICAL: Use log_softmax on raw logits for rock-solid gradients
+                // Policy loss: cross-entropy via log_softmax
+                // Clamp logits to prevent unbounded growth — gradient is zero at boundary,
+                // which breaks the positive feedback loop of logit inflation.
+                let pred_logits = pred_logits.clamp(-20.0, 20.0);
                 let log_probs = activation::log_softmax(pred_logits, 1);
-
-                // Add epsilon to target policies to prevent 0 * log(0) = NaN
                 let epsilon = 1e-8;
                 let safe_target_policies = target_policies.clone() + epsilon;
                 let safe_target_policies = safe_target_policies.clone() / safe_target_policies.sum_dim(1).unsqueeze();
+                let policy_loss = -(safe_target_policies * log_probs).sum() / target_policies.dims()[0] as f32;
 
-                let policy_loss = -(safe_target_policies * log_probs.clone()).sum() / target_policies.dims()[0] as f32;
+                // Track per-component losses (single GPU sync for both)
+                let vl = value_loss.clone().into_scalar();
+                let pl = policy_loss.clone().into_scalar();
 
-                // DEBUG: Check for NaN in policy loss
-                let policy_loss_scalar = policy_loss.clone().into_scalar();
-                if !policy_loss_scalar.is_finite() {
-                    eprintln!("DEBUG: Policy loss is NaN/Inf: {}", policy_loss_scalar);
-                    eprintln!("  log_probs dims: {:?}", log_probs.dims());
-                    eprintln!("  target_policies dims: {:?}", target_policies.dims());
-                }
-
-                // Value loss weight from CLI arguments
+                // Combined loss
                 let value_weight = args.value_weight;
-                let total_batch_loss = value_loss.clone() * value_weight + policy_loss.clone();
+                let total_batch_loss = value_loss * value_weight + policy_loss;
 
-                // Check for NaN in loss before backward pass
-                let loss_scalar = total_batch_loss.clone().into_scalar();
-                if !loss_scalar.is_finite() {
-                    eprintln!("ERROR: NaN/Inf loss detected: {}. Training failed - network corrupted.", loss_scalar);
-                    eprintln!("This indicates numerical instability. Try reducing learning rate.");
-                    std::process::exit(1); // Fail fast instead of continuing with corrupted network
+                if !(vl.is_finite() && pl.is_finite()) {
+                    eprintln!("ERROR: NaN/Inf loss (value={}, policy={}). Training failed.", vl, pl);
+                    std::process::exit(1);
                 }
 
-                // Backward pass with automatic gradient clipping
+                // Backward pass and optimizer step
                 let gradients = total_batch_loss.backward();
                 let gradients = GradientsParams::from_grads(gradients, &net);
-
                 net = optimizer.step(learning_rate, net, gradients);
 
-                epoch_loss += total_batch_loss.into_scalar();
+                epoch_value_loss += vl;
+                epoch_policy_loss += pl;
                 num_batches += 1;
             }
 
             if epoch == 0 || epoch == epochs - 1 {
-                let avg_epoch_loss = epoch_loss / num_batches as f32;
-                println!("  Epoch {}: Total Loss = {:.4}", epoch + 1, avg_epoch_loss);
-
-                // Report value vs policy loss breakdown on final epoch
-                if epoch == epochs - 1 {
-                    // Recalculate losses for reporting (simplified)
-                    let sample_value_loss = (epoch_loss / num_batches as f32) / (1.5 + 1.0); // Approximate value loss
-                    let sample_policy_loss = sample_value_loss / 1.5; // Approximate policy loss
-                    println!("    Value Loss (weighted): {:.4}, Policy Loss: {:.4}", sample_value_loss * 1.5, sample_policy_loss);
-                    println!("    Value:Policy ratio {}:1, {} MCTS simulations", args.value_weight, args.mcts_simulations);
-                }
+                let avg_vl = epoch_value_loss / num_batches as f32;
+                let avg_pl = epoch_policy_loss / num_batches as f32;
+                println!("  Epoch {}: value_loss={:.4}, policy_loss={:.4}, total={:.4}",
+                         epoch + 1, avg_vl, avg_pl, avg_vl * args.value_weight + avg_pl);
             }
-            total_loss = epoch_loss / num_batches as f32;
         }
         let training_time = training_start.elapsed();
 

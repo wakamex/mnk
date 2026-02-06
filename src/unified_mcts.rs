@@ -116,7 +116,17 @@ fn expand_node<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
 ) -> f32 {
     // Get value and policy from neural network
     let (value, policy) = net.forward_inference(board, player);
+    expand_node_with_policy(node, board, &policy, value);
+    value
+}
 
+/// Expand a node using pre-computed policy priors and value (for batched inference).
+fn expand_node_with_policy(
+    node: &mut MctsNode,
+    board: &[Option<u8>],
+    policy: &[f32],
+    _value: f32,
+) {
     // Mask illegal moves and renormalize
     let mut legal_sum = 0.0f32;
     for i in 0..9 {
@@ -139,7 +149,6 @@ fn expand_node<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
     }
 
     node.is_expanded = true;
-    value
 }
 
 /// Add Dirichlet noise to root priors for exploration.
@@ -498,4 +507,372 @@ pub fn generate_training_data<B: Backend<FloatElem = f32>, N: NetworkInference<B
     }
 
     all_games
+}
+
+// ============================================================
+// Batched MCTS for GPU efficiency
+// ============================================================
+
+/// A game in progress during batched self-play.
+struct GameInProgress {
+    board: Vec<Option<u8>>,
+    player: u8,
+    move_number: usize,
+    examples: Vec<TrainingExample>,
+    /// MCTS root for the current position
+    root: Option<MctsNode>,
+    /// Number of simulations completed for the current position
+    sim_count: usize,
+    /// Whether this game has finished
+    completed: bool,
+    /// Whether the root node needs initial expansion
+    root_needs_expansion: bool,
+}
+
+impl GameInProgress {
+    fn new() -> Self {
+        Self {
+            board: vec![None; 9],
+            player: 0,
+            move_number: 0,
+            examples: Vec::new(),
+            root: None,
+            sim_count: 0,
+            completed: false,
+            root_needs_expansion: true,
+        }
+    }
+
+    /// Start MCTS for the current position by creating a fresh root.
+    fn init_root(&mut self) {
+        self.root = Some(MctsNode::new(0.0));
+        self.sim_count = 0;
+        self.root_needs_expansion = true;
+    }
+}
+
+/// A leaf node waiting for neural network evaluation.
+struct PendingLeaf {
+    /// Index into the games array
+    game_idx: usize,
+    /// Board state at the leaf
+    board: Vec<Option<u8>>,
+    /// Player to move at the leaf
+    player: u8,
+    /// Path from root to the leaf (node pointer, action) for backpropagation
+    path: Vec<(*mut MctsNode, usize)>,
+    /// Pointer to the leaf node itself (for expansion)
+    leaf_ptr: *mut MctsNode,
+    /// Whether this is the root expansion (needs Dirichlet noise after)
+    is_root_expansion: bool,
+}
+
+// Safety: PendingLeaf uses raw pointers into MctsNode trees that are owned by
+// GameInProgress structs. This is safe because:
+// 1. We are single-threaded
+// 2. The trees (owned by GameInProgress) outlive the PendingLeaf structs
+// 3. We never reallocate or move trees while PendingLeaf exists
+unsafe impl Send for PendingLeaf {}
+
+/// Generate training data from multiple self-play games using batched NN inference.
+///
+/// Instead of calling the neural network once per leaf expansion, this function
+/// runs N games simultaneously, collects leaf nodes across all games into a batch,
+/// evaluates them in one GPU call, then distributes results back.
+pub fn generate_training_data_batched<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
+    net: &N,
+    num_games: usize,
+    simulations: usize,
+    temp_threshold: usize,
+    batch_size: usize,
+) -> Vec<Vec<TrainingExample>> {
+    let mut games: Vec<GameInProgress> = (0..num_games)
+        .map(|_| {
+            let mut g = GameInProgress::new();
+            g.init_root();
+            g
+        })
+        .collect();
+
+    // Main loop: run until all games complete
+    loop {
+        let active_count = games.iter().filter(|g| !g.completed).count();
+        if active_count == 0 {
+            break;
+        }
+
+        // Collect pending leaves from active games
+        let mut pending: Vec<PendingLeaf> = Vec::with_capacity(batch_size);
+
+        for game_idx in 0..games.len() {
+            let game = &mut games[game_idx];
+            if game.completed {
+                continue;
+            }
+
+            // If this game has completed all simulations for the current position,
+            // extract policy, make a move, and prepare next position
+            if game.sim_count >= simulations && !game.root_needs_expansion {
+                handle_move_selection(game, temp_threshold);
+                if game.completed {
+                    continue;
+                }
+                // init_root for the new position
+                game.init_root();
+            }
+
+            // Check if the game is in a terminal state (no legal moves or winner exists)
+            let legal_moves: Vec<usize> = game.board.iter()
+                .enumerate()
+                .filter_map(|(i, &c)| if c.is_none() { Some(i) } else { None })
+                .collect();
+            if legal_moves.is_empty() || check_winner_internal(&game.board).is_some() {
+                finish_game(game);
+                continue;
+            }
+
+            // Run one MCTS simulation down to a leaf
+            let root = game.root.as_mut().unwrap();
+
+            if game.root_needs_expansion {
+                // Root needs initial NN expansion — add to pending batch
+                let root_ptr: *mut MctsNode = root;
+                pending.push(PendingLeaf {
+                    game_idx,
+                    board: game.board.clone(),
+                    player: game.player,
+                    path: Vec::new(),
+                    leaf_ptr: root_ptr,
+                    is_root_expansion: true,
+                });
+            } else {
+                // Normal simulation: select down to a leaf
+                if let Some(leaf) = run_simulation_to_leaf(game_idx, root, &game.board, game.player) {
+                    pending.push(leaf);
+                } else {
+                    // Simulation hit a terminal node (no leaf to expand) — count it
+                    game.sim_count += 1;
+                }
+            }
+
+            // Flush batch if full
+            if pending.len() >= batch_size {
+                flush_pending_batch(net, &mut games, &mut pending);
+            }
+        }
+
+        // Flush any remaining pending leaves
+        if !pending.is_empty() {
+            flush_pending_batch(net, &mut games, &mut pending);
+        }
+    }
+
+    // Collect results
+    games.into_iter().map(|g| g.examples).collect()
+}
+
+/// Run one MCTS simulation from root to an unexpanded leaf.
+/// Returns Some(PendingLeaf) if we hit a leaf that needs NN evaluation,
+/// or None if we hit a terminal node (already handled via backprop).
+fn run_simulation_to_leaf(
+    game_idx: usize,
+    root: &mut MctsNode,
+    board: &[Option<u8>],
+    player: u8,
+) -> Option<PendingLeaf> {
+    let mut path: Vec<(*mut MctsNode, usize)> = Vec::new();
+    let mut current_board = board.to_vec();
+    let mut current_player = player;
+    let mut node_ptr: *mut MctsNode = root;
+
+    loop {
+        let node = unsafe { &mut *node_ptr };
+
+        if node.is_terminal {
+            // Terminal node — backpropagate terminal value
+            backpropagate(&path, node.terminal_value);
+            return None;
+        }
+
+        if !node.is_expanded {
+            // Leaf node — needs NN evaluation
+            return Some(PendingLeaf {
+                game_idx,
+                board: current_board,
+                player: current_player,
+                path,
+                leaf_ptr: node_ptr,
+                is_root_expansion: false,
+            });
+        }
+
+        // Node is expanded — select action with PUCT
+        let action = select_action_puct(node, &current_board);
+        path.push((node_ptr, action));
+
+        // Make the move
+        current_board[action] = Some(current_player);
+        current_player = 1 - current_player;
+
+        // Check for terminal state after the move
+        if let Some(winner) = check_winner_internal(&current_board) {
+            let child = node.children[action].as_mut().unwrap();
+            child.is_terminal = true;
+            child.terminal_value = if winner == current_player { 1.0 } else { -1.0 };
+            child.is_expanded = true;
+            child.visit_count += 1;
+            child.total_value += child.terminal_value;
+            node.visit_count += 1;
+
+            let leaf_val = -child.terminal_value;
+            if path.len() > 1 {
+                backpropagate(&path[..path.len() - 1], leaf_val);
+            }
+            return None;
+        }
+
+        // Check for draw
+        let board_full = current_board.iter().all(|c| c.is_some());
+        if board_full {
+            let child = node.children[action].as_mut().unwrap();
+            child.is_terminal = true;
+            child.terminal_value = 0.0;
+            child.is_expanded = true;
+            child.visit_count += 1;
+            node.visit_count += 1;
+
+            if path.len() > 1 {
+                backpropagate(&path[..path.len() - 1], 0.0);
+            }
+            return None;
+        }
+
+        // Move to child node
+        node_ptr = node.children[action].as_mut().unwrap().as_mut() as *mut MctsNode;
+    }
+}
+
+/// Evaluate a batch of pending leaves with the neural network, expand them,
+/// and backpropagate results.
+fn flush_pending_batch<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
+    net: &N,
+    games: &mut [GameInProgress],
+    pending: &mut Vec<PendingLeaf>,
+) {
+    if pending.is_empty() {
+        return;
+    }
+
+    // Collect boards and players for batch inference
+    let boards: Vec<&[Option<u8>]> = pending.iter().map(|p| p.board.as_slice()).collect();
+    let players: Vec<u8> = pending.iter().map(|p| p.player).collect();
+
+    // Single batched NN call
+    let (values, policies) = net.forward_batch_inference(&boards, &players);
+
+    // Distribute results back to each pending leaf
+    for (i, leaf) in pending.drain(..).enumerate() {
+        let value = values[i];
+        let policy = &policies[i];
+
+        // Expand the leaf node with the policy
+        let leaf_node = unsafe { &mut *leaf.leaf_ptr };
+        expand_node_with_policy(leaf_node, &leaf.board, policy, value);
+
+        // Check if this is actually terminal (no children created)
+        let has_children = leaf_node.children.iter().any(|c| c.is_some());
+        if !has_children {
+            leaf_node.is_terminal = true;
+            leaf_node.terminal_value = if let Some(winner) = check_winner_internal(&leaf.board) {
+                if winner == leaf.player { 1.0 } else { -1.0 }
+            } else {
+                0.0 // Draw
+            };
+            backpropagate(&leaf.path, leaf_node.terminal_value);
+        } else {
+            // Backpropagate the NN value
+            backpropagate(&leaf.path, -value);
+        }
+
+        if leaf.is_root_expansion {
+            // Root was just expanded — add Dirichlet noise and set virtual visit
+            leaf_node.visit_count = 1;
+            add_dirichlet_noise(leaf_node);
+            games[leaf.game_idx].root_needs_expansion = false;
+        } else {
+            // Normal simulation completed
+            games[leaf.game_idx].sim_count += 1;
+        }
+    }
+}
+
+/// After all simulations for a position are done, extract policy, select move,
+/// store training example, and advance the game.
+fn handle_move_selection(game: &mut GameInProgress, temp_threshold: usize) {
+    let root = game.root.as_ref().unwrap();
+
+    // Extract visit counts from root children
+    let mut visit_counts = vec![0.0f32; 9];
+    for i in 0..9 {
+        if let Some(ref child) = root.children[i] {
+            visit_counts[i] = child.visit_count as f32;
+        }
+    }
+
+    // Normalize to probability distribution
+    let total: f32 = visit_counts.iter().sum();
+    if total > 0.0 {
+        for v in &mut visit_counts {
+            *v /= total;
+        }
+    }
+
+    // Store training example (value filled in later)
+    game.examples.push(TrainingExample {
+        board: game.board.clone(),
+        player: game.player,
+        policy: visit_counts.clone(),
+        value: 0.0,
+    });
+
+    // Select move
+    let legal_moves: Vec<usize> = game.board.iter()
+        .enumerate()
+        .filter_map(|(i, &c)| if c.is_none() { Some(i) } else { None })
+        .collect();
+
+    let selected = if game.move_number < temp_threshold {
+        sample_from_distribution(&visit_counts)
+    } else {
+        visit_counts.iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .map(|(i, _)| i)
+            .unwrap_or(legal_moves[0])
+    };
+
+    // Make the move
+    game.board[selected] = Some(game.player);
+    game.player = 1 - game.player;
+    game.move_number += 1;
+
+    // Check for game end
+    if check_winner_internal(&game.board).is_some()
+        || game.board.iter().all(|c| c.is_some())
+    {
+        finish_game(game);
+    }
+}
+
+/// Fill in game outcome values for all training examples and mark game complete.
+fn finish_game(game: &mut GameInProgress) {
+    let winner = check_winner_internal(&game.board);
+    for example in &mut game.examples {
+        example.value = match winner {
+            Some(w) if w == example.player => 1.0,
+            Some(_) => -1.0,
+            None => 0.0,
+        };
+    }
+    game.completed = true;
 }
