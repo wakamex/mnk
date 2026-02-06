@@ -244,33 +244,54 @@ fn backpropagate(path: &[(* mut MctsNode, usize)], leaf_value: f32) {
     }
 }
 
-/// Sample an action from a distribution (visit counts).
-fn sample_from_distribution(distribution: &[f32]) -> usize {
+/// Sample an action from visit counts using temperature.
+/// pi_i = N_i^(1/tau) / sum(N_j^(1/tau))
+/// tau → 0: argmax, tau = 1: proportional to visit counts, tau > 1: more uniform.
+fn sample_with_temperature(visit_counts: &[f32], temperature: f32) -> usize {
     use rand::Rng;
     let mut rng = rand::thread_rng();
 
-    let total: f32 = distribution.iter().sum();
+    // Find legal moves (non-zero visit counts)
+    let nonzero: Vec<usize> = visit_counts.iter().enumerate()
+        .filter(|(_, &v)| v > 0.0)
+        .map(|(i, _)| i)
+        .collect();
+
+    if nonzero.is_empty() {
+        return 0;
+    }
+    if nonzero.len() == 1 {
+        return nonzero[0];
+    }
+
+    // tau very small → argmax
+    if temperature < 1e-4 {
+        return *nonzero.iter()
+            .max_by(|&&a, &&b| visit_counts[a].partial_cmp(&visit_counts[b]).unwrap())
+            .unwrap();
+    }
+
+    // Apply temperature: pi_i = N_i^(1/tau)
+    let inv_tau = 1.0 / temperature;
+    let weights: Vec<f32> = nonzero.iter()
+        .map(|&i| visit_counts[i].powf(inv_tau))
+        .collect();
+
+    let total: f32 = weights.iter().sum();
     if total <= 0.0 {
-        // Uniform over non-zero entries, or first entry
-        let nonzero: Vec<usize> = distribution.iter().enumerate()
-            .filter(|(_, &v)| v > 0.0)
-            .map(|(i, _)| i)
-            .collect();
-        if nonzero.is_empty() {
-            return 0;
-        }
         return nonzero[rng.gen_range(0..nonzero.len())];
     }
 
+    // Sample from weighted distribution
     let r: f32 = rng.gen::<f32>() * total;
     let mut cumsum = 0.0;
-    for (i, &v) in distribution.iter().enumerate() {
-        cumsum += v;
+    for (j, &w) in weights.iter().enumerate() {
+        cumsum += w;
         if cumsum > r {
-            return i;
+            return nonzero[j];
         }
     }
-    distribution.len() - 1
+    *nonzero.last().unwrap()
 }
 
 /// Run MCTS search from a position and return the visit-count policy.
@@ -429,7 +450,7 @@ pub fn mcts_search<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
 pub fn self_play_game_mcts<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
     net: &N,
     simulations: usize,
-    temp_threshold: usize,
+    temperature: f32,
 ) -> Vec<TrainingExample> {
     let mut board = vec![None; 9];
     let mut player = 0u8;
@@ -461,18 +482,8 @@ pub fn self_play_game_mcts<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
             value: 0.0,
         });
 
-        // Select move
-        let selected = if move_number < temp_threshold {
-            // Temperature = 1: sample proportionally to visit counts
-            sample_from_distribution(&policy)
-        } else {
-            // Temperature → 0: pick argmax
-            policy.iter()
-                .enumerate()
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-                .map(|(i, _)| i)
-                .unwrap_or(legal_moves[0])
-        };
+        // Select move using temperature-scaled visit counts
+        let selected = sample_with_temperature(&policy, temperature);
 
         board[selected] = Some(player);
         player = 1 - player;
@@ -497,12 +508,12 @@ pub fn generate_training_data<B: Backend<FloatElem = f32>, N: NetworkInference<B
     net: &N,
     num_games: usize,
     simulations: usize,
-    temp_threshold: usize,
+    temperature: f32,
 ) -> Vec<Vec<TrainingExample>> {
     let mut all_games = Vec::with_capacity(num_games);
 
     for _ in 0..num_games {
-        let examples = self_play_game_mcts(net, simulations, temp_threshold);
+        let examples = self_play_game_mcts(net, simulations, temperature);
         all_games.push(examples);
     }
 
@@ -583,7 +594,7 @@ pub fn generate_training_data_batched<B: Backend<FloatElem = f32>, N: NetworkInf
     net: &N,
     num_games: usize,
     simulations: usize,
-    temp_threshold: usize,
+    temperature: f32,
     batch_size: usize,
 ) -> Vec<Vec<TrainingExample>> {
     let mut games: Vec<GameInProgress> = (0..num_games)
@@ -613,7 +624,7 @@ pub fn generate_training_data_batched<B: Backend<FloatElem = f32>, N: NetworkInf
             // If this game has completed all simulations for the current position,
             // extract policy, make a move, and prepare next position
             if game.sim_count >= simulations && !game.root_needs_expansion {
-                handle_move_selection(game, temp_threshold);
+                handle_move_selection(game, temperature);
                 if game.completed {
                     continue;
                 }
@@ -808,7 +819,7 @@ fn flush_pending_batch<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
 
 /// After all simulations for a position are done, extract policy, select move,
 /// store training example, and advance the game.
-fn handle_move_selection(game: &mut GameInProgress, temp_threshold: usize) {
+fn handle_move_selection(game: &mut GameInProgress, temperature: f32) {
     let root = game.root.as_ref().unwrap();
 
     // Extract visit counts from root children
@@ -841,15 +852,7 @@ fn handle_move_selection(game: &mut GameInProgress, temp_threshold: usize) {
         .filter_map(|(i, &c)| if c.is_none() { Some(i) } else { None })
         .collect();
 
-    let selected = if game.move_number < temp_threshold {
-        sample_from_distribution(&visit_counts)
-    } else {
-        visit_counts.iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-            .map(|(i, _)| i)
-            .unwrap_or(legal_moves[0])
-    };
+    let selected = sample_with_temperature(&visit_counts, temperature);
 
     // Make the move
     game.board[selected] = Some(game.player);

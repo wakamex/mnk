@@ -178,14 +178,18 @@ def find_latest_summary(sweep_dir):
 
 
 def extract_params(experiment_name):
-    """Extract lr and mcts from experiment name like i20_g1000_lr0.005_mcts25_netcnn."""
+    """Extract parameters from experiment name like i20_g1000_lr0.005_mcts25_vw0.25_netcnn."""
     params = {}
     parts = experiment_name.split("_")
-    for i, part in enumerate(parts):
+    for part in parts:
         if part.startswith("lr"):
             params["lr"] = part[2:]
         elif part.startswith("mcts"):
             params["mcts"] = part[4:]
+        elif part.startswith("vw"):
+            params["vw"] = part[2:]
+        elif part.startswith("temp"):
+            params["temp"] = part[4:]
         elif part.startswith("net"):
             params["net"] = part[3:]
         elif part.startswith("i") and part[1:].isdigit():
@@ -380,61 +384,47 @@ def analyze_sweep(summary_csv_path, sweep_dir=None):
     print("PARAMETER SENSITIVITY")
     print("=" * 80)
 
-    # Group by LR
-    by_lr = {}
+    # Find which parameters actually vary across experiments
+    param_labels = {"lr": "Learning Rate", "mcts": "MCTS Sims", "vw": "Value Weight",
+                    "temp": "Temperature", "net": "Network"}
+    swept_params = {}
     for m in successful:
-        lr = m["params"].get("lr", "?")
-        by_lr.setdefault(lr, []).append(m)
+        for k, v in m["params"].items():
+            swept_params.setdefault(k, set()).add(v)
+    # Only show params with >1 unique value (actually swept)
+    swept_params = {k: v for k, v in swept_params.items() if len(v) > 1}
 
-    print("\nBy Learning Rate (averaged across MCTS values):")
-    headers = ["LR", "n", "vsR mean", "vsD mean", "vsM mean", "VL mean", "games/s"]
-    rows = []
-    for lr in sorted(by_lr.keys(), key=float):
-        ms = by_lr[lr]
-        n = len(ms)
-        vr = [m["vs_random_tournament"] for m in ms if m.get("vs_random_tournament") is not None]
-        vd = [m["vs_deep_tournament"] for m in ms if m.get("vs_deep_tournament") is not None]
-        vm = [m["vs_medium_tournament"] for m in ms if m.get("vs_medium_tournament") is not None]
-        vl = [m["value_loss_final"] for m in ms if m.get("value_loss_final") is not None]
-        gps = [m["games_per_sec_steady"] for m in ms if m.get("games_per_sec_steady") is not None]
-        rows.append([
-            lr, str(n),
-            pct(sum(vr) / len(vr)) if vr else "-",
-            pct(sum(vd) / len(vd)) if vd else "-",
-            pct(sum(vm) / len(vm)) if vm else "-",
-            fmt(sum(vl) / len(vl), 4) if vl else "-",
-            fmt(sum(gps) / len(gps), 1) if gps else "-",
-        ])
-    print(format_table(headers, rows))
+    for param_key in swept_params:
+        by_val = {}
+        for m in successful:
+            val = m["params"].get(param_key, "?")
+            by_val.setdefault(val, []).append(m)
 
-    # Group by MCTS
-    by_mcts = {}
-    for m in successful:
-        mcts = m["params"].get("mcts", "?")
-        by_mcts.setdefault(mcts, []).append(m)
-
-    print("By MCTS Simulations (averaged across LR values):")
-    headers = ["MCTS", "n", "vsR mean", "vsD mean", "vsM mean", "VL mean", "games/s", "wall(s)"]
-    rows = []
-    for mcts in sorted(by_mcts.keys(), key=lambda x: int(x)):
-        ms = by_mcts[mcts]
-        n = len(ms)
-        vr = [m["vs_random_tournament"] for m in ms if m.get("vs_random_tournament") is not None]
-        vd = [m["vs_deep_tournament"] for m in ms if m.get("vs_deep_tournament") is not None]
-        vm = [m["vs_medium_tournament"] for m in ms if m.get("vs_medium_tournament") is not None]
-        vl = [m["value_loss_final"] for m in ms if m.get("value_loss_final") is not None]
-        gps = [m["games_per_sec_steady"] for m in ms if m.get("games_per_sec_steady") is not None]
-        wc = [m["total_wall_clock_s"] for m in ms if m.get("total_wall_clock_s") is not None]
-        rows.append([
-            mcts, str(n),
-            pct(sum(vr) / len(vr)) if vr else "-",
-            pct(sum(vd) / len(vd)) if vd else "-",
-            pct(sum(vm) / len(vm)) if vm else "-",
-            fmt(sum(vl) / len(vl), 4) if vl else "-",
-            fmt(sum(gps) / len(gps), 1) if gps else "-",
-            fmt(sum(wc) / len(wc), 0) if wc else "-",
-        ])
-    print(format_table(headers, rows))
+        label = param_labels.get(param_key, param_key)
+        print(f"\nBy {label}:")
+        headers = [label, "n", "vsR mean", "vsD mean", "vsM mean", "VL mean", "games/s"]
+        rows = []
+        try:
+            sorted_keys = sorted(by_val.keys(), key=float)
+        except ValueError:
+            sorted_keys = sorted(by_val.keys())
+        for val in sorted_keys:
+            ms = by_val[val]
+            n = len(ms)
+            vr = [m["vs_random_tournament"] for m in ms if m.get("vs_random_tournament") is not None]
+            vd = [m["vs_deep_tournament"] for m in ms if m.get("vs_deep_tournament") is not None]
+            vm = [m["vs_medium_tournament"] for m in ms if m.get("vs_medium_tournament") is not None]
+            vl = [m["value_loss_final"] for m in ms if m.get("value_loss_final") is not None]
+            gps = [m["games_per_sec_steady"] for m in ms if m.get("games_per_sec_steady") is not None]
+            rows.append([
+                val, str(n),
+                pct(sum(vr) / len(vr)) if vr else "-",
+                pct(sum(vd) / len(vd)) if vd else "-",
+                pct(sum(vm) / len(vm)) if vm else "-",
+                fmt(sum(vl) / len(vl), 4) if vl else "-",
+                fmt(sum(gps) / len(gps), 1) if gps else "-",
+            ])
+        print(format_table(headers, rows))
 
     # === RANKINGS ===
     print("=" * 80)

@@ -154,7 +154,7 @@ struct Args {
     learning_rate: f64,
 
     /// Value loss weight (vs policy loss weight of 1.0)
-    #[arg(long, default_value = "1.0")]
+    #[arg(long, default_value = "4.0")]
     value_weight: f32,
 
     /// MCTS simulations per position during self-play
@@ -172,6 +172,10 @@ struct Args {
     /// Board width (transformer supports variable sizes, cnn only supports 3)
     #[arg(long, default_value = "3")]
     board_width: usize,
+
+    /// MCTS temperature for move selection (0=argmax, 1=proportional to visits, >1=more exploratory)
+    #[arg(long, default_value = "1.75")]
+    temperature: f32,
 
     /// Path for CSV training log (iteration metrics with wall-clock time)
     #[arg(long)]
@@ -264,7 +268,7 @@ fn main() {
         // Using Autodiff backend here builds graphs that are never backpropagated.
         let net_valid = net.valid();
         let game_training_examples = mnk::unified_mcts::generate_training_data_batched::<<MyBackend as AutodiffBackend>::InnerBackend, _>(
-            &net_valid, games_per_iter, args.mcts_simulations, 2, 64
+            &net_valid, games_per_iter, args.mcts_simulations, args.temperature, 64
         );
         let selfplay_time = selfplay_start.elapsed();
         let iter_games_per_sec = games_per_iter as f32 / selfplay_time.as_secs_f32();
