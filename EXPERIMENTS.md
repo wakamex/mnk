@@ -1,40 +1,77 @@
-# Training Efficiency Roadmap
+# Experiment Log
 
-Goal: maximize model quality per wall-clock second. Find optimal hyperparameters for both CNN and Transformer, determine which architecture learns faster, and identify the best training configuration for each.
+This file tracks what has actually been run and which defaults we picked from sweep data.
+Old roadmap/planning notes were removed to keep this document current.
 
-## Current Baseline (CNN, 30 iter x 1000 games, defaults)
+## Source of truth
 
-| Metric | Value |
-|--------|-------|
-| Wall clock | 268s |
-| Self-play throughput | 370-415 games/sec |
-| Final loss | 0.83 (value: 0.01, policy: 0.81) |
-| vs Random | 88.5% |
-| vs Medium (depth 2) | 37.0% |
-| vs Deep (depth 3) | 25.0% |
+- Sweep artifacts: `sweep_results/`
+- Latest completed CNN summary: `sweep_results/cnn_lr_mcts_20260206_125932.csv`
+- Curve analysis tool: `analyze_sweep.py`
 
-The model draws against perfect minimax but never wins. Policy head has plateaued.
+## Current defaults (as of 2026-02-06)
 
-## Known Issues to Fix First
+- `--learning-rate`: `0.02`
+- `--mcts-simulations`: `50`
 
-### ~~1. Sweep framework defaults are stale~~ FIXED
-Sweep framework no longer duplicates binary defaults. Non-swept params are omitted from the command line so the binary uses its own clap defaults. Sweep queries binary `--help` at startup for display.
+Rationale: this pair is a better balance than the old `0.01/50` on the current sweep, with stronger `vs_Deep` and `vs_Medium` while staying fast.
 
-### ~~2. Sweep framework lacks `--net-type` support~~ FIXED
-Added `--net-type cnn,transformer` to sweep framework via `PARAM_TABLE`.
+## Latest completed sweep (CNN lr x mcts)
 
-### ~~3. Transformer batch inference is not actually batched~~ FIXED
-Added `forward_batch_inference()` to `MiniBT4Net` — single forward pass for all positions in the batch, same pattern as CNN.
+Sweep grid:
 
-## Experiment Phases
+- Iterations: `20`
+- Games/iter: `1000`
+- Epochs: `8`
+- Batch size: `1024`
+- LR: `0.005, 0.01, 0.02, 0.05`
+- MCTS: `25, 50, 100, 200`
 
-### Phase 0: Framework Fixes
-All three issues fixed. Ready to run sweeps.
+Selected outcomes from `sweep_results/cnn_lr_mcts_20260206_125932.csv`:
 
-### Phase 1: CNN Hyperparameter Sensitivity (quick, 1-2 hours)
-Goal: find which hyperparameters matter most for CNN quality-per-second.
+| Config | Train Time | vs Random | vs Deep | vs Medium | Notes |
+|--------|------------|-----------|---------|-----------|-------|
+| `lr0.005_mcts100` | `1091.2s` | `91.5%` | `24.0%` | `24.5%` | Best `vs Random` |
+| `lr0.005_mcts25` | `919.3s` | `82.0%` | `38.5%` | `24.5%` | Best `vs Deep` |
+| `lr0.05_mcts50` | `945.0s` | `80.0%` | `25.0%` | `44.0%` | Best `vs Medium` and best weighted composite in `analyze_sweep.py` |
+| `lr0.02_mcts50` | `857.5s` | `86.0%` | `27.0%` | `26.5%` | Chosen default compromise |
 
-Sweep learning rate and MCTS sims (the two most impactful parameters), holding everything else at defaults:
+## Reliability notes
+
+- `mcts=200` had only 1 successful run; 3/4 runs failed.
+- Failed runs show `CUDA_ERROR_OUT_OF_MEMORY` in:
+  - `sweep_results/i20_g1000_lr0.005_mcts200_netcnn/training.log`
+  - `sweep_results/i20_g1000_lr0.01_mcts200_netcnn/training.log`
+  - `sweep_results/i20_g1000_lr0.02_mcts200_netcnn/training.log`
+- Partial `training_log.csv` data for failed runs is still useful for convergence trend analysis, but not for final tournament ranking.
+
+## VRAM status
+
+- Main training VRAM-growth issue was traced to inference through `Autodiff<Cuda>` during self-play/eval.
+- Fix now in trainer: self-play/eval/sample inference use `net.valid()` (non-autodiff inner backend).
+- With no competing GPU jobs, monitored runs showed stable VRAM after warm-up instead of linear growth.
+
+## Next queued sweeps
+
+- Transformer baseline sweep on same lr/mcts grid (3x3).
+- Value-weight sweep (`--value-weight`) to improve policy behavior vs medium-depth opponents.
+- Re-test `mcts=200` in isolated runs only if needed, after confirming stable memory behavior under current code.
+
+## Useful commands
+
+Analyze latest sweep:
+
+```bash
+python analyze_sweep.py sweep_results/
+```
+
+Analyze a specific summary:
+
+```bash
+python analyze_sweep.py sweep_results/cnn_lr_mcts_20260206_125932.csv
+```
+
+Run the CNN lr/mcts sweep:
 
 ```bash
 python parallel_sweep.py \
@@ -43,85 +80,5 @@ python parallel_sweep.py \
   -g 1000 \
   --learning-rate 0.005,0.01,0.02,0.05 \
   --mcts 25,50,100,200 \
-  --sweep-name cnn_lr_mcts \
-  --dry-run
+  --sweep-name cnn_lr_mcts
 ```
-16 experiments. Key questions:
-- Does more MCTS sims improve final quality enough to justify slower self-play?
-- Is LR=0.01 actually optimal for SGD, or can we push higher?
-
-Then sweep training intensity (epochs and games-per-iter):
-```bash
-python parallel_sweep.py \
-  --net-type cnn \
-  -i 20 \
-  -g 500,1000,2000 \
-  -e 4,8,16 \
-  --sweep-name cnn_training_intensity \
-  --dry-run
-```
-9 experiments. Key questions:
-- Is 8 epochs overfitting within each iteration?
-- Does 2000 games/iter help or just waste wall clock?
-
-### Phase 2: Transformer Baseline (after fixing batch inference)
-Goal: establish Transformer baseline on 3x3 with same hyperparameter grid.
-
-```bash
-python parallel_sweep.py \
-  --net-type transformer \
-  -i 20 \
-  -g 1000 \
-  --learning-rate 0.005,0.01,0.02,0.05 \
-  --mcts 25,50,100 \
-  --sweep-name transformer_lr_mcts \
-  --dry-run
-```
-12 experiments. The transformer has ~800K params vs CNN's ~42K -- it may need different LR or more data.
-
-### Phase 3: Head-to-Head CNN vs Transformer (long, overnight)
-Goal: compare architectures at their respective best hyperparameters (from phases 1-2).
-
-Run both architectures at longer training horizons:
-```bash
-# Use best LR/MCTS from phases 1-2
-python parallel_sweep.py \
-  --net-type cnn,transformer \
-  -i 30,50,100 \
-  -g 1000 \
-  --learning-rate <best_cnn_lr>,<best_transformer_lr> \
-  --mcts <best_mcts> \
-  --sweep-name architecture_comparison \
-  --dry-run
-```
-Key questions:
-- Does the transformer catch up or surpass CNN with more iterations?
-- Which architecture has better quality-per-second at convergence?
-- Does CNN plateau earlier due to smaller capacity?
-
-### Phase 4: Policy Head Investigation
-The biggest open problem is the passive policy (draws but never wins). Targeted experiments:
-
-- **Value weight sweep**: `--value-weight 0.25,0.5,1.0,2.0,4.0` -- maybe we're over-weighting value loss, starving the policy gradient
-- **MCTS sims scaling**: Try 200-800 sims -- more search may produce sharper policy targets
-- **Temperature threshold**: Currently 2 (first 2 moves sampled, rest argmax). Try 0,4,6 to see if more exploration during self-play produces better policy training data
-
-## Metrics to Track
-
-For each experiment, the sweep framework already captures:
-- Training time (wall clock)
-- Games/sec (self-play throughput)
-- vs Random / vs Medium / vs Deep (tournament scores)
-
-Derived metrics to compute from sweep CSVs:
-- **Quality/second**: tournament score / wall_clock_time
-- **Convergence speed**: iterations to reach 80% vs Random
-- **Policy quality**: vs_Medium score (sensitive to policy -- must exploit mistakes to beat depth-2)
-
-## Architecture Notes
-
-**CNN** (~42K params): 3 conv layers (32/64/128 channels), 1x1 conv heads. Only supports 3x3. Fast inference, fast training. Good baseline.
-
-**Transformer** (~800K params): 4 layers, 8 heads, d_model=128, 2D positional encoding. Supports 3x3 to 15x15. ~20x more parameters than CNN. Potentially better for larger boards but may be overkill for 3x3.
-
-**Transformer batching**: `forward_batch_inference()` now uses a single forward pass for the full batch, same as CNN.

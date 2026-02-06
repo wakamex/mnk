@@ -33,30 +33,21 @@ Key flags:
 - `--games-per-iter N` — games per self-play phase (default: 1000)
 - `--mcts-simulations N` — MCTS sims per move (default: 50)
 - `--epochs N` — training epochs per iteration (default: 8)
-- `--learning-rate F` — SGD learning rate (default: 0.01)
+- `--learning-rate F` — SGD learning rate (default: 0.02)
 - `--net-type cnn|transformer` — network architecture (default: cnn)
 
-## Performance
+## Sweep Status
 
-With batched MCTS (interleaved multi-game self-play with batch NN inference):
+Latest sweep progress and decisions are tracked in `EXPERIMENTS.md`.
 
-| Metric | Value |
-|--------|-------|
-| Self-play throughput | 370-415 games/sec |
-| Training loss (30 iter) | 2.75 → 0.83 |
-| Value loss | 0.55 → 0.01 |
-| Policy loss | 2.20 → 0.81 |
-| Total training time | 268s (30 iter × 1000 games) |
+Current CNN sweep snapshot (`sweep_results/cnn_lr_mcts_20260206_125932.csv`):
 
-## Tournament Results (30 iter, defaults)
-
-| Matchup | W-L-D | Score |
-|---------|-------|-------|
-| AZ-25 vs Random | 85-8-7 | 88.5% |
-| AZ-25 vs Medium (depth 2) | 0-26-74 | 37.0% |
-| AZ-25 vs Deep (depth 3) | 0-50-50 | 25.0% |
-
-Model has learned solid defensive play (draws against perfect minimax) but doesn't exploit opponent mistakes — policy is too passive. Value head converged well (loss 0.01); policy head plateaued (loss 0.81).
+| Config | Train Time | vs Random | vs Deep | vs Medium |
+|--------|------------|-----------|---------|-----------|
+| `lr0.005_mcts100` | `1091.2s` | `91.5%` | `24.0%` | `24.5%` |
+| `lr0.005_mcts25` | `919.3s` | `82.0%` | `38.5%` | `24.5%` |
+| `lr0.05_mcts50` | `945.0s` | `80.0%` | `25.0%` | `44.0%` |
+| `lr0.02_mcts50` | `857.5s` | `86.0%` | `27.0%` | `26.5%` |
 
 ## Training Details
 

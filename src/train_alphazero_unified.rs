@@ -1,14 +1,31 @@
 use burn::prelude::*;
 use burn::backend::Autodiff;
+use burn::module::AutodiffModule;
 use burn::optim::{SgdConfig, Optimizer, GradientsParams};
 use burn::optim::momentum::MomentumConfig;
 use burn::optim::decay::WeightDecayConfig;
 use burn::grad_clipping::{GradientClippingConfig};
+use burn::tensor::backend::AutodiffBackend;
 use burn::tensor::activation;
 use mnk::alphazero::evaluate_vs_random;
 use mnk::unified_mcts::TrainingExample;
 use mnk::network::{Network, NetworkType};
 use clap::Parser;
+
+/// Query GPU VRAM usage via nvidia-smi. Returns (used_mb, total_mb) or None.
+fn gpu_vram_mb() -> Option<(u64, u64)> {
+    let output = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=memory.used,memory.total", "--format=csv,noheader,nounits"])
+        .output()
+        .ok()?;
+    let s = String::from_utf8_lossy(&output.stdout);
+    let parts: Vec<&str> = s.trim().split(',').map(|s| s.trim()).collect();
+    if parts.len() == 2 {
+        Some((parts[0].parse().ok()?, parts[1].parse().ok()?))
+    } else {
+        None
+    }
+}
 
 // GPU backend configuration (native burn-cuda via CubeCL)
 #[cfg(feature = "cuda")]
@@ -132,8 +149,8 @@ struct Args {
     #[arg(short, long, default_value = "1024")]
     batch_size: usize,
 
-    /// Learning rate for optimizer (SGD default: 0.01)
-    #[arg(long, default_value = "0.01")]
+    /// Learning rate for optimizer (SGD default: 0.02)
+    #[arg(long, default_value = "0.02")]
     learning_rate: f64,
 
     /// Value loss weight (vs policy loss weight of 1.0)
@@ -230,7 +247,7 @@ fn main() {
         let file = std::fs::File::create(path).expect("Failed to create CSV log file");
         let mut w = std::io::BufWriter::new(file);
         use std::io::Write;
-        writeln!(w, "iteration,wall_clock_s,selfplay_s,training_s,games_per_sec,value_loss,policy_loss,vs_random").unwrap();
+        writeln!(w, "iteration,wall_clock_s,selfplay_s,training_s,games_per_sec,value_loss,policy_loss,vs_random,vram_used_mb").unwrap();
         w
     });
 
@@ -243,8 +260,11 @@ fn main() {
         let selfplay_start = std::time::Instant::now();
         let mut all_examples = Vec::new();
 
-        let game_training_examples = mnk::unified_mcts::generate_training_data_batched::<MyBackend, _>(
-            &net, games_per_iter, args.mcts_simulations, 2, 64
+        // IMPORTANT: Run inference-heavy self-play on the non-autodiff model.
+        // Using Autodiff backend here builds graphs that are never backpropagated.
+        let net_valid = net.valid();
+        let game_training_examples = mnk::unified_mcts::generate_training_data_batched::<<MyBackend as AutodiffBackend>::InnerBackend, _>(
+            &net_valid, games_per_iter, args.mcts_simulations, 2, 64
         );
         let selfplay_time = selfplay_start.elapsed();
         let iter_games_per_sec = games_per_iter as f32 / selfplay_time.as_secs_f32();
@@ -285,7 +305,10 @@ fn main() {
             let mut num_batches = 0;
 
             for batch_start in (0..all_examples.len()).step_by(batch_size) {
-                let batch_end = (batch_start + batch_size).min(all_examples.len());
+                let batch_end = batch_start + batch_size;
+                if batch_end > all_examples.len() {
+                    break; // Skip incomplete last batch to keep tensor sizes constant (avoids CubeCL VRAM leak)
+                }
                 let batch = &all_examples[batch_start..batch_end];
 
                 // Prepare batch data
@@ -380,20 +403,28 @@ fn main() {
                  iter_time.as_secs_f32());
 
         // Evaluate every iteration (~0.5s overhead, gives continuous quality signal)
-        let win_rate = evaluate_vs_random::<MyBackend, _>(&net);
+        let net_valid = net.valid();
+        let win_rate = evaluate_vs_random::<<MyBackend as AutodiffBackend>::InnerBackend, _>(&net_valid);
         println!("  vs Random: {:.1}%", win_rate * 100.0);
         let vs_random = Some(win_rate);
+
+        // Report VRAM
+        let vram_used = gpu_vram_mb().map(|(used, _)| used);
+        if let Some(used) = vram_used {
+            println!("  VRAM: {}MB", used);
+        }
 
         // Write CSV row
         if let Some(ref mut w) = csv_writer {
             use std::io::Write;
             let wall_clock = start_time.elapsed().as_secs_f32();
             let vs_random_str = vs_random.map_or(String::new(), |v| format!("{:.4}", v));
-            writeln!(w, "{},{:.2},{:.3},{:.3},{:.1},{:.4},{:.4},{}",
+            let vram_str = vram_used.map_or(String::new(), |v| format!("{}", v));
+            writeln!(w, "{},{:.2},{:.3},{:.3},{:.1},{:.4},{:.4},{},{}",
                      iteration, wall_clock,
                      selfplay_time.as_secs_f32(), training_time.as_secs_f32(),
                      iter_games_per_sec, final_value_loss, final_policy_loss,
-                     vs_random_str).unwrap();
+                     vs_random_str, vram_str).unwrap();
             w.flush().unwrap();
         }
     }
@@ -404,13 +435,14 @@ fn main() {
     // Test the trained model immediately with some positions
     println!("Testing trained model with sample positions...");
     let test_board = vec![None; 9]; // Empty board
-    let (value, policy) = net.forward_inference(&test_board, 0);
+    let net_valid = net.valid();
+    let (value, policy) = net_valid.forward_inference(&test_board, 0);
     println!("  Empty board evaluation: value={:.3}, policy_max={:.3}", value, policy.iter().fold(0.0f32, |a, &b| a.max(b)));
 
     // Test with one move made
     let mut test_board2 = vec![None; 9];
     test_board2[4] = Some(0); // Center move
-    let (value2, policy2) = net.forward_inference(&test_board2, 1);
+    let (value2, policy2) = net_valid.forward_inference(&test_board2, 1);
     println!("  After center move: value={:.3}, policy_max={:.3}", value2, policy2.iter().fold(0.0f32, |a, &b| a.max(b)));
 
     // Save the trained model using Burn's record system (INFERENCE COMPATIBLE!)
