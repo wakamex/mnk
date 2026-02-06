@@ -4,9 +4,7 @@ use std::time::Instant;
 use clap::Parser;
 
 // Import the actual AlphaZero implementation from the shared library
-use mnk::alphazero::AlphaZeroNet;
 use mnk::network::{Network, NetworkType};
-use mnk::unified_mcts::fallback_mcts;
 use mnk::inference_backend::{InferenceBackend, InferenceDevice};
 use burn::prelude::*;
 
@@ -20,13 +18,27 @@ pub enum TrainingLevel {
 #[command(name = "mnk_game")]
 #[command(about = "M,N,K Game with AlphaZero AI")]
 struct Args {
-    /// Path to the AlphaZero model file
+    /// Path to the first AlphaZero model file
     #[arg(long, default_value = "alphazero_model.bin")]
     model_path: String,
+
+    /// Path to the second model file (for head-to-head tournament)
+    #[arg(long)]
+    model_path2: Option<String>,
 
     /// Number of games per tournament matchup
     #[arg(long, default_value = "10")]
     tournament_games: usize,
+}
+
+/// Infer network type from model filename
+fn infer_network_type(path: &str) -> NetworkType {
+    let lower = path.to_lowercase();
+    if lower.contains("transformer") || lower.contains("bt4") {
+        NetworkType::Transformer
+    } else {
+        NetworkType::Cnn
+    }
 }
 
 // Backend types now handled by inference_backend module
@@ -736,41 +748,37 @@ impl AlphaZeroStrategy {
         // Load trained network or create new one based on training level
         let net = match training {
             TrainingLevel::Trained => {
-                // FIXED: Load using the same backend as training (Autodiff) to prevent segfault
                 use burn::record::{BinFileRecorder, FullPrecisionSettings, Recorder};
 
-                // Initialize device (same as training)
                 #[cfg(feature = "cuda")]
-                let device = InferenceDevice::cuda(0);
+                let device = InferenceDevice::new(0);
 
                 #[cfg(not(feature = "cuda"))]
-                let device = InferenceDevice::default();
+                let device = burn_ndarray::NdArrayDevice::default();
 
                 let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
+                let net_type = infer_network_type(model_path);
                 match recorder.load(model_path.into(), &device) {
                     Ok(record) => {
-                        // Load as Network enum (matches training save format)
-                        let trained_net = Network::<InferenceBackend>::new(NetworkType::Cnn, &device, 3).load_record(record);
-                        println!("✅ Loaded trained model from '{}' (using Network enum)", model_path);
+                        let trained_net = Network::<InferenceBackend>::new(net_type, &device, 3).load_record(record);
+                        println!("Loaded trained {:?} model from '{}'", net_type, model_path);
                         trained_net
                     }
                     Err(e) => {
-                        println!("⚠️  Failed to load trained model: {:?}", e);
+                        println!("Failed to load trained model: {:?}", e);
                         println!("   Using untrained network instead");
-                        println!("   Make sure to run training first: ./target/release/train_alphazero");
-                        Network::<InferenceBackend>::new(NetworkType::Cnn, &device, 3)
+                        Network::<InferenceBackend>::new(net_type, &device, 3)
                     }
                 }
             }
             TrainingLevel::Untrained => {
-                println!("🔄 Creating new untrained network");
+                println!("Creating new untrained network");
 
-                // Initialize device (same as training)
                 #[cfg(feature = "cuda")]
-                let device = InferenceDevice::cuda(0);
+                let device = InferenceDevice::new(0);
 
                 #[cfg(not(feature = "cuda"))]
-                let device = InferenceDevice::default();
+                let device = burn_ndarray::NdArrayDevice::default();
 
                 Network::<InferenceBackend>::new(NetworkType::Cnn, &device, 3)
             }
@@ -815,10 +823,11 @@ impl Strategy for AlphaZeroStrategy {
         let alphazero_board = self.game_state_to_alphazero_board(state, config);
         let current_player = self.current_player_to_u8(state.current_player);
 
-        // CRITICAL FIX: Remove .valid() call to prevent module churn
-        // Use the network directly - no need to create new module instances each time!
-        // Use batched MCTS from alphazero module (same as training)
-        let policy = mnk::unified_mcts::fallback_mcts(&self.net, &alphazero_board, current_player, self.simulations);
+        // Get raw neural net evaluation (before MCTS)
+        let (raw_value, raw_policy) = self.net.forward_inference(&alphazero_board, current_player);
+
+        // Run MCTS
+        let policy = mnk::unified_mcts::mcts_search(&self.net, &alphazero_board, current_player, self.simulations);
 
         // Convert policy to move by finding the best legal move
         let valid_moves = generate_valid_moves(state, config);
@@ -832,6 +841,25 @@ impl Strategy for AlphaZeroStrategy {
                 best_policy_value = policy[move_idx];
                 best_move = move_idx;
             }
+        }
+
+        // Debug: show NN eval and MCTS policy
+        if std::env::var("AZ_DEBUG").is_ok() {
+            println!("  NN value={:.3} player={}", raw_value, current_player);
+            print!("  NN policy: ");
+            for i in 0..9 {
+                if alphazero_board[i].is_none() {
+                    print!("[{}]={:.3} ", i, raw_policy[i]);
+                }
+            }
+            println!();
+            print!("  MCTS policy:");
+            for i in 0..9 {
+                if alphazero_board[i].is_none() {
+                    print!("[{}]={:.3} ", i, policy[i]);
+                }
+            }
+            println!("→ move {}", best_move);
         }
 
         Ok(best_move)
@@ -1013,15 +1041,15 @@ pub fn play_interleaved_tournament(
     use mnk::inference_backend::{InferenceBackend, InferenceDevice};
     use burn::record::{BinFileRecorder, FullPrecisionSettings, Recorder};
 
-    // Load AlphaZero model using the same approach as AlphaZeroStrategy
     #[cfg(feature = "cuda")]
-    let device = InferenceDevice::cuda(0);
+    let device = InferenceDevice::new(0);
     #[cfg(not(feature = "cuda"))]
-    let device = InferenceDevice::default();
+    let device = burn_ndarray::NdArrayDevice::default();
 
     let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
+    let net_type = infer_network_type(model_path);
     let net = match recorder.load(model_path.into(), &device) {
-        Ok(record) => Network::<InferenceBackend>::new(NetworkType::Cnn, &device, 3).load_record(record),
+        Ok(record) => Network::<InferenceBackend>::new(net_type, &device, 3).load_record(record),
         Err(e) => return Err(format!("Failed to load model from {}: {:?}", model_path, e)),
     };
 
@@ -1074,7 +1102,7 @@ pub fn play_interleaved_tournament(
             // Use unified MCTS with batching for all positions
             let policies: Vec<Vec<f32>> = boards.iter().zip(players.iter())
                 .map(|(board, &player)| {
-                    mnk::unified_mcts::fallback_mcts(&net, board, player, mcts_simulations)
+                    mnk::unified_mcts::mcts_search(&net, board, player, mcts_simulations)
                 })
                 .collect();
 
@@ -1082,9 +1110,10 @@ pub fn play_interleaved_tournament(
             for (idx, game_id) in alphazero_game_ids.iter().enumerate() {
                 let policy = &policies[idx];
 
-                // Select best move from policy
+                // Select best legal move from policy (only empty cells)
                 let selected_move = policy.iter()
                     .enumerate()
+                    .filter(|(i, _)| game_states[*game_id][*i].is_none())
                     .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
                     .map(|(i, _)| i)
                     .unwrap_or(0);
@@ -1284,33 +1313,33 @@ fn demo_tournament(model_path: &str, tournament_games: usize) -> Result<(), Stri
     println!("\n🧠 AlphaZero Neural Network vs Classical AI:");
     println!("{}", "-".repeat(50));
 
-    // AlphaZero vs Deep Minimax (using interleaved tournament for batching)
-    let result = play_interleaved_tournament(
+    // AlphaZero vs Deep Minimax - show first 2 games verbose
+    let result = play_tournament(
         &config,
-        model_path,
+        AlphaZeroStrategy::new_with_model_path(25, model_path),
         MinimaxStrategy::new(3),
         tournament_games,
-        25,  // MCTS simulations
+        true,
     )?;
     println!("{:8} vs {:8}: {}", "AZ-25", "Deep", result);
 
-    // AlphaZero vs Medium Minimax (using interleaved tournament for batching)
-    let result = play_interleaved_tournament(
+    // AlphaZero vs Medium Minimax
+    let result = play_tournament(
         &config,
-        model_path,
+        AlphaZeroStrategy::new_with_model_path(25, model_path),
         MinimaxStrategy::new(2),
         tournament_games,
-        25,  // MCTS simulations
+        false,
     )?;
     println!("{:8} vs {:8}: {}", "AZ-25", "Medium", result);
 
-    // AlphaZero vs Random (using interleaved tournament for batching)
-    let result = play_interleaved_tournament(
+    // AlphaZero vs Random
+    let result = play_tournament(
         &config,
-        model_path,
+        AlphaZeroStrategy::new_with_model_path(25, model_path),
         RandomStrategy::new(),
         tournament_games,
-        25,  // MCTS simulations
+        false,
     )?;
     println!("{:8} vs {:8}: {}", "AZ-25", "Random", result);
 
@@ -1376,6 +1405,37 @@ fn demo_performance() -> Result<(), String> {
     Ok(())
 }
 
+fn demo_head_to_head(model1: &str, model2: &str, tournament_games: usize) -> Result<(), String> {
+    let config = GameConfig::new(3, 3, 3);
+
+    println!("\n=== Head-to-Head Tournament ===");
+    println!("{} vs {}", model1, model2);
+    println!("{}", "-".repeat(50));
+
+    let sims = 25;
+    use std::io::Write;
+    print!("Loading model 1: {} ... ", model1);
+    std::io::stdout().flush().ok();
+    let s1 = AlphaZeroStrategy::new_with_model_path(sims, model1);
+    println!("done");
+    print!("Loading model 2: {} ... ", model2);
+    std::io::stdout().flush().ok();
+    let s2 = AlphaZeroStrategy::new_with_model_path(sims, model2);
+    println!("done");
+
+    let result = play_tournament(&config, s1, s2, tournament_games, false)?;
+
+    let name1 = std::path::Path::new(model1).file_stem().unwrap_or_default().to_string_lossy();
+    let name2 = std::path::Path::new(model2).file_stem().unwrap_or_default().to_string_lossy();
+    println!("{:16} vs {:16}: {}", name1, name2, result);
+    println!("  {} wins: {}, {} wins: {}, draws: {}",
+        name1, result.player0_wins,
+        name2, result.player1_wins,
+        result.draws);
+
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
@@ -1385,18 +1445,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Functional M,N,K Game Implementation in Rust");
     println!("{}", "=".repeat(45));
 
-    // Run demonstrations
-    demo_board_analysis()?;
-    demo_single_game()?;
+    if let Some(ref model2) = args.model_path2 {
+        // Head-to-head mode: just run the two models against each other
+        demo_head_to_head(&args.model_path, model2, args.tournament_games)?;
+    } else {
+        // Full demo mode
+        demo_board_analysis()?;
+        demo_single_game()?;
 
-    print_gpu_memory("Before AlphaZero tournaments");
-    demo_tournament(&args.model_path, args.tournament_games)?;
-    print_gpu_memory("After AlphaZero tournaments");
+        print_gpu_memory("Before AlphaZero tournaments");
+        demo_tournament(&args.model_path, args.tournament_games)?;
+        print_gpu_memory("After AlphaZero tournaments");
 
-    demo_performance()?;
+        demo_performance()?;
+    }
 
     print_gpu_memory("Tournament end");
-    println!("\nDemo completed successfully!");
+    println!("\nDone!");
     Ok(())
 }
 

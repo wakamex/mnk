@@ -1,23 +1,22 @@
 use burn::prelude::*;
 use burn::backend::Autodiff;
 use burn::optim::{AdamConfig, Optimizer, GradientsParams};
-use burn::grad_clipping::{GradientClipping, GradientClippingConfig};
+use burn::grad_clipping::{GradientClippingConfig};
 use burn::tensor::activation;
-use mnk::alphazero::{AlphaZeroNet, check_winner, board_to_tensor, batch_evaluate_positions, evaluate_vs_random};
-use mnk::unified_mcts::{InterleavedGamesManager, TrainingExample};
+use mnk::alphazero::evaluate_vs_random;
+use mnk::unified_mcts::TrainingExample;
 use mnk::network::{Network, NetworkType};
-use mnk::mcts_bridge; // Enable AlphaZeroNet to work with unified_mcts
 use clap::Parser;
 
-// GPU backend configuration
+// GPU backend configuration (native burn-cuda via CubeCL)
 #[cfg(feature = "cuda")]
-use burn_candle::{Candle, CandleDevice};
+use burn_cuda::{Cuda, CudaDevice};
 
 #[cfg(feature = "cuda")]
-type MyBackend = Autodiff<Candle>;
+type MyBackend = Autodiff<Cuda>;
 
 #[cfg(feature = "cuda")]
-type MyDevice = CandleDevice;
+type InferenceBackend = Cuda;
 
 // CPU backend fallback
 #[cfg(not(feature = "cuda"))]
@@ -27,7 +26,8 @@ use burn_ndarray::{NdArray, NdArrayDevice};
 type MyBackend = Autodiff<NdArray>;
 
 #[cfg(not(feature = "cuda"))]
-type MyDevice = NdArrayDevice;
+type InferenceBackend = NdArray;
+
 
 // Symmetry augmentation for 8x data efficiency
 fn apply_symmetry_augmentation(examples: &[TrainingExample]) -> Vec<TrainingExample> {
@@ -169,26 +169,25 @@ fn main() {
     // Display backend information
     #[cfg(feature = "cuda")]
     {
-        println!("🚀 GPU ACCELERATION ENABLED (Candle/CUDA)");
+        println!("GPU ACCELERATION ENABLED (burn-cuda/CubeCL)");
         println!();
         println!("GPU Device Info:");
-        println!("  Device ID: 0");
-        println!("  Backend: Candle/CUDA");
+        println!("  Backend: burn-cuda (native CubeCL)");
     }
 
     #[cfg(not(feature = "cuda"))]
     {
-        println!("💻 Running on CPU (use --features cuda for GPU)");
+        println!("Running on CPU (use --features cuda for GPU)");
     }
 
     println!();
 
     // Initialize device
     #[cfg(feature = "cuda")]
-    let device = CandleDevice::cuda(0);
+    let device = CudaDevice::new(0);
 
     #[cfg(not(feature = "cuda"))]
-    let device = MyDevice::default();
+    let device = NdArrayDevice::default();
 
     // Parse network type from CLI
     let net_type: NetworkType = args.net_type.parse().expect("Invalid network type. Use 'cnn' or 'transformer'");
@@ -220,6 +219,7 @@ fn main() {
     println!("  MCTS simulations: {}", args.mcts_simulations);
     println!();
 
+    // Test GPU: basic tensor and network forward pass
     let start_time = std::time::Instant::now();
 
     for iteration in 1..=iterations {
@@ -229,48 +229,23 @@ fn main() {
         let selfplay_start = std::time::Instant::now();
         let mut all_examples = Vec::new();
 
-        // Experiment: Use batch evaluation for game initialization
-        let use_batch_optimization = true; // Always use batch optimization (InterleavedGamesManager)
-        let use_production_batched_mcts = iteration > 5; // Enable production batching after iteration 5
-
-        if use_batch_optimization {
-            // SYSTEMATIC BATCH SIZE TESTING
-            let test_batch_sizes = if cfg!(feature = "cuda") {
-                vec![32, 64, 128, 256, 512, 1024] // Test full range on GPU
-            } else {
-                vec![16, 32, 64, 128] // Conservative on CPU
-            };
-
-            let virtual_loss_value = 0.1;
-            // Use optimal batch size directly (512 for GPU, 128 for CPU)
-            let mcts_batch_size = if cfg!(feature = "cuda") { 512 } else { 128 };
-
-            let net_arc = std::sync::Arc::new(net.clone());
-            let mut interleaved_manager = InterleavedGamesManager::new(
-                net_arc.clone(),
-                mcts_batch_size,
-                virtual_loss_value
-            );
-
+        {
             let batch_start = std::time::Instant::now();
-            match interleaved_manager.run_simulations_with_batch_size::<MyBackend>(games_per_iter, mcts_batch_size) {
-                Ok(game_training_examples) => {
-                    let batch_time = batch_start.elapsed();
-                    let games_per_sec = games_per_iter as f32 / batch_time.as_secs_f32();
+            let game_training_examples = mnk::unified_mcts::generate_training_data::<MyBackend, _>(
+                &net, games_per_iter, args.mcts_simulations, 2
+            );
+            let batch_time = batch_start.elapsed();
+            let games_per_sec = games_per_iter as f32 / batch_time.as_secs_f32();
 
-                    for game_examples in game_training_examples {
-                        all_examples.extend(game_examples);
-                    }
-
-                    println!("  Self-play: {:.3}s for {} games ({:.1} games/sec)",
-                             batch_time.as_secs_f32(),
-                             games_per_iter,
-                             games_per_sec);
-                }
-                Err(e) => {
-                    println!("  Self-play failed: {}", e);
-                }
+            for game_examples in game_training_examples {
+                all_examples.extend(game_examples);
             }
+
+            println!("  Self-play: {:.3}s for {} games ({:.1} games/sec, {} MCTS sims)",
+                     batch_time.as_secs_f32(),
+                     games_per_iter,
+                     games_per_sec,
+                     args.mcts_simulations);
         }
         let selfplay_time = selfplay_start.elapsed();
 
@@ -416,7 +391,7 @@ fn main() {
 
         // Evaluation every 5 iterations
         if iteration % 5 == 0 {
-            let win_rate = evaluate_vs_random(&net);
+            let win_rate = evaluate_vs_random::<MyBackend, _>(&net);
             println!("  Evaluating vs random player... Win rate: {:.1}%", win_rate * 100.0);
         }
     }

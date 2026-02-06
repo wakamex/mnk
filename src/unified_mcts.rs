@@ -1,5 +1,4 @@
 use burn::prelude::Backend;
-use std::collections::{HashMap, VecDeque};
 
 // Training example for AlphaZero
 #[derive(Clone, Debug)]
@@ -10,147 +9,6 @@ pub struct TrainingExample {
     pub value: f32,
 }
 
-// Game state for MCTS simulations
-pub struct GameState {
-    pub board: Vec<Option<u8>>,
-    pub player: u8,
-    pub move_history: Vec<usize>,
-    pub active_simulations: HashMap<usize, SimulationPath>,
-    pub visit_counts: Vec<f32>,
-    pub is_finished: bool,
-    pub training_examples: Vec<TrainingExample>,
-}
-
-// Game state for optimized multi-game batch processing
-#[derive(Clone)]
-pub struct GameInProgress {
-    pub board: Vec<Option<u8>>,
-    pub player: u8,
-    pub examples: Vec<TrainingExample>,
-    pub is_complete: bool,
-    pub needs_evaluation: bool,
-}
-
-impl GameInProgress {
-    pub fn new() -> Self {
-        Self {
-            board: vec![None; 9],
-            player: 0,
-            examples: Vec::new(),
-            is_complete: false,
-            needs_evaluation: true,
-        }
-    }
-
-    pub fn is_finished(&self) -> bool {
-        self.is_complete
-    }
-
-    pub fn get_next_position_for_evaluation(&mut self) -> Option<(Vec<Option<u8>>, u8)> {
-        if self.needs_evaluation && !self.is_complete {
-            self.needs_evaluation = false;
-            Some((self.board.clone(), self.player))
-        } else {
-            None
-        }
-    }
-
-    pub fn apply_policy_and_advance(&mut self, policy: Vec<f32>) -> Result<(), Box<dyn std::error::Error>> {
-        // Check if game is already finished
-        if let Some(winner) = check_winner_internal(&self.board) {
-            for ex in &mut self.examples {
-                ex.value = if ex.player == winner { 1.0 } else { -1.0 };
-            }
-            self.is_complete = true;
-            return Ok(());
-        }
-
-        let valid: Vec<usize> = self.board.iter()
-            .enumerate()
-            .filter_map(|(i, &c)| if c.is_none() { Some(i) } else { None })
-            .collect();
-
-        if valid.is_empty() {
-            for ex in &mut self.examples {
-                ex.value = 0.0; // Draw
-            }
-            self.is_complete = true;
-            return Ok(());
-        }
-
-        // Add training example
-        self.examples.push(TrainingExample {
-            board: self.board.clone(),
-            player: self.player,
-            policy: policy.clone(),
-            value: 0.0,
-        });
-
-        // Select move
-        let selected = if self.examples.len() <= 2 {
-            // Sample from distribution for exploration
-            let r = rand::random::<f32>();
-            let mut cumsum = 0.0;
-            let mut selected = valid[0];
-            for i in 0..9 {
-                cumsum += policy[i];
-                if cumsum > r && self.board[i].is_none() {
-                    selected = i;
-                    break;
-                }
-            }
-            selected
-        } else {
-            // Greedy selection
-            policy.iter()
-                .enumerate()
-                .filter(|(i, _)| self.board[*i].is_none())
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-                .map(|(i, _)| i)
-                .unwrap_or(valid[0])
-        };
-
-        self.board[selected] = Some(self.player);
-        self.player = 1 - self.player;
-        self.needs_evaluation = true;
-
-        Ok(())
-    }
-
-    pub fn into_training_examples(self) -> Vec<TrainingExample> {
-        self.examples
-    }
-}
-
-// Types for InterleavedGamesManager (batched MCTS implementation)
-#[derive(Clone)]
-pub struct SimulationPath {
-    pub current_board: Vec<Option<u8>>,
-    pub current_player: u8,
-    pub awaiting_evaluation: bool,
-    pub virtual_losses: Vec<f32>,
-    pub path_value: f32,
-    pub depth: usize,
-}
-
-pub struct GamePosition {
-    pub board: Vec<Option<u8>>,
-    pub player: u8,
-    pub game_id: usize,
-    pub move_number: usize,
-    pub path_id: usize,
-    pub virtual_loss: f32,
-    pub depth: usize,
-}
-
-pub struct PositionToEvaluate {
-    pub board: Vec<Option<u8>>,
-    pub player: u8,
-    pub simulation_id: usize,
-    pub depth: usize,
-    pub is_first_move: bool,
-}
-
 /// Trait for neural network inference to avoid circular dependencies
 pub trait NetworkInference<B: Backend<FloatElem = f32>> {
     fn forward_batch_inference(&self, boards: &[&[Option<u8>]], players: &[u8]) -> (Vec<f32>, Vec<Vec<f32>>);
@@ -159,7 +17,6 @@ pub trait NetworkInference<B: Backend<FloatElem = f32>> {
 
 /// Check for winner in tic-tac-toe game - copied here to avoid circular dependencies
 fn check_winner_internal(board: &[Option<u8>]) -> Option<u8> {
-    // Check rows, columns, and diagonals
     let lines = [
         [0, 1, 2], [3, 4, 5], [6, 7, 8], // rows
         [0, 3, 6], [1, 4, 7], [2, 5, 8], // columns
@@ -176,341 +33,469 @@ fn check_winner_internal(board: &[Option<u8>]) -> Option<u8> {
     None
 }
 
-/// Unified batched MCTS implementation used by both training and tournament modes.
-/// This implementation processes multiple simulations in parallel using GPU batch inference
-/// for optimal performance, avoiding the Module Churn issue that caused segmentation faults.
-pub fn unified_batched_mcts<B: Backend<FloatElem = f32>, N>(
-    net: &N,
-    board: &[Option<u8>],
-    player: u8,
-    simulations: usize,
-) -> Vec<f32>
-where
-    N: NetworkInference<B>,
-{
-    let batch_size = 64; // GPU-optimized batch size
-    let mut visit_counts = vec![0.0; 9];
+// ============================================================
+// Proper AlphaZero MCTS with tree search
+// ============================================================
 
-    // For batching efficiency: collect all positions that need evaluation
-    let mut positions_to_evaluate = Vec::new();
-    let mut simulation_contexts = Vec::new(); // Track which simulation each position belongs to
+const C_PUCT: f32 = 1.5;
+const DIRICHLET_ALPHA: f64 = 0.3;
+const DIRICHLET_EPSILON: f32 = 0.25;
 
-    // Start all simulations
-    for sim_id in 0..simulations {
-        positions_to_evaluate.push(board.to_vec());
-        simulation_contexts.push((sim_id, player, None::<usize>)); // (sim_id, current_player, first_move)
-    }
-
-    // Process simulations in batches using the same approach as InterleavedGamesManager
-    while !positions_to_evaluate.is_empty() {
-        // Collect batch for neural network evaluation
-        let batch_size_actual = batch_size.min(positions_to_evaluate.len());
-        let batch_boards: Vec<&[Option<u8>]> = positions_to_evaluate[0..batch_size_actual]
-            .iter()
-            .map(|b| b.as_slice())
-            .collect();
-        let batch_players: Vec<u8> = simulation_contexts[0..batch_size_actual]
-            .iter()
-            .map(|(_, player, _)| *player)
-            .collect();
-
-        // Batch neural network inference - KEY PERFORMANCE IMPROVEMENT!
-        let (_values, policies) = net.forward_batch_inference(&batch_boards, &batch_players);
-
-        // Apply results and advance simulations
-        let mut new_positions = Vec::new();
-        let mut new_contexts = Vec::new();
-
-        for i in 0..batch_size_actual {
-            let (sim_id, sim_player, first_move) = simulation_contexts[i];
-            let sim_board = &positions_to_evaluate[i];
-
-            let valid: Vec<usize> = sim_board.iter()
-                .enumerate()
-                .filter_map(|(j, &c)| if c.is_none() { Some(j) } else { None })
-                .collect();
-
-            if valid.is_empty() || check_winner_internal(&sim_board).is_some() {
-                // Simulation ended - record first move for visit counts
-                if let Some(mv) = first_move {
-                    visit_counts[mv] += 1.0;
-                }
-                continue;
-            }
-
-            // Select move based on policy
-            let mut best_move = valid[0];
-            let mut best_prob = 0.0;
-            for &mv in &valid {
-                if policies[i][mv] > best_prob {
-                    best_prob = policies[i][mv];
-                    best_move = mv;
-                }
-            }
-
-            // Update simulation state
-            let mut new_board = sim_board.clone();
-            new_board[best_move] = Some(sim_player);
-            let new_player = 1 - sim_player;
-            let new_first_move = first_move.or(Some(best_move));
-
-            new_positions.push(new_board);
-            new_contexts.push((sim_id, new_player, new_first_move));
-        }
-
-        // Add remaining unprocessed simulations
-        for i in batch_size_actual..positions_to_evaluate.len() {
-            new_positions.push(positions_to_evaluate[i].clone());
-            new_contexts.push(simulation_contexts[i]);
-        }
-
-        positions_to_evaluate = new_positions;
-        simulation_contexts = new_contexts;
-    }
-
-    // Normalize visit counts to probabilities
-    let total_visits: f32 = visit_counts.iter().sum();
-    if total_visits > 0.0 {
-        for count in &mut visit_counts {
-            *count /= total_visits;
-        }
-    }
-
-    visit_counts
+/// A node in the MCTS search tree.
+struct MctsNode {
+    visit_count: u32,
+    total_value: f32,
+    prior: f32,
+    children: Vec<Option<Box<MctsNode>>>, // size 9 for tic-tac-toe
+    is_terminal: bool,
+    terminal_value: f32,
+    is_expanded: bool,
 }
 
-/// Fallback non-batched MCTS implementation for error handling or debugging.
-/// This is the original implementation that uses individual forward_inference calls.
-pub fn fallback_mcts<B: Backend<FloatElem = f32>, N>(
+impl MctsNode {
+    fn new(prior: f32) -> Self {
+        Self {
+            visit_count: 0,
+            total_value: 0.0,
+            prior,
+            children: (0..9).map(|_| None).collect(),
+            is_terminal: false,
+            terminal_value: 0.0,
+            is_expanded: false,
+        }
+    }
+
+    /// Q-value from the parent's perspective.
+    /// Negated because total_value accumulates from the child's perspective.
+    fn q_value(&self) -> f32 {
+        if self.visit_count == 0 {
+            0.0
+        } else {
+            -self.total_value / self.visit_count as f32
+        }
+    }
+}
+
+/// Select the best action from a node using the PUCT formula.
+fn select_action_puct(node: &MctsNode, board: &[Option<u8>]) -> usize {
+    let sqrt_parent = (node.visit_count as f32).sqrt();
+    let mut best_action = 0;
+    let mut best_score = f32::NEG_INFINITY;
+
+    for action in 0..9 {
+        if board[action].is_some() {
+            continue; // illegal move
+        }
+        let (q, prior, child_visits) = match &node.children[action] {
+            Some(child) => (child.q_value(), child.prior, child.visit_count),
+            None => {
+                // Unexpanded child — should not happen after expansion,
+                // but handle gracefully with high exploration bonus.
+                continue;
+            }
+        };
+
+        let exploration = C_PUCT * prior * sqrt_parent / (1.0 + child_visits as f32);
+        let score = q + exploration;
+
+        if score > best_score {
+            best_score = score;
+            best_action = action;
+        }
+    }
+
+    best_action
+}
+
+/// Expand a node: create children for all legal moves using NN priors.
+fn expand_node<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
+    node: &mut MctsNode,
+    net: &N,
+    board: &[Option<u8>],
+    player: u8,
+) -> f32 {
+    // Get value and policy from neural network
+    let (value, policy) = net.forward_inference(board, player);
+
+    // Mask illegal moves and renormalize
+    let mut legal_sum = 0.0f32;
+    for i in 0..9 {
+        if board[i].is_none() {
+            legal_sum += policy[i];
+        }
+    }
+
+    for i in 0..9 {
+        if board[i].is_none() {
+            let prior = if legal_sum > 0.0 {
+                policy[i] / legal_sum
+            } else {
+                // Uniform over legal moves if NN gives all zeros
+                1.0 / board.iter().filter(|c| c.is_none()).count() as f32
+            };
+            node.children[i] = Some(Box::new(MctsNode::new(prior)));
+        }
+        // Illegal moves remain None
+    }
+
+    node.is_expanded = true;
+    value
+}
+
+/// Add Dirichlet noise to root priors for exploration.
+fn add_dirichlet_noise(node: &mut MctsNode) {
+    // Sample Dirichlet noise using Gamma distribution
+    let mut rng = rand::thread_rng();
+    let mut noise = Vec::new();
+    let mut noise_sum = 0.0f64;
+
+    let num_legal = node.children.iter().filter(|c| c.is_some()).count();
+    if num_legal == 0 {
+        return;
+    }
+
+    for child in &node.children {
+        if child.is_some() {
+            // Gamma(alpha, 1) samples — Dirichlet is normalized Gamma
+            let sample = gamma_sample(&mut rng, DIRICHLET_ALPHA);
+            noise.push(sample);
+            noise_sum += sample;
+        } else {
+            noise.push(0.0);
+        }
+    }
+
+    // Normalize to get Dirichlet sample
+    if noise_sum > 0.0 {
+        for n in &mut noise {
+            *n /= noise_sum;
+        }
+    }
+
+    // Mix noise into priors
+    for (i, child) in node.children.iter_mut().enumerate() {
+        if let Some(ref mut c) = child {
+            let original_prior = c.prior;
+            c.prior = (1.0 - DIRICHLET_EPSILON) * original_prior
+                + DIRICHLET_EPSILON * noise[i] as f32;
+        }
+    }
+}
+
+/// Sample from Gamma(alpha, 1) using Marsaglia and Tsang's method.
+fn gamma_sample(rng: &mut impl rand::Rng, alpha: f64) -> f64 {
+    if alpha < 1.0 {
+        // For alpha < 1, use the relation: Gamma(alpha) = Gamma(alpha+1) * U^(1/alpha)
+        let u: f64 = rng.gen();
+        return gamma_sample(rng, alpha + 1.0) * u.powf(1.0 / alpha);
+    }
+
+    let d = alpha - 1.0 / 3.0;
+    let c = 1.0 / (9.0 * d).sqrt();
+
+    loop {
+        let x: f64 = {
+            // Box-Muller for standard normal
+            let u1: f64 = rng.gen();
+            let u2: f64 = rng.gen();
+            (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
+        };
+
+        let v = (1.0 + c * x).powi(3);
+        if v <= 0.0 {
+            continue;
+        }
+
+        let u: f64 = rng.gen();
+        // Squeeze test
+        if u < 1.0 - 0.0331 * x.powi(4) {
+            return d * v;
+        }
+        if u.ln() < 0.5 * x * x + d * (1.0 - v + v.ln()) {
+            return d * v;
+        }
+    }
+}
+
+/// Backpropagate a value up the path of nodes.
+/// `path` contains (node pointer as *mut, action taken) pairs.
+/// Value alternates sign at each level because players alternate.
+fn backpropagate(path: &[(* mut MctsNode, usize)], leaf_value: f32) {
+    let mut value = leaf_value;
+    for &(node_ptr, action) in path.iter().rev() {
+        unsafe {
+            let node = &mut *node_ptr;
+            if let Some(ref mut child) = node.children[action] {
+                child.visit_count += 1;
+                child.total_value += value;
+            }
+            node.visit_count += 1;
+        }
+        value = -value; // Flip for alternating players
+    }
+}
+
+/// Sample an action from a distribution (visit counts).
+fn sample_from_distribution(distribution: &[f32]) -> usize {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+
+    let total: f32 = distribution.iter().sum();
+    if total <= 0.0 {
+        // Uniform over non-zero entries, or first entry
+        let nonzero: Vec<usize> = distribution.iter().enumerate()
+            .filter(|(_, &v)| v > 0.0)
+            .map(|(i, _)| i)
+            .collect();
+        if nonzero.is_empty() {
+            return 0;
+        }
+        return nonzero[rng.gen_range(0..nonzero.len())];
+    }
+
+    let r: f32 = rng.gen::<f32>() * total;
+    let mut cumsum = 0.0;
+    for (i, &v) in distribution.iter().enumerate() {
+        cumsum += v;
+        if cumsum > r {
+            return i;
+        }
+    }
+    distribution.len() - 1
+}
+
+/// Run MCTS search from a position and return the visit-count policy.
+///
+/// This is proper AlphaZero MCTS with:
+/// - UCT/PUCT selection
+/// - Neural network expansion
+/// - Dirichlet noise at root
+/// - Value backpropagation through the tree
+pub fn mcts_search<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
     net: &N,
     board: &[Option<u8>],
     player: u8,
     simulations: usize,
-) -> Vec<f32>
-where
-    N: NetworkInference<B>,
-{
-    let mut visit_counts = vec![0.0; 9];
+) -> Vec<f32> {
+    let legal_moves: Vec<usize> = board.iter()
+        .enumerate()
+        .filter_map(|(i, &c)| if c.is_none() { Some(i) } else { None })
+        .collect();
 
+    if legal_moves.is_empty() {
+        return vec![0.0; 9];
+    }
+
+    // If only one legal move, return it immediately
+    if legal_moves.len() == 1 {
+        let mut policy = vec![0.0; 9];
+        policy[legal_moves[0]] = 1.0;
+        return policy;
+    }
+
+    // Create root node and expand it
+    let mut root = MctsNode::new(0.0);
+    let _root_value = expand_node(&mut root, net, board, player);
+    root.visit_count = 1; // Virtual visit for root
+
+    // Add Dirichlet noise to root for exploration
+    add_dirichlet_noise(&mut root);
+
+    // Run simulations
     for _ in 0..simulations {
-        let mut sim_board = board.to_vec();
-        let mut sim_player = player;
-        let mut first_move = None;
+        let mut path: Vec<(*mut MctsNode, usize)> = Vec::new();
+        let mut current_board = board.to_vec();
+        let mut current_player = player;
+        let mut node_ptr: *mut MctsNode = &mut root;
 
+        // SELECT: walk down the tree using PUCT
         loop {
-            let valid: Vec<usize> = sim_board.iter()
-                .enumerate()
-                .filter_map(|(i, &c)| if c.is_none() { Some(i) } else { None })
-                .collect();
+            let node = unsafe { &mut *node_ptr };
 
-            if valid.is_empty() || check_winner_internal(&sim_board).is_some() {
+            if node.is_terminal {
+                // Terminal node — backpropagate terminal value
+                let value = node.terminal_value;
+                // Backprop from perspective of the player at this node
+                backpropagate(&path, value);
                 break;
             }
 
-            let (_value, policy) = net.forward_inference(&sim_board, sim_player);
+            if !node.is_expanded {
+                // EXPAND: leaf node, evaluate with NN
+                let value = expand_node(node, net, &current_board, current_player);
 
-            // Select move based on policy
-            let mut best_move = valid[0];
-            let mut best_prob = 0.0;
-            for &mv in &valid {
-                if policy[mv] > best_prob {
-                    best_prob = policy[mv];
-                    best_move = mv;
+                // Check if this is actually terminal (no children created)
+                let has_children = node.children.iter().any(|c| c.is_some());
+                if !has_children {
+                    node.is_terminal = true;
+                    // Determine terminal value
+                    node.terminal_value = if let Some(winner) = check_winner_internal(&current_board) {
+                        // Winner exists — value from current player's perspective
+                        if winner == current_player { 1.0 } else { -1.0 }
+                    } else {
+                        0.0 // Draw (board full)
+                    };
+                    backpropagate(&path, node.terminal_value);
+                } else {
+                    // Backpropagate the NN value (negated because it's from the
+                    // perspective of current_player, but backprop expects leaf value)
+                    backpropagate(&path, -value);
                 }
+                break;
             }
 
-            if first_move.is_none() {
-                first_move = Some(best_move);
+            // Node is expanded — select action with PUCT
+            let action = select_action_puct(node, &current_board);
+            path.push((node_ptr, action));
+
+            // Make the move
+            current_board[action] = Some(current_player);
+            current_player = 1 - current_player;
+
+            // Check for terminal state after the move
+            if let Some(winner) = check_winner_internal(&current_board) {
+                // The move resulted in a win for the player who just moved
+                let child = node.children[action].as_mut().unwrap();
+                child.is_terminal = true;
+                // Value from the perspective of the player whose turn it now is
+                // (which is the loser, since the previous player just won)
+                child.terminal_value = if winner == current_player { 1.0 } else { -1.0 };
+                child.is_expanded = true;
+                child.visit_count += 1;
+                child.total_value += child.terminal_value;
+
+                // Also increment parent visit
+                node.visit_count += 1;
+
+                // Backpropagate the rest of the path (excluding the last step we just handled)
+                let leaf_val = -child.terminal_value; // flip for parent's perspective
+                if path.len() > 1 {
+                    backpropagate(&path[..path.len()-1], leaf_val);
+                }
+                break;
             }
 
-            sim_board[best_move] = Some(sim_player);
-            sim_player = 1 - sim_player;
-        }
+            // Check for draw (board full)
+            let board_full = current_board.iter().all(|c| c.is_some());
+            if board_full {
+                let child = node.children[action].as_mut().unwrap();
+                child.is_terminal = true;
+                child.terminal_value = 0.0;
+                child.is_expanded = true;
+                child.visit_count += 1;
+                child.total_value += 0.0;
+                node.visit_count += 1;
 
-        // CRITICAL FIX: Evaluate game outcome and propagate value
-        let game_value = if let Some(winner) = check_winner_internal(&sim_board) {
-            if winner == player { 1.0 } else { -1.0 } // Win/loss from current player's perspective
-        } else {
-            0.0 // Draw
-        };
+                if path.len() > 1 {
+                    backpropagate(&path[..path.len()-1], 0.0);
+                }
+                break;
+            }
 
-        if let Some(mv) = first_move {
-            visit_counts[mv] += 1.0 + game_value; // Weight by outcome, not just frequency
+            // Move to child node
+            node_ptr = node.children[action].as_mut().unwrap().as_mut() as *mut MctsNode;
         }
     }
 
-    // Normalize to probabilities (visit counts now include outcome weighting)
-    let total_visits: f32 = visit_counts.iter().sum();
-    if total_visits > 0.0 {
-        for count in &mut visit_counts {
-            *count /= total_visits;
+    // Extract visit counts from root children
+    let mut visit_counts = vec![0.0f32; 9];
+    for i in 0..9 {
+        if let Some(ref child) = root.children[i] {
+            visit_counts[i] = child.visit_count as f32;
+        }
+    }
+
+    // Normalize to probability distribution
+    let total: f32 = visit_counts.iter().sum();
+    if total > 0.0 {
+        for v in &mut visit_counts {
+            *v /= total;
         }
     }
 
     visit_counts
 }
-// Interleaved game manager for full position batching inspired by LC0
-pub struct InterleavedGamesManager<N> {
-    pub active_games: Vec<GameState>,
-    pub position_queue: VecDeque<GamePosition>,
-    pub batch_size: usize,
-    pub virtual_loss_value: f32,
-    pub network: std::sync::Arc<N>,
-    pub simulations_per_game: usize,
-    pub next_path_id: usize,
-}
 
-impl<N> InterleavedGamesManager<N> {
-    pub fn new(
-        network: std::sync::Arc<N>,
-        batch_size: usize,
-        virtual_loss_value: f32
-    ) -> Self {
-        Self {
-            active_games: Vec::new(),
-            position_queue: VecDeque::new(),
-            batch_size,
-            virtual_loss_value,
-            network,
-            simulations_per_game: 25,
-            next_path_id: 0,
-        }
-    }
+/// Play a complete self-play game using proper MCTS and return training examples.
+pub fn self_play_game_mcts<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
+    net: &N,
+    simulations: usize,
+    temp_threshold: usize,
+) -> Vec<TrainingExample> {
+    let mut board = vec![None; 9];
+    let mut player = 0u8;
+    let mut examples: Vec<TrainingExample> = Vec::new();
+    let mut move_number = 0;
 
-    // Initialize multiple games for interleaved simulation
-    pub fn initialize_games(&mut self, num_games: usize) {
-        self.active_games.clear();
-        for game_id in 0..num_games {
-            let game_state = GameState {
-                board: vec![None; 9],
-                player: 0,
-                move_history: Vec::new(),
-                active_simulations: HashMap::new(),
-                visit_counts: vec![0.0; 9],
-                is_finished: false,
-                training_examples: Vec::new(),
-            };
-            self.active_games.push(game_state);
-
-            // Start initial simulations for each game
-            for _sim_id in 0..self.simulations_per_game {
-                let path_id = self.next_path_id;
-                self.next_path_id += 1;
-
-                let position = GamePosition {
-                    board: vec![None; 9],
-                    player: 0,
-                    game_id,
-                    move_number: 0,
-                    path_id,
-                    virtual_loss: 0.0,
-                    depth: 0,
-                };
-
-                self.position_queue.push_back(position);
-            }
-        }
-    }
-}
-
-impl<N> InterleavedGamesManager<N> {
-    // OPTIMIZED: Multi-game batch processing with large batch sizes
-    pub fn run_simulations<B>(&mut self, num_games: usize) -> Result<Vec<Vec<TrainingExample>>, Box<dyn std::error::Error>>
-    where
-        B: Backend<FloatElem = f32>,
-        N: NetworkInference<B>,
-    {
-        let optimal_batch_size = if cfg!(feature = "cuda") { 512 } else { 128 };
-        self.run_simulations_with_batch_size(num_games, optimal_batch_size)
-    }
-    // BATCH SIZE TESTING: Multi-game batch processing with configurable batch size
-    pub fn run_simulations_with_batch_size<B>(&mut self, num_games: usize, large_batch_size: usize) -> Result<Vec<Vec<TrainingExample>>, Box<dyn std::error::Error>>
-    where
-        B: Backend<FloatElem = f32>,
-        N: NetworkInference<B>,
-    {
-        // Initialize all games
-        let mut games_in_progress: Vec<GameInProgress> = (0..num_games)
-            .map(|_| GameInProgress::new())
+    loop {
+        let legal_moves: Vec<usize> = board.iter()
+            .enumerate()
+            .filter_map(|(i, &c)| if c.is_none() { Some(i) } else { None })
             .collect();
 
-        // Process games in rounds, collecting positions for large batches
-        let mut round = 0;
-        while !games_in_progress.iter().all(|game| game.is_finished()) {
-            round += 1;
-
-            let mut batch_positions = Vec::new();
-            let mut position_game_mapping = Vec::new();
-
-            // PHASE 1: Collect positions from all active games
-            for (game_idx, game) in games_in_progress.iter_mut().enumerate() {
-                if game.is_finished() {
-                    continue;
-                }
-
-                // Get the next position that needs neural network evaluation
-                if let Some((board, player)) = game.get_next_position_for_evaluation() {
-                    batch_positions.push((board, player));
-                    position_game_mapping.push(game_idx);
-                }
-            }
-
-            // Debug every 20 rounds
-            if round % 20 == 0 {
-                let active_count = games_in_progress.iter().filter(|g| !g.is_finished()).count();
-                if active_count > 0 {
-                    println!("  Round {}: {} active games, {} positions in batch", round, active_count, batch_positions.len());
-                }
-            }
-
-            // PHASE 2: Process batch when we have positions
-            let should_process_batch = batch_positions.len() >= large_batch_size ||
-               (!batch_positions.is_empty() && games_in_progress.iter().filter(|g| !g.is_finished()).count() <= 5) ||
-               (!batch_positions.is_empty() && round > 10);
-
-            if should_process_batch {
-                // Convert to neural network batch format
-                let boards: Vec<&[Option<u8>]> = batch_positions
-                    .iter()
-                    .map(|(board, _)| board.as_slice())
-                    .collect();
-                let players: Vec<u8> = batch_positions
-                    .iter()
-                    .map(|(_, player)| *player)
-                    .collect();
-
-                // Large batch neural network evaluation
-                let (_values, policies) = self.network.forward_batch_inference(&boards, &players);
-
-                // PHASE 3: Distribute results back to games
-                for (batch_idx, &game_idx) in position_game_mapping.iter().enumerate() {
-                    let policy = policies[batch_idx].clone();
-                    games_in_progress[game_idx].apply_policy_and_advance(policy)?;
-                }
-            } else if batch_positions.is_empty() && round > 5 {
-                // No positions to process but games are still active
-                for game in &mut games_in_progress {
-                    if !game.is_finished() && !game.needs_evaluation {
-                        game.needs_evaluation = true;
-                    }
-                }
-            }
-
-            // Emergency exit
-            if round > 200 {
-                let active_count = games_in_progress.iter().filter(|g| !g.is_finished()).count();
-                let positions_count = batch_positions.len();
-                return Err(format!("Training round limit exceeded - possible infinite loop: {} active games, {} positions waiting",
-                    active_count, positions_count).into());
-            }
+        if legal_moves.is_empty() {
+            break;
         }
 
-        // Extract training examples from completed games
-        let training_examples: Vec<Vec<TrainingExample>> = games_in_progress
-            .into_iter()
-            .map(|game| game.into_training_examples())
-            .collect();
+        if check_winner_internal(&board).is_some() {
+            break;
+        }
 
-        Ok(training_examples)
+        // Run MCTS to get policy
+        let policy = mcts_search(net, &board, player, simulations);
+
+        // Store training example (value filled in later)
+        examples.push(TrainingExample {
+            board: board.clone(),
+            player,
+            policy: policy.clone(),
+            value: 0.0,
+        });
+
+        // Select move
+        let selected = if move_number < temp_threshold {
+            // Temperature = 1: sample proportionally to visit counts
+            sample_from_distribution(&policy)
+        } else {
+            // Temperature → 0: pick argmax
+            policy.iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                .map(|(i, _)| i)
+                .unwrap_or(legal_moves[0])
+        };
+
+        board[selected] = Some(player);
+        player = 1 - player;
+        move_number += 1;
     }
+
+    // Fill in values from game outcome
+    let winner = check_winner_internal(&board);
+    for example in &mut examples {
+        example.value = match winner {
+            Some(w) if w == example.player => 1.0,
+            Some(_) => -1.0,
+            None => 0.0, // Draw
+        };
+    }
+
+    examples
+}
+
+/// Generate training data from multiple self-play games.
+pub fn generate_training_data<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
+    net: &N,
+    num_games: usize,
+    simulations: usize,
+    temp_threshold: usize,
+) -> Vec<Vec<TrainingExample>> {
+    let mut all_games = Vec::with_capacity(num_games);
+
+    for _ in 0..num_games {
+        let examples = self_play_game_mcts(net, simulations, temp_threshold);
+        all_games.push(examples);
+    }
+
+    all_games
 }

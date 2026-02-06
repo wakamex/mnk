@@ -4,9 +4,9 @@ use crate::unified_mcts::TrainingExample;
 use burn::prelude::*;
 
 #[cfg(feature = "cuda")]
-use burn_candle::{Candle, CandleDevice};
+use burn_cuda::{Cuda, CudaDevice};
 #[cfg(feature = "cuda")]
-type MyBackend = burn::backend::Autodiff<Candle>;
+type MyBackend = burn::backend::Autodiff<Cuda>;
 
 #[cfg(not(feature = "cuda"))]
 use burn_ndarray::{NdArray, NdArrayDevice};
@@ -265,7 +265,7 @@ fn count_unique_positions(examples: &[TrainingExample]) -> usize {
 pub fn load_trained_model() -> Result<AlphaZeroNet<MyBackend>, Box<dyn std::error::Error>> {
     // Initialize device
     #[cfg(feature = "cuda")]
-    let device = CandleDevice::cuda(0);
+    let device = CudaDevice::new(0);
     #[cfg(not(feature = "cuda"))]
     let device = burn_ndarray::NdArrayDevice::default();
 

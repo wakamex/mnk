@@ -5,7 +5,6 @@ use burn::prelude::Backend;
 use crate::alphazero::{AlphaZeroNet, check_winner};
 use crate::unified_mcts::TrainingExample;
 use crate::unified_mcts;
-use crate::mcts_bridge; // Enables AlphaZeroNet to work with unified_mcts
 
 /// Play a complete self-play game using MCTS for move selection
 /// Returns training examples from the game
@@ -28,7 +27,7 @@ pub fn self_play_game<B: Backend<FloatElem = f32>>(
         }
 
         // Use unified MCTS to get move probabilities
-        let policy = unified_mcts::fallback_mcts(net, &board, player, mcts_simulations);
+        let policy = unified_mcts::mcts_search(net, &board, player, mcts_simulations);
 
         // Store training example
         examples.push(TrainingExample {

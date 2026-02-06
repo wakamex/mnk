@@ -1,15 +1,11 @@
 // Simplified AlphaZero with Burn that actually compiles and works
 
 use burn::prelude::*;
-use crate::unified_mcts::{TrainingExample, PositionToEvaluate};
 use burn::nn::{Linear, LinearConfig, conv::Conv2d, conv::Conv2dConfig,
                PaddingConfig2d};
 use burn::tensor::activation;
 use burn::module::Module;
 use rand::seq::SliceRandom;
-// Note: When used in binaries, must import via mnk:: not crate::
-// use mnk::unified_mcts::{self, NetworkInference};
-// use crate::symmetry; // Temporarily commented for build test
 
 #[derive(Module, Debug)]
 pub struct AlphaZeroNet<B: Backend> {
@@ -105,19 +101,12 @@ impl<B: Backend> AlphaZeroNet<B> {
         let input = board_to_tensor(board, player, &self.conv1.devices()[0]);
         let (value, policy_logits) = self.forward(input);
 
-        // CRITICAL: Convert logits to probabilities for MCTS inference
+        // Convert logits to probabilities for MCTS inference
         let policy = activation::softmax(policy_logits, 1);
 
-        // Convert to scalar and vector
-        let value_scalar: f32 = value.clone().into_scalar();
-
-        // For policy, we need to extract the data properly
-        let board_size = self.board_width * self.board_width;
-        let policy_vec: Vec<f32> = (0..board_size).map(|i| {
-            let elem = policy.clone().slice([0..1, i..i+1]);
-            let scalar: f32 = elem.into_scalar();
-            scalar
-        }).collect();
+        // Bulk GPU→CPU transfer via to_data()
+        let value_scalar = value.to_data().as_slice::<f32>().unwrap()[0];
+        let policy_vec = policy.to_data().as_slice::<f32>().unwrap().to_vec();
 
         (value_scalar, policy_vec)
     }
@@ -158,22 +147,16 @@ impl<B: Backend> AlphaZeroNet<B> {
         // Convert logits to probabilities for MCTS inference
         let batch_policies = activation::softmax(batch_policy_logits, 1);
 
-        // Extract results for each position
-        let mut values = Vec::with_capacity(batch_size);
-        let mut policies = Vec::with_capacity(batch_size);
+        // Bulk GPU→CPU transfer (avoids per-element into_scalar segfaults on CUDA)
+        let values_data = batch_values.to_data();
+        let values_slice = values_data.as_slice::<f32>().unwrap();
+        let values: Vec<f32> = values_slice.iter().copied().collect();
 
-        for i in 0..batch_size {
-            // Extract value for position i
-            let value: f32 = batch_values.clone().slice([i..i+1, 0..1]).into_scalar();
-            values.push(value);
-
-            // Extract policy for position i
-            let policy: Vec<f32> = (0..board_size).map(|j| {
-                let elem = batch_policies.clone().slice([i..i+1, j..j+1]);
-                elem.into_scalar()
-            }).collect();
-            policies.push(policy);
-        }
+        let policies_data = batch_policies.to_data();
+        let policies_slice = policies_data.as_slice::<f32>().unwrap();
+        let policies: Vec<Vec<f32>> = (0..batch_size)
+            .map(|i| policies_slice[i * board_size..(i + 1) * board_size].to_vec())
+            .collect();
 
         (values, policies)
     }
@@ -214,11 +197,7 @@ pub fn check_winner(board: &[Option<u8>]) -> Option<u8> {
     None
 }
 
-// TrainingExample moved to unified_mcts module
-
-// MCTS functions moved to unified_mcts module - use mnk::unified_mcts::unified_batched_mcts
-
-// Demonstration of batch inference potential - process root positions together
+// Batch evaluation helper
 pub fn batch_evaluate_positions<B: Backend<FloatElem = f32>>(
     net: &AlphaZeroNet<B>,
     boards: &[Vec<Option<u8>>],
@@ -236,309 +215,6 @@ pub fn batch_evaluate_positions<B: Backend<FloatElem = f32>>(
 }
 
 
-// GameState moved to unified_mcts module
-
-
-// Full batched MCTS implementation inspired by LC0
-pub fn full_batched_mcts<B: Backend<FloatElem = f32>>(
-    net: &AlphaZeroNet<B>,
-    boards: &[Vec<Option<u8>>],
-    players: &[u8],
-    simulations_per_position: usize,
-    batch_size: usize,
-) -> Vec<Vec<f32>> {
-    assert_eq!(boards.len(), players.len());
-
-    let num_positions = boards.len();
-    let mut all_visit_counts = vec![vec![0.0; 9]; num_positions];
-
-    // Collect positions to evaluate across all MCTS simulations
-    let mut positions_to_evaluate = Vec::new();
-
-    // Generate all simulation positions across all root positions
-    for (pos_idx, (board, &player)) in boards.iter().zip(players.iter()).enumerate() {
-        for sim_id in 0..simulations_per_position {
-            // Start each simulation
-            let mut sim_board = board.clone();
-            let mut sim_player = player;
-            let mut moves_made = 0;
-
-            loop {
-                // Check for terminal state
-                let valid: Vec<usize> = sim_board.iter()
-                    .enumerate()
-                    .filter_map(|(i, &c)| if c.is_none() { Some(i) } else { None })
-                    .collect();
-
-                if valid.is_empty() || check_winner(&sim_board).is_some() {
-                    break;
-                }
-
-                // Add this position to our batch evaluation queue
-                positions_to_evaluate.push(PositionToEvaluate {
-                    board: sim_board.clone(),
-                    player: sim_player,
-                    simulation_id: pos_idx * simulations_per_position + sim_id,
-                    depth: moves_made,
-                    is_first_move: moves_made == 0,
-                });
-
-                // For simplicity, we'll process each simulation step individually
-                // In a full implementation, we'd collect many positions before evaluating
-                if positions_to_evaluate.len() >= batch_size {
-                    let batch_results = evaluate_position_batch(net, &positions_to_evaluate);
-
-                    // Apply results (simplified - in reality we'd track full game tree)
-                    for (eval_pos, (_value, policy)) in positions_to_evaluate.iter().zip(batch_results.iter()) {
-                        if eval_pos.is_first_move {
-                            // Only track first moves for visit counts
-                            let root_pos_idx = eval_pos.simulation_id / simulations_per_position;
-
-                            // Select move based on policy
-                            let valid: Vec<usize> = eval_pos.board.iter()
-                                .enumerate()
-                                .filter_map(|(i, &c)| if c.is_none() { Some(i) } else { None })
-                                .collect();
-
-                            let mut best_move = valid[0];
-                            let mut best_prob = 0.0;
-                            for &mv in &valid {
-                                if policy[mv] > best_prob {
-                                    best_prob = policy[mv];
-                                    best_move = mv;
-                                }
-                            }
-
-                            all_visit_counts[root_pos_idx][best_move] += 1.0;
-                        }
-                    }
-
-                    positions_to_evaluate.clear();
-                }
-
-                // Make a move (simplified simulation)
-                // In reality, this would be based on the neural network evaluation
-                let move_idx = valid[0]; // Simplified - just pick first valid move
-                sim_board[move_idx] = Some(sim_player);
-                sim_player = 1 - sim_player;
-                moves_made += 1;
-
-                // Limit simulation depth to avoid infinite games
-                if moves_made >= 9 { break; }
-            }
-        }
-    }
-
-    // Process any remaining positions
-    if !positions_to_evaluate.is_empty() {
-        let batch_results = evaluate_position_batch(net, &positions_to_evaluate);
-
-        for (eval_pos, (_value, policy)) in positions_to_evaluate.iter().zip(batch_results.iter()) {
-            if eval_pos.is_first_move {
-                let root_pos_idx = eval_pos.simulation_id / simulations_per_position;
-
-                let valid: Vec<usize> = eval_pos.board.iter()
-                    .enumerate()
-                    .filter_map(|(i, &c)| if c.is_none() { Some(i) } else { None })
-                    .collect();
-
-                let mut best_move = valid[0];
-                let mut best_prob = 0.0;
-                for &mv in &valid {
-                    if policy[mv] > best_prob {
-                        best_prob = policy[mv];
-                        best_move = mv;
-                    }
-                }
-
-                all_visit_counts[root_pos_idx][best_move] += 1.0;
-            }
-        }
-    }
-
-    // Normalize visit counts to probabilities
-    for visit_counts in &mut all_visit_counts {
-        let total: f32 = visit_counts.iter().sum();
-        if total > 0.0 {
-            for count in visit_counts {
-                *count /= total;
-            }
-        }
-    }
-
-    all_visit_counts
-}
-
-// Helper function to evaluate a batch of positions
-fn evaluate_position_batch<B: Backend<FloatElem = f32>>(
-    net: &AlphaZeroNet<B>,
-    positions: &[PositionToEvaluate],
-) -> Vec<(f32, Vec<f32>)> {
-    if positions.is_empty() {
-        return vec![];
-    }
-
-    let boards: Vec<&[Option<u8>]> = positions.iter()
-        .map(|p| p.board.as_slice())
-        .collect();
-    let players: Vec<u8> = positions.iter()
-        .map(|p| p.player)
-        .collect();
-
-    let (values, policies) = net.forward_batch_inference(&boards, &players);
-
-    values.into_iter().zip(policies.into_iter()).collect()
-}
-
-pub fn self_play_game<B: Backend<FloatElem = f32>>(net: &AlphaZeroNet<B>, mcts_simulations: usize) -> Vec<TrainingExample> {
-    let mut board = vec![None; 9];
-    let mut player = 0u8;
-    let mut examples: Vec<TrainingExample> = Vec::new();
-
-    loop {
-        let valid: Vec<usize> = board.iter()
-            .enumerate()
-            .filter_map(|(i, &c)| if c.is_none() { Some(i) } else { None })
-            .collect();
-
-        if valid.is_empty() {
-            for ex in &mut examples {
-                ex.value = 0.0; // Draw
-            }
-            return examples;
-        }
-
-        if let Some(winner) = check_winner(&board) {
-            for ex in &mut examples {
-                ex.value = if ex.player == winner { 1.0 } else { -1.0 };
-            }
-            return examples;
-        }
-
-        // Use unified MCTS from standalone module
-        let policy = crate::unified_mcts::fallback_mcts(net, &board, player, mcts_simulations);
-        examples.push(TrainingExample {
-            board: board.clone(),
-            player,
-            policy: policy.clone(),
-            value: 0.0,
-        });
-
-        // Select move (temperature for first 2 moves)
-        let selected = if examples.len() <= 2 {
-            // Sample from distribution
-            let r = rand::random::<f32>();
-            let mut cumsum = 0.0;
-            let mut selected = valid[0];
-            for i in 0..9 {
-                cumsum += policy[i];
-                if cumsum > r && board[i].is_none() {
-                    selected = i;
-                    break;
-                }
-            }
-            selected
-        } else {
-            // Greedy
-            policy.iter()
-                .enumerate()
-                .filter(|(i, _)| board[*i].is_none())
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-                .map(|(i, _)| i)
-                .unwrap()
-        };
-
-        board[selected] = Some(player);
-        player = 1 - player;
-    }
-}
-
-// /// Self-play game with 8x symmetry augmentation for data efficiency
-// pub fn self_play_game_with_symmetry<B: Backend<FloatElem = f32>>(
-//     net: &AlphaZeroNet<B>,
-//     mcts_simulations: usize
-// ) -> Vec<TrainingExample> {
-//     // Generate original examples through normal self-play
-//     let original_examples = self_play_game(net, mcts_simulations);
-//
-//     // Apply symmetry augmentation for 8x data multiplication
-//     symmetry::augment_training_data(original_examples)
-// }
-
-pub fn self_play_game_with_batched_policy<B: Backend<FloatElem = f32>>(
-    net: &AlphaZeroNet<B>,
-    initial_policy: &[f32],
-    mcts_simulations: usize
-) -> Vec<TrainingExample> {
-    let mut board = vec![None; 9];
-    let mut player = 0u8;
-    let mut examples: Vec<TrainingExample> = Vec::new();
-    let mut move_count = 0;
-
-    loop {
-        let valid: Vec<usize> = board.iter()
-            .enumerate()
-            .filter_map(|(i, &c)| if c.is_none() { Some(i) } else { None })
-            .collect();
-
-        if valid.is_empty() {
-            for ex in &mut examples {
-                ex.value = 0.0; // Draw
-            }
-            return examples;
-        }
-
-        if let Some(winner) = check_winner(&board) {
-            for ex in &mut examples {
-                ex.value = if ex.player == winner { 1.0 } else { -1.0 };
-            }
-            return examples;
-        }
-
-        // Use batched policy for first move, then fall back to regular MCTS
-        let policy = if move_count == 0 {
-            initial_policy.to_vec()
-        } else {
-            // Use unified MCTS from standalone module
-            crate::unified_mcts::fallback_mcts(net, &board, player, mcts_simulations)
-        };
-
-        examples.push(TrainingExample {
-            board: board.clone(),
-            player,
-            policy: policy.clone(),
-            value: 0.0,
-        });
-
-        // Select move (temperature for first 2 moves)
-        let selected = if examples.len() <= 2 {
-            // Sample from distribution
-            let r = rand::random::<f32>();
-            let mut cumsum = 0.0;
-            let mut selected = valid[0];
-            for i in 0..9 {
-                cumsum += policy[i];
-                if cumsum > r && board[i].is_none() {
-                    selected = i;
-                    break;
-                }
-            }
-            selected
-        } else {
-            // Greedy
-            policy.iter()
-                .enumerate()
-                .filter(|(i, _)| board[*i].is_none())
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-                .map(|(i, _)| i)
-                .unwrap()
-        };
-
-        board[selected] = Some(player);
-        player = 1 - player;
-        move_count += 1;
-    }
-}
 
 pub fn evaluate_vs_random<B, N>(net: &N) -> f32
 where

@@ -176,9 +176,9 @@ pub fn evaluate_position<B: Backend<FloatElem = f32>>(
     // Forward pass
     let (value, policy) = net.forward(input_tensor, board_width);
 
-    // Extract results
-    let value_scalar = value.into_scalar();
-    let policy_vec: Vec<f32> = policy.into_data().convert::<f32>().to_vec().unwrap();
+    // Bulk GPU→CPU transfer (avoids into_scalar segfaults on CUDA)
+    let value_scalar = value.to_data().as_slice::<f32>().unwrap()[0];
+    let policy_vec: Vec<f32> = policy.to_data().as_slice::<f32>().unwrap().to_vec();
 
     (value_scalar, policy_vec)
 }
