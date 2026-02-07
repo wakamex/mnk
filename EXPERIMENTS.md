@@ -11,35 +11,15 @@ Old roadmap/planning notes were removed to keep this document current.
 
 ## Overnight harness run (2026-02-07)
 
-Run folder:
-- `research_runs/20260207_overnight_loop/`
+Run outputs live under local `research_runs/` and are not committed.
 
 Key additions in code:
 - Fixed deterministic evaluation suite mode in `mnk_game` (25 openings x 2 sides, eval sims=100, root noise off, CSV output).
 - Strict model-load behavior in fixed-suite mode (fail fast instead of silently evaluating with an untrained fallback model).
-- Optional hybrid inference knobs for fixed-suite mode:
-  - `--fixed-suite-endgame-solve-threshold`
-  - `--fixed-suite-tactical-override`
 - Exposed MCTS eval-time hyperparameter path via `mcts_search_with_hyperparams`.
 
 Critical finding:
 - Many legacy checkpoints are not loadable with the current recorder path (`Utf8` record error). Earlier sweeps that allowed fallback-to-untrained were partly invalid for model ranking.
-
-Best strict fixed-suite result in this run:
-- Baseline loadable model:
-  - `alphazero_model_i20_g1000_vw2_0_mcts50_netcnn_temp1_25_tcut1_dalpha0_1_cpuct0_75.bin`
-- Eval config:
-  - `--fixed-suite-endgame-solve-threshold 8`
-  - `--fixed-suite-cpuct 0.75`
-  - `--fixed-suite-sims 100`
-- Metrics:
-  - `vs_Deep=53.0%`
-  - `vs_Medium=57.0%`
-  - `vs_Random=90.0%`
-- Repro artifacts:
-  - Command: `research_runs/20260207_overnight_loop/best_fixed_suite_endgame8.cmd`
-  - Log: `research_runs/20260207_overnight_loop/best_fixed_suite_endgame8.log`
-  - CSV: `research_runs/20260207_overnight_loop/best_fixed_suite_endgame8.csv`
 
 ## Current defaults (as of 2026-02-07)
 

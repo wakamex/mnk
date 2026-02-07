@@ -59,3 +59,7 @@ research_runs/**/training_log.csv
 research_runs/**/eval_*.cmd
 research_runs/**/eval_*.log
 research_runs/**/eval_*.csv
+research_runs/**/best_*.cmd
+research_runs/**/best_*.log
+research_runs/**/best_*.csv
+research_runs/**/notes.md
