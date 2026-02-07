@@ -9,14 +9,24 @@ Old roadmap/planning notes were removed to keep this document current.
 - Latest completed CNN summary: `sweep_results/cnn_lr_mcts_20260206_125932.csv`
 - Curve analysis tool: `analyze_sweep.py`
 
-## Current defaults (as of 2026-02-06)
+## Current defaults (as of 2026-02-07)
 
 - `--learning-rate`: `0.02`
 - `--mcts-simulations`: `50`
 - `--value-weight`: `2.0`
 - `--temperature`: `1.25`
+- `--temperature-cutoff-moves`: `1`
+- `--dirichlet-alpha`: `0.1`
+- `--cpuct`: `0.75`
 
-Rationale: lr/mcts from Phase 1 CNN sweep. Value weight and temperature from Phase 2 policy investigation. `vw=2.0, temp=1.25` scored vsR=87%, vsD=38%, vsM=45.5% — best balanced config across all opponents. The earlier `vw=4.0, temp=1.75` winner (49.5% vsD) traded too much vsR for vsD.
+Rationale:
+- Temp-cutoff sweep (`sweep_results/temp_cutoff_v1_20260207_000025.csv`) selected `tcut=1` as the only setting that kept `vsDeep=25%` while reaching `vsMedium=50%`.
+- Dirichlet sweep at `tcut=1` (`sweep_results/dirichlet_tcut1_v1_20260207_001159.csv`) selected `dalpha=0.1` as top balanced config (`vsR=89.5%, vsD=25.0%, vsM=50.0%`).
+- CPUCT sweep (`sweep_results/cpuct_tcut1_dalpha0.1_v1_20260207_002811.csv`) selected `cpuct=0.75` as best combined strength/diversity tradeoff.
+
+Position-diversity note:
+- Duplicate analysis showed very high repetition with `tcut=1` (`8978` samples, `145` exact uniques, `34` canonical uniques), versus `tcut=4` (`6635` samples, `934` exact uniques, `241` canonical uniques).
+- We keep `tcut=1` for strength and track diversity as a secondary metric during sweeps.
 
 ## Architecture update (2026-02-07)
 
@@ -64,6 +74,7 @@ Selected outcomes from `sweep_results/cnn_lr_mcts_20260206_125932.csv`:
 ## Phase 2: Policy Head Investigation (completed)
 
 Replaced the binary temp_threshold (sample N moves then argmax) with continuous temperature `tau` applied via `N_i^(1/tau)` to MCTS visit counts for all moves.
+This was later superseded in current defaults by a short opening schedule (`--temperature-cutoff-moves 1`), based on the 2026-02-07 sweeps above.
 
 ### Value weight sweep (`sweep_results/policy_value_weight_20260206_140629.csv`)
 

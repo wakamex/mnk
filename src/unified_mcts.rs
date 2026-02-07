@@ -37,8 +37,8 @@ fn check_winner_internal(board: &[Option<u8>]) -> Option<u8> {
 // Proper AlphaZero MCTS with tree search
 // ============================================================
 
-const DEFAULT_C_PUCT: f32 = 1.5;
-const DIRICHLET_ALPHA: f64 = 0.3;
+const DEFAULT_C_PUCT: f32 = 0.75;
+const DIRICHLET_ALPHA: f64 = 0.1;
 const DIRICHLET_EPSILON: f32 = 0.25;
 
 /// A node in the MCTS search tree.

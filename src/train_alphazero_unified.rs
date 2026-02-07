@@ -182,7 +182,7 @@ struct Args {
     mcts_simulations: usize,
 
     /// MCTS PUCT exploration constant
-    #[arg(long, default_value = "1.5")]
+    #[arg(long, default_value = "0.75")]
     cpuct: f32,
 
     /// Output path for the trained model
@@ -202,11 +202,11 @@ struct Args {
     temperature: f32,
 
     /// Number of opening moves that use the configured temperature before switching to temp=0
-    #[arg(long, default_value = "3")]
+    #[arg(long, default_value = "1")]
     temperature_cutoff_moves: usize,
 
     /// Dirichlet alpha for root-noise during self-play
-    #[arg(long, default_value = "0.3")]
+    #[arg(long, default_value = "0.1")]
     dirichlet_alpha: f64,
 
     /// Path for CSV training log (iteration metrics with wall-clock time)

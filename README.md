@@ -34,6 +34,11 @@ Key flags:
 - `--mcts-simulations N` — MCTS sims per move (default: 50)
 - `--epochs N` — training epochs per iteration (default: 8)
 - `--learning-rate F` — SGD learning rate (default: 0.02)
+- `--value-weight F` — value-loss weight (default: 2.0)
+- `--temperature F` — opening move temperature (default: 1.25)
+- `--temperature-cutoff-moves N` — opening moves with non-zero temperature (default: 1)
+- `--dirichlet-alpha F` — self-play root-noise alpha (default: 0.1)
+- `--cpuct F` — PUCT exploration constant (default: 0.75)
 - `--net-type cnn|transformer` — network architecture (default: cnn)
 
 ## Sweep Status
