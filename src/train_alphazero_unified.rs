@@ -181,6 +181,10 @@ struct Args {
     #[arg(long, default_value = "50")]
     mcts_simulations: usize,
 
+    /// MCTS PUCT exploration constant
+    #[arg(long, default_value = "1.5")]
+    cpuct: f32,
+
     /// Output path for the trained model
     #[arg(long, default_value = "alphazero_model.bin")]
     model_path: String,
@@ -196,6 +200,14 @@ struct Args {
     /// MCTS temperature for move selection (0=argmax, 1=proportional to visits, >1=more exploratory)
     #[arg(long, default_value = "1.25")]
     temperature: f32,
+
+    /// Number of opening moves that use the configured temperature before switching to temp=0
+    #[arg(long, default_value = "3")]
+    temperature_cutoff_moves: usize,
+
+    /// Dirichlet alpha for root-noise during self-play
+    #[arg(long, default_value = "0.3")]
+    dirichlet_alpha: f64,
 
     /// Path for CSV training log (iteration metrics with wall-clock time)
     #[arg(long)]
@@ -271,6 +283,10 @@ fn main() {
     println!("  Learning rate: {}", learning_rate);
     println!("  Value weight: {}", args.value_weight);
     println!("  MCTS simulations: {}", args.mcts_simulations);
+    println!("  CPUCT: {}", args.cpuct);
+    println!("  Temperature: {}", args.temperature);
+    println!("  Temperature cutoff moves: {}", args.temperature_cutoff_moves);
+    println!("  Dirichlet alpha: {}", args.dirichlet_alpha);
     println!();
 
     // CSV training log
@@ -302,6 +318,9 @@ fn main() {
             games_per_iter,
             args.mcts_simulations,
             args.temperature,
+            args.temperature_cutoff_moves,
+            args.cpuct,
+            args.dirichlet_alpha,
             64,
         );
         let selfplay_time = selfplay_start.elapsed();

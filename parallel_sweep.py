@@ -11,7 +11,7 @@ import re
 import subprocess
 import sys
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -95,11 +95,22 @@ class AlphaZeroSweep:
         else:
             self.max_parallel_jobs = 1
 
-        self.results_dir = Path('./sweep_results')
-        self.results_dir.mkdir(exist_ok=True)
+        preferred_results_dir = Path('./sweep_results')
+        fallback_results_dir = Path('/tmp/mnk_sweep_results')
+        self.results_dir = preferred_results_dir
+        try:
+            self.results_dir.mkdir(exist_ok=True)
+            probe = self.results_dir / ".write_test"
+            probe.write_text("ok")
+            probe.unlink()
+        except Exception:
+            self.results_dir = fallback_results_dir
+            self.results_dir.mkdir(parents=True, exist_ok=True)
+            print(f"   Results dir not writable, using fallback: {self.results_dir}")
 
         # Tournament execution settings
         self.cpu_tournaments = cpu_tournaments
+        self.train_binary = os.environ.get("TRAIN_ALPHAZERO_BINARY", "./target/release/train_alphazero")
         # Default: use more tournament jobs for CPU (no GPU memory constraint)
         if tournament_jobs:
             self.tournament_jobs = tournament_jobs
@@ -119,6 +130,7 @@ class AlphaZeroSweep:
         print(f"   CPU Cores: {self.cpu_cores}")
         print(f"   GPU Memory: {self.gpu_memory}MB" if self.gpu_memory else "   GPU: Not detected")
         print(f"   Max Parallel Jobs: {self.max_parallel_jobs}")
+        print(f"   Train binary: {self.train_binary}")
 
         if self.gpu_memory:
             estimated_usage = self.max_parallel_jobs * 1500
@@ -154,7 +166,7 @@ class AlphaZeroSweep:
 
             # Execute training directly on host (CUDA context works fine here)
             cmd = [
-                "./target/release/train_alphazero"
+                self.train_binary
             ] + config.args.split() + ["--model-path", unique_model, "--csv-log", csv_log]
             result = subprocess.run(
                 cmd,
@@ -439,8 +451,8 @@ class AlphaZeroSweep:
 
         if can_run_concurrent:
             # Concurrent Mode: separate pools for GPU training and CPU tournaments
-            training_executor = ProcessPoolExecutor(max_workers=training_jobs)
-            tournament_executor = ProcessPoolExecutor(max_workers=actual_tournament_jobs)
+            training_executor = ThreadPoolExecutor(max_workers=training_jobs)
+            tournament_executor = ThreadPoolExecutor(max_workers=actual_tournament_jobs)
 
             # Submit all training jobs (pool limits concurrency to training_jobs)
             print(f"  🚀 Starting {len(experiments)} training jobs (max {training_jobs} concurrent)...", flush=True)
@@ -542,7 +554,7 @@ class AlphaZeroSweep:
         else:
             # Sequential Mode: Training first, then tournaments
             # Phase 1: Parallel Training
-            with ProcessPoolExecutor(max_workers=training_jobs) as executor:
+            with ThreadPoolExecutor(max_workers=training_jobs) as executor:
                 print(f"  🚀 Starting {len(experiments)} training jobs...", flush=True)
                 training_futures = {}
                 for i, exp in enumerate(experiments, 1):
@@ -600,7 +612,7 @@ class AlphaZeroSweep:
             print(f"\n🏆 [PHASE 2] Parallel Tournaments ({self.tournament_jobs} jobs)")
             successful_training = [exp for exp in experiments if training_results.get(exp.name, (False,))[0]]
 
-            with ProcessPoolExecutor(max_workers=self.tournament_jobs) as tournament_executor:
+            with ThreadPoolExecutor(max_workers=self.tournament_jobs) as tournament_executor:
                 tournament_futures = {}
                 running_tournaments = {}
                 for exp in successful_training:
@@ -696,36 +708,40 @@ class AlphaZeroSweep:
             print(f"\n🏆 TOP PERFORMERS")
 
             # Try to extract numeric values for analysis, handling non-numeric formats
-            def extract_win_rate(match_result):
+            def extract_score(match_result):
                 try:
-                    if 'W' in match_result:
+                    text = str(match_result).strip()
+                    pct_match = re.search(r'([0-9]+(?:\.[0-9]+)?)%', text)
+                    if pct_match:
+                        return float(pct_match.group(1))
+                    if text.endswith('%'):
+                        return float(text[:-1])
+                    if 'W' in text:
                         # Format like "5W-0D-0L"
-                        wins = int(match_result.split('W')[0])
-                        return wins
-                    elif '-' in match_result:
-                        # Format like "5-0-0"
-                        wins = int(match_result.split('-')[0])
-                        return wins
-                    else:
-                        return 0
+                        return float(int(text.split('W')[0]))
+                    if '-' in text:
+                        # Format like "5-0-0" or "5-0-0 (50.0%)"
+                        wins = int(text.split('(')[0].split('-')[0].strip())
+                        return float(wins)
+                    return float(text)
                 except:
-                    return 0
+                    return 0.0
 
             if not successful_experiments.empty:
                 successful_experiments = successful_experiments.copy()
-                successful_experiments['Random_Wins'] = successful_experiments['vs_Random'].apply(extract_win_rate)
-                successful_experiments['Deep_Wins'] = successful_experiments['vs_Deep'].apply(extract_win_rate)
-                successful_experiments['Medium_Wins'] = successful_experiments['vs_Medium'].apply(extract_win_rate)
-                successful_experiments['Total_Wins'] = (
-                    successful_experiments['Random_Wins'] +
-                    successful_experiments['Deep_Wins'] +
-                    successful_experiments['Medium_Wins']
+                successful_experiments['Random_Score'] = successful_experiments['vs_Random'].apply(extract_score)
+                successful_experiments['Deep_Score'] = successful_experiments['vs_Deep'].apply(extract_score)
+                successful_experiments['Medium_Score'] = successful_experiments['vs_Medium'].apply(extract_score)
+                successful_experiments['Total_Score'] = (
+                    successful_experiments['Random_Score'] +
+                    successful_experiments['Deep_Score'] +
+                    successful_experiments['Medium_Score']
                 )
 
-                # Top 5 by total wins
-                top_performers = successful_experiments.nlargest(5, 'Total_Wins')
+                # Top 5 by combined score across opponents
+                top_performers = successful_experiments.nlargest(5, 'Total_Score')
                 for idx, row in top_performers.iterrows():
-                    print(f"   {row['Experiment']}: {row['Total_Wins']} total wins "
+                    print(f"   {row['Experiment']}: {row['Total_Score']:.1f} total score "
                           f"(R:{row['vs_Random']}, D:{row['vs_Deep']}, M:{row['vs_Medium']})")
 
         # Display full results table
@@ -763,6 +779,8 @@ class SweepConfig:
 
     # Advanced parameters (optional)
     temperature: List[float] = None
+    temperature_cutoff_moves: List[int] = None
+    dirichlet_alpha: List[float] = None
     cpuct: List[float] = None
 
     def __post_init__(self):
@@ -841,6 +859,8 @@ PARAM_TABLE = [
     ("mcts_simulations","mcts",          "--mcts-simulations",   "mcts", "MCTS simulations",    "int"),
     ("net_type",        "net_type",      "--net-type",           "net",  "Network type",        "str"),
     ("temperature",     "temperature",   "--temperature",        "temp", "Temperature",         "float"),
+    ("temperature_cutoff_moves", "temperature_cutoff_moves", "--temperature-cutoff-moves", "tcut", "Temp cutoff moves", "int"),
+    ("dirichlet_alpha", "dirichlet_alpha", "--dirichlet-alpha", "dalpha", "Dirichlet alpha", "float"),
     ("cpuct",           "cpuct",         "--cpuct",              "cpuct","CPUCT",               "float"),
 ]
 
@@ -855,15 +875,23 @@ def query_binary_defaults() -> Dict[str, str]:
     """Parse parameter defaults from train_alphazero --help output.
     Returns dict mapping long flag name (e.g. 'iterations') to default value string."""
     try:
+        train_binary = os.environ.get("TRAIN_ALPHAZERO_BINARY", "./target/release/train_alphazero")
         result = subprocess.run(
-            ["./target/release/train_alphazero", "--help"],
+            [train_binary, "--help"],
             capture_output=True, text=True, timeout=5
         )
+        if result.returncode != 0:
+            return {}
         defaults = {}
+        current_flag = None
         for line in result.stdout.splitlines():
-            m = re.search(r'--(\S+).*\[default:\s*([^\]]+)\]', line)
-            if m:
-                defaults[m.group(1)] = m.group(2).strip()
+            flag_match = re.search(r'--([a-zA-Z0-9-]+)\b', line)
+            if flag_match:
+                current_flag = flag_match.group(1)
+
+            default_match = re.search(r'\[default:\s*([^\]]+)\]', line)
+            if current_flag and default_match:
+                defaults[current_flag] = default_match.group(1).strip()
         return defaults
     except Exception:
         return {}
@@ -889,7 +917,8 @@ Examples:
   python parallel_sweep.py --net-type cnn,transformer -i 20 --learning-rate 0.01,0.05
 
   # Advanced parameters
-  python parallel_sweep.py --temperature 0.8,1.0,1.2 --cpuct 1.0,1.5,2.0
+  python parallel_sweep.py --temperature 1.0,1.25 --temperature-cutoff-moves 1,2,3,4
+  python parallel_sweep.py --dirichlet-alpha 0.1,0.3,0.7
 
   Unspecified parameters use the binary's own defaults (queried at startup).
         """
@@ -910,6 +939,8 @@ Examples:
     # Advanced parameter group
     advanced_group = parser.add_argument_group('advanced hyperparameters')
     advanced_group.add_argument('--temperature', '-t', help='MCTS temperature')
+    advanced_group.add_argument('--temperature-cutoff-moves', help='Opening moves using high temperature before switching to temp=0')
+    advanced_group.add_argument('--dirichlet-alpha', help='Dirichlet alpha for root noise during self-play')
     advanced_group.add_argument('--cpuct', '-c', help='MCTS CPUCT exploration parameter')
 
     # Execution control

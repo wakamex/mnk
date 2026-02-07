@@ -37,7 +37,7 @@ fn check_winner_internal(board: &[Option<u8>]) -> Option<u8> {
 // Proper AlphaZero MCTS with tree search
 // ============================================================
 
-const C_PUCT: f32 = 1.5;
+const DEFAULT_C_PUCT: f32 = 1.5;
 const DIRICHLET_ALPHA: f64 = 0.3;
 const DIRICHLET_EPSILON: f32 = 0.25;
 
@@ -77,7 +77,7 @@ impl MctsNode {
 }
 
 /// Select the best action from a node using the PUCT formula.
-fn select_action_puct(node: &MctsNode, board: &[Option<u8>]) -> usize {
+fn select_action_puct(node: &MctsNode, board: &[Option<u8>], c_puct: f32) -> usize {
     let sqrt_parent = (node.visit_count as f32).sqrt();
     let mut best_action = 0;
     let mut best_score = f32::NEG_INFINITY;
@@ -95,7 +95,7 @@ fn select_action_puct(node: &MctsNode, board: &[Option<u8>]) -> usize {
             }
         };
 
-        let exploration = C_PUCT * prior * sqrt_parent / (1.0 + child_visits as f32);
+        let exploration = c_puct * prior * sqrt_parent / (1.0 + child_visits as f32);
         let score = q + exploration;
 
         if score > best_score {
@@ -152,7 +152,7 @@ fn expand_node_with_policy(
 }
 
 /// Add Dirichlet noise to root priors for exploration.
-fn add_dirichlet_noise(node: &mut MctsNode) {
+fn add_dirichlet_noise(node: &mut MctsNode, dirichlet_alpha: f64) {
     // Sample Dirichlet noise using Gamma distribution
     let mut rng = rand::thread_rng();
     let mut noise = Vec::new();
@@ -166,7 +166,7 @@ fn add_dirichlet_noise(node: &mut MctsNode) {
     for child in &node.children {
         if child.is_some() {
             // Gamma(alpha, 1) samples — Dirichlet is normalized Gamma
-            let sample = gamma_sample(&mut rng, DIRICHLET_ALPHA);
+            let sample = gamma_sample(&mut rng, dirichlet_alpha);
             noise.push(sample);
             noise_sum += sample;
         } else {
@@ -294,6 +294,16 @@ fn sample_with_temperature(visit_counts: &[f32], temperature: f32) -> usize {
     *nonzero.last().unwrap()
 }
 
+/// AlphaZero-style temperature schedule:
+/// use high temperature for opening moves, then switch to deterministic play.
+fn scheduled_temperature(base_temperature: f32, move_number: usize, temperature_cutoff_moves: usize) -> f32 {
+    if move_number < temperature_cutoff_moves {
+        base_temperature
+    } else {
+        0.0
+    }
+}
+
 /// Run MCTS search from a position and return the visit-count policy.
 ///
 /// This is proper AlphaZero MCTS with:
@@ -301,11 +311,14 @@ fn sample_with_temperature(visit_counts: &[f32], temperature: f32) -> usize {
 /// - Neural network expansion
 /// - Dirichlet noise at root
 /// - Value backpropagation through the tree
-pub fn mcts_search<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
+fn mcts_search_configured<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
     net: &N,
     board: &[Option<u8>],
     player: u8,
     simulations: usize,
+    root_noise: bool,
+    c_puct: f32,
+    dirichlet_alpha: f64,
 ) -> Vec<f32> {
     let legal_moves: Vec<usize> = board.iter()
         .enumerate()
@@ -328,8 +341,10 @@ pub fn mcts_search<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
     let _root_value = expand_node(&mut root, net, board, player);
     root.visit_count = 1; // Virtual visit for root
 
-    // Add Dirichlet noise to root for exploration
-    add_dirichlet_noise(&mut root);
+    // Add Dirichlet noise to root for exploration during self-play.
+    if root_noise {
+        add_dirichlet_noise(&mut root, dirichlet_alpha);
+    }
 
     // Run simulations
     for _ in 0..simulations {
@@ -375,7 +390,7 @@ pub fn mcts_search<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
             }
 
             // Node is expanded — select action with PUCT
-            let action = select_action_puct(node, &current_board);
+            let action = select_action_puct(node, &current_board, c_puct);
             path.push((node_ptr, action));
 
             // Make the move
@@ -446,11 +461,42 @@ pub fn mcts_search<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
     visit_counts
 }
 
+pub fn mcts_search_with_options<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
+    net: &N,
+    board: &[Option<u8>],
+    player: u8,
+    simulations: usize,
+    root_noise: bool,
+) -> Vec<f32> {
+    mcts_search_configured(
+        net,
+        board,
+        player,
+        simulations,
+        root_noise,
+        DEFAULT_C_PUCT,
+        DIRICHLET_ALPHA,
+    )
+}
+
+/// Default AlphaZero search behavior used in self-play: root noise enabled.
+pub fn mcts_search<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
+    net: &N,
+    board: &[Option<u8>],
+    player: u8,
+    simulations: usize,
+) -> Vec<f32> {
+    mcts_search_with_options(net, board, player, simulations, true)
+}
+
 /// Play a complete self-play game using proper MCTS and return training examples.
 pub fn self_play_game_mcts<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
     net: &N,
     simulations: usize,
     temperature: f32,
+    temperature_cutoff_moves: usize,
+    c_puct: f32,
+    dirichlet_alpha: f64,
 ) -> Vec<TrainingExample> {
     let mut board = vec![None; 9];
     let mut player = 0u8;
@@ -472,7 +518,15 @@ pub fn self_play_game_mcts<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
         }
 
         // Run MCTS to get policy
-        let policy = mcts_search(net, &board, player, simulations);
+        let policy = mcts_search_configured(
+            net,
+            &board,
+            player,
+            simulations,
+            true,
+            c_puct,
+            dirichlet_alpha,
+        );
 
         // Store training example (value filled in later)
         examples.push(TrainingExample {
@@ -483,7 +537,10 @@ pub fn self_play_game_mcts<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
         });
 
         // Select move using temperature-scaled visit counts
-        let selected = sample_with_temperature(&policy, temperature);
+        let selected = sample_with_temperature(
+            &policy,
+            scheduled_temperature(temperature, move_number, temperature_cutoff_moves),
+        );
 
         board[selected] = Some(player);
         player = 1 - player;
@@ -509,11 +566,21 @@ pub fn generate_training_data<B: Backend<FloatElem = f32>, N: NetworkInference<B
     num_games: usize,
     simulations: usize,
     temperature: f32,
+    temperature_cutoff_moves: usize,
+    c_puct: f32,
+    dirichlet_alpha: f64,
 ) -> Vec<Vec<TrainingExample>> {
     let mut all_games = Vec::with_capacity(num_games);
 
     for _ in 0..num_games {
-        let examples = self_play_game_mcts(net, simulations, temperature);
+        let examples = self_play_game_mcts(
+            net,
+            simulations,
+            temperature,
+            temperature_cutoff_moves,
+            c_puct,
+            dirichlet_alpha,
+        );
         all_games.push(examples);
     }
 
@@ -595,6 +662,9 @@ pub fn generate_training_data_batched<B: Backend<FloatElem = f32>, N: NetworkInf
     num_games: usize,
     simulations: usize,
     temperature: f32,
+    temperature_cutoff_moves: usize,
+    c_puct: f32,
+    dirichlet_alpha: f64,
     batch_size: usize,
 ) -> Vec<Vec<TrainingExample>> {
     let mut games: Vec<GameInProgress> = (0..num_games)
@@ -624,7 +694,7 @@ pub fn generate_training_data_batched<B: Backend<FloatElem = f32>, N: NetworkInf
             // If this game has completed all simulations for the current position,
             // extract policy, make a move, and prepare next position
             if game.sim_count >= simulations && !game.root_needs_expansion {
-                handle_move_selection(game, temperature);
+                handle_move_selection(game, temperature, temperature_cutoff_moves);
                 if game.completed {
                     continue;
                 }
@@ -658,7 +728,13 @@ pub fn generate_training_data_batched<B: Backend<FloatElem = f32>, N: NetworkInf
                 });
             } else {
                 // Normal simulation: select down to a leaf
-                if let Some(leaf) = run_simulation_to_leaf(game_idx, root, &game.board, game.player) {
+                if let Some(leaf) = run_simulation_to_leaf(
+                    game_idx,
+                    root,
+                    &game.board,
+                    game.player,
+                    c_puct,
+                ) {
                     pending.push(leaf);
                 } else {
                     // Simulation hit a terminal node (no leaf to expand) — count it
@@ -668,13 +744,13 @@ pub fn generate_training_data_batched<B: Backend<FloatElem = f32>, N: NetworkInf
 
             // Flush batch if full
             if pending.len() >= batch_size {
-                flush_pending_batch(net, &mut games, &mut pending);
+                flush_pending_batch(net, &mut games, &mut pending, dirichlet_alpha);
             }
         }
 
         // Flush any remaining pending leaves
         if !pending.is_empty() {
-            flush_pending_batch(net, &mut games, &mut pending);
+            flush_pending_batch(net, &mut games, &mut pending, dirichlet_alpha);
         }
     }
 
@@ -690,6 +766,7 @@ fn run_simulation_to_leaf(
     root: &mut MctsNode,
     board: &[Option<u8>],
     player: u8,
+    c_puct: f32,
 ) -> Option<PendingLeaf> {
     let mut path: Vec<(*mut MctsNode, usize)> = Vec::new();
     let mut current_board = board.to_vec();
@@ -718,7 +795,7 @@ fn run_simulation_to_leaf(
         }
 
         // Node is expanded — select action with PUCT
-        let action = select_action_puct(node, &current_board);
+        let action = select_action_puct(node, &current_board, c_puct);
         path.push((node_ptr, action));
 
         // Make the move
@@ -769,6 +846,7 @@ fn flush_pending_batch<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
     net: &N,
     games: &mut [GameInProgress],
     pending: &mut Vec<PendingLeaf>,
+    dirichlet_alpha: f64,
 ) {
     if pending.is_empty() {
         return;
@@ -808,7 +886,7 @@ fn flush_pending_batch<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
         if leaf.is_root_expansion {
             // Root was just expanded — add Dirichlet noise and set virtual visit
             leaf_node.visit_count = 1;
-            add_dirichlet_noise(leaf_node);
+            add_dirichlet_noise(leaf_node, dirichlet_alpha);
             games[leaf.game_idx].root_needs_expansion = false;
         } else {
             // Normal simulation completed
@@ -819,7 +897,7 @@ fn flush_pending_batch<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
 
 /// After all simulations for a position are done, extract policy, select move,
 /// store training example, and advance the game.
-fn handle_move_selection(game: &mut GameInProgress, temperature: f32) {
+fn handle_move_selection(game: &mut GameInProgress, temperature: f32, temperature_cutoff_moves: usize) {
     let root = game.root.as_ref().unwrap();
 
     // Extract visit counts from root children
@@ -846,13 +924,11 @@ fn handle_move_selection(game: &mut GameInProgress, temperature: f32) {
         value: 0.0,
     });
 
-    // Select move
-    let legal_moves: Vec<usize> = game.board.iter()
-        .enumerate()
-        .filter_map(|(i, &c)| if c.is_none() { Some(i) } else { None })
-        .collect();
-
-    let selected = sample_with_temperature(&visit_counts, temperature);
+    // Select move with AlphaZero-style opening temperature schedule.
+    let selected = sample_with_temperature(
+        &visit_counts,
+        scheduled_temperature(temperature, game.move_number, temperature_cutoff_moves),
+    );
 
     // Make the move
     game.board[selected] = Some(game.player);

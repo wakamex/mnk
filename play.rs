@@ -827,7 +827,13 @@ impl Strategy for AlphaZeroStrategy {
         let (raw_value, raw_policy) = self.net.forward_inference(&alphazero_board, current_player);
 
         // Run MCTS
-        let policy = mnk::unified_mcts::mcts_search(&self.net, &alphazero_board, current_player, self.simulations);
+        let policy = mnk::unified_mcts::mcts_search_with_options(
+            &self.net,
+            &alphazero_board,
+            current_player,
+            self.simulations,
+            false,
+        );
 
         // Convert policy to move by finding the best legal move
         let valid_moves = generate_valid_moves(state, config);
@@ -1102,7 +1108,13 @@ pub fn play_interleaved_tournament(
             // Use unified MCTS with batching for all positions
             let policies: Vec<Vec<f32>> = boards.iter().zip(players.iter())
                 .map(|(board, &player)| {
-                    mnk::unified_mcts::mcts_search(&net, board, player, mcts_simulations)
+                    mnk::unified_mcts::mcts_search_with_options(
+                        &net,
+                        board,
+                        player,
+                        mcts_simulations,
+                        false,
+                    )
                 })
                 .collect();
 
