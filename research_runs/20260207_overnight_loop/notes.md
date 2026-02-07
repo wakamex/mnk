@@ -62,3 +62,9 @@ Strict-load fixed-suite mode now prevents this silent failure mode.
 ## Partial training attempt (aborted)
 - Run dir: `research_runs/20260207_overnight_loop/exp01_i30_g1000_lr0_005_mcts25_cpuct0_75`
 - Reason: per-iteration training cost on current CPU path was too high for efficient iteration in this session.
+
+## Verified target hit (strict fixed-suite)
+- `vs_Deep=53.0%`
+- `vs_Medium=57.0%`
+- `vs_Random=90.0%`
+- Source log: `research_runs/20260207_overnight_loop/best_fixed_suite_endgame8.log`
