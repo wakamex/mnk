@@ -8,11 +8,11 @@ use burn::prelude::*;
 use burn::tensor::activation;
 use burn::tensor::backend::AutodiffBackend;
 use clap::Parser;
-use mnk::alphazero::evaluate_vs_random;
 use mnk::fixed_suite_eval::{evaluate_fixed_suite_inprocess, FixedSuiteConfig, FixedSuiteEvaluation};
 use mnk::network::{Network, NetworkType};
 use mnk::unified_mcts::NetworkInference;
 use mnk::unified_mcts::TrainingExample;
+use rand::Rng;
 use std::collections::HashMap;
 
 /// Query GPU VRAM usage via nvidia-smi. Returns (used_mb, total_mb) or None.
@@ -47,36 +47,6 @@ use burn_ndarray::{NdArray, NdArrayDevice};
 #[cfg(not(feature = "cuda"))]
 type MyBackend = Autodiff<NdArray>;
 
-// Symmetry augmentation for 8x data efficiency
-fn apply_symmetry_augmentation(examples: &[TrainingExample]) -> Vec<TrainingExample> {
-    let mut augmented = Vec::with_capacity(examples.len() * 8);
-
-    for example in examples {
-        // Add all 8 symmetric versions of this example
-        augmented.extend(get_all_symmetries(example));
-    }
-
-    augmented
-}
-
-fn get_all_symmetries(example: &TrainingExample) -> Vec<TrainingExample> {
-    let transforms = [
-        Transform::Identity,
-        Transform::Rotate90,
-        Transform::Rotate180,
-        Transform::Rotate270,
-        Transform::FlipHorizontal,
-        Transform::FlipVertical,
-        Transform::FlipDiag1,
-        Transform::FlipDiag2,
-    ];
-
-    transforms
-        .iter()
-        .map(|&transform| apply_transform(example, transform))
-        .collect()
-}
-
 #[derive(Clone, Copy)]
 enum Transform {
     Identity,
@@ -89,6 +59,17 @@ enum Transform {
     FlipDiag2,
 }
 
+const ALL_TRANSFORMS: [Transform; 8] = [
+    Transform::Identity,
+    Transform::Rotate90,
+    Transform::Rotate180,
+    Transform::Rotate270,
+    Transform::FlipHorizontal,
+    Transform::FlipVertical,
+    Transform::FlipDiag1,
+    Transform::FlipDiag2,
+];
+
 fn apply_transform(example: &TrainingExample, transform: Transform) -> TrainingExample {
     let board_width = board_width_from_len(example.board.len());
     TrainingExample {
@@ -97,6 +78,14 @@ fn apply_transform(example: &TrainingExample, transform: Transform) -> TrainingE
         policy: transform_policy(&example.policy, board_width, transform),
         value: example.value,
     }
+}
+
+fn random_transform<R: Rng + ?Sized>(rng: &mut R) -> Transform {
+    ALL_TRANSFORMS[rng.gen_range(0..ALL_TRANSFORMS.len())]
+}
+
+fn apply_random_transform<R: Rng + ?Sized>(example: &TrainingExample, rng: &mut R) -> TrainingExample {
+    apply_transform(example, random_transform(rng))
 }
 
 fn board_width_from_len(len: usize) -> usize {
@@ -248,7 +237,7 @@ impl ReplayBuffer {
                         policy,
                         value: acc.sum_value / count_f,
                     },
-                    weight: count_f,
+                    weight: count_f.sqrt(),
                 }
             })
             .collect()
@@ -295,21 +284,10 @@ fn board_player_key(board: &[Option<u8>], player: u8) -> Vec<u8> {
 }
 
 fn canonicalize_example(example: &TrainingExample) -> TrainingExample {
-    let transforms = [
-        Transform::Identity,
-        Transform::Rotate90,
-        Transform::Rotate180,
-        Transform::Rotate270,
-        Transform::FlipHorizontal,
-        Transform::FlipVertical,
-        Transform::FlipDiag1,
-        Transform::FlipDiag2,
-    ];
-
     let mut best_key: Option<Vec<u8>> = None;
     let mut best_example: Option<TrainingExample> = None;
 
-    for transform in transforms {
+    for transform in ALL_TRANSFORMS {
         let candidate = apply_transform(example, transform);
         let key = board_player_key(&candidate.board, candidate.player);
         if best_key.as_ref().map_or(true, |k| key < *k) {
@@ -369,7 +347,7 @@ struct Args {
     epochs: usize,
 
     /// Batch size for training
-    #[arg(short, long, default_value = "1024")]
+    #[arg(short, long, default_value = "256")]
     batch_size: usize,
 
     /// Learning rate for optimizer (SGD default: 0.02)
@@ -416,7 +394,7 @@ struct Args {
     #[arg(long)]
     csv_log: Option<String>,
 
-    /// Replay buffer capacity (weighted unique samples after symmetry-aug dedup)
+    /// Replay buffer capacity (canonical unique positions)
     #[arg(long, default_value = "20000")]
     replay_buffer_size: usize,
 
@@ -594,21 +572,12 @@ fn main() {
             args.mcts_simulations
         );
 
-        let original_count = iter_examples.len();
-
-        // Apply 8x symmetry augmentation, then let replay buffer merge canonical duplicates globally.
-        let augmented_examples = apply_symmetry_augmentation(&iter_examples);
-        let insert_stats = replay_buffer.push(&augmented_examples);
+        let iter_example_count = iter_examples.len();
+        let insert_stats = replay_buffer.push(&iter_examples);
         let replay_unique_count = replay_buffer.len();
         let replay_total_weight = replay_buffer.total_weight();
 
-        println!(
-            "Iteration {}: {} → {} examples ({}x symmetry)",
-            iteration,
-            original_count,
-            augmented_examples.len(),
-            augmented_examples.len() as f32 / original_count as f32
-        );
+        println!("Iteration {}: {} examples", iteration, iter_example_count);
         println!(
             "  Replay ingest: merged={}, new_unique={}, evicted={}",
             insert_stats.merged_existing, insert_stats.added_unique, insert_stats.evicted
@@ -640,7 +609,8 @@ fn main() {
 
         for epoch in 0..epochs {
             use rand::seq::SliceRandom;
-            replay_examples.shuffle(&mut rand::thread_rng());
+            let mut rng = rand::thread_rng();
+            replay_examples.shuffle(&mut rng);
 
             let mut epoch_value_loss = 0.0f32;
             let mut epoch_policy_loss = 0.0f32;
@@ -660,7 +630,7 @@ fn main() {
                 let mut sample_weights: Vec<f32> = Vec::new();
 
                 for weighted in batch {
-                    let ex = &weighted.example;
+                    let ex = apply_random_transform(&weighted.example, &mut rng);
                     assert_eq!(
                         ex.board.len(),
                         board_size,
@@ -777,21 +747,12 @@ fn main() {
 
         // Evaluate every iteration and report timing.
         let net_valid = net.valid();
-        let vs_random_eval_start = std::time::Instant::now();
-        let win_rate =
-            evaluate_vs_random::<<MyBackend as AutodiffBackend>::InnerBackend, _>(&net_valid);
-        let vs_random_eval_s = vs_random_eval_start.elapsed().as_secs_f32();
-        println!(
-            "  vs Random: {:.1}% (eval {:.2}s)",
-            win_rate * 100.0,
-            vs_random_eval_s
-        );
-        let vs_random = Some(win_rate);
         let fixed_suite_eval = run_lightweight_fixed_suite_eval::<
             <MyBackend as AutodiffBackend>::InnerBackend,
             _,
         >(&net_valid, &args, iteration);
         let fixed_suite_metrics = fixed_suite_eval.map(|eval| eval.metrics());
+        let vs_random = fixed_suite_metrics.map(|m| m.vs_random / 100.0);
         if let Some(eval) = fixed_suite_eval {
             let metrics = eval.metrics();
             println!(
