@@ -11,6 +11,10 @@ path = "play.rs"
 name = "train_alphazero"
 path = "src/train_alphazero_unified.rs"
 
+[[bin]]
+name = "analyze_duplicates"
+path = "src/analyze_duplicates.rs"
+
 [lib]
 name = "mnk"
 path = "src/lib.rs"
