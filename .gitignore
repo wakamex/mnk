@@ -46,3 +46,21 @@ __pycache__/
 *.pyc
 memory_log.csv
 tournament_test.log
+
+# Research run generated artifacts (keep curated notes/summaries, ignore volatile run outputs)
+research_runs/fixed_suite_latest.csv
+research_runs/**/codex_exec.log
+research_runs/**/run_state.json
+research_runs/**/codex_prompt.md
+research_runs/**/runner_settings.md
+research_runs/**/train.cmd
+research_runs/**/train.log
+research_runs/**/training_log.csv
+research_runs/**/eval_*.cmd
+research_runs/**/eval_*.log
+research_runs/**/eval_*.csv
+research_runs/**/best_*.cmd
+research_runs/**/best_*.log
+research_runs/**/best_*.csv
+research_runs/**/notes.md
+agent_logs/

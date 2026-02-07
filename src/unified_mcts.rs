@@ -468,7 +468,7 @@ pub fn mcts_search_with_options<B: Backend<FloatElem = f32>, N: NetworkInference
     simulations: usize,
     root_noise: bool,
 ) -> Vec<f32> {
-    mcts_search_configured(
+    mcts_search_with_hyperparams(
         net,
         board,
         player,
@@ -476,6 +476,26 @@ pub fn mcts_search_with_options<B: Backend<FloatElem = f32>, N: NetworkInference
         root_noise,
         DEFAULT_C_PUCT,
         DIRICHLET_ALPHA,
+    )
+}
+
+pub fn mcts_search_with_hyperparams<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
+    net: &N,
+    board: &[Option<u8>],
+    player: u8,
+    simulations: usize,
+    root_noise: bool,
+    c_puct: f32,
+    dirichlet_alpha: f64,
+) -> Vec<f32> {
+    mcts_search_configured(
+        net,
+        board,
+        player,
+        simulations,
+        root_noise,
+        c_puct,
+        dirichlet_alpha,
     )
 }
 

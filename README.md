@@ -19,6 +19,12 @@ Requires the `cuda-dev` podman container (host GCC is too new for CUDA):
 bash build.sh
 ```
 
+### Host vs Container (quick note)
+
+- **Build**: use `bash build.sh` (runs inside `cuda-dev` via `podman exec`).
+- **Run eval/tournament**: run on host with `./target/release/mnk_game ...` (no container required).
+- **Run training**: host or `cuda-dev` both work; host requires a working NVIDIA driver/CUDA runtime setup.
+
 ## Training
 
 ```bash

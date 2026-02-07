@@ -9,6 +9,18 @@ Old roadmap/planning notes were removed to keep this document current.
 - Latest completed CNN summary: `sweep_results/cnn_lr_mcts_20260206_125932.csv`
 - Curve analysis tool: `analyze_sweep.py`
 
+## Overnight harness run (2026-02-07)
+
+Run outputs live under local `research_runs/` and are not committed.
+
+Key additions in code:
+- Fixed deterministic evaluation suite mode in `mnk_game` (25 openings x 2 sides, eval sims=100, root noise off, CSV output).
+- Strict model-load behavior in fixed-suite mode (fail fast instead of silently evaluating with an untrained fallback model).
+- Exposed MCTS eval-time hyperparameter path via `mcts_search_with_hyperparams`.
+
+Critical finding:
+- Many legacy checkpoints are not loadable with the current recorder path (`Utf8` record error). Earlier sweeps that allowed fallback-to-untrained were partly invalid for model ranking.
+
 ## Current defaults (as of 2026-02-07)
 
 - `--learning-rate`: `0.02`

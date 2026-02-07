@@ -5,8 +5,12 @@ use clap::Parser;
 
 // Import the actual AlphaZero implementation from the shared library
 use mnk::network::{Network, NetworkType};
-use mnk::inference_backend::{InferenceBackend, InferenceDevice};
+use mnk::inference_backend::InferenceBackend;
+#[cfg(feature = "cuda")]
+use mnk::inference_backend::InferenceDevice;
 use burn::prelude::*;
+
+mod fixed_suite;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TrainingLevel {
@@ -29,6 +33,38 @@ struct Args {
     /// Number of games per tournament matchup
     #[arg(long, default_value = "10")]
     tournament_games: usize,
+
+    /// Run deterministic fixed-opening evaluation suite and exit
+    #[arg(long, default_value_t = false)]
+    fixed_suite_eval: bool,
+
+    /// Number of opening states used in fixed-suite evaluation
+    #[arg(long, default_value_t = 25)]
+    fixed_suite_openings: usize,
+
+    /// Number of sides played per opening state (2 evaluates both sides)
+    #[arg(long, default_value_t = 2)]
+    fixed_suite_sides: usize,
+
+    /// AlphaZero MCTS simulations per move during fixed-suite evaluation
+    #[arg(long, default_value_t = 100)]
+    fixed_suite_sims: usize,
+
+    /// AlphaZero PUCT constant during fixed-suite evaluation
+    #[arg(long, default_value_t = 0.75)]
+    fixed_suite_cpuct: f32,
+
+    /// Maximum opening plies used when constructing deterministic opening states
+    #[arg(long, default_value_t = 4)]
+    fixed_suite_max_plies: usize,
+
+    /// Seed for deterministic random baseline in fixed-suite evaluation
+    #[arg(long, default_value_t = 20260207u64)]
+    fixed_suite_seed: u64,
+
+    /// CSV output path for per-game fixed-suite results
+    #[arg(long, default_value = "research_runs/fixed_suite_latest.csv")]
+    fixed_suite_csv: Option<String>,
 }
 
 /// Infer network type from model filename
@@ -58,6 +94,39 @@ pub enum Winner {
     Player1,
     Draw,
     None,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GameOutcome {
+    Player0Win,
+    Player1Win,
+    Draw,
+}
+
+impl GameOutcome {
+    pub(crate) fn from_winner(winner: Winner) -> Self {
+        match winner {
+            Winner::Player0 => Self::Player0Win,
+            Winner::Player1 => Self::Player1Win,
+            Winner::Draw | Winner::None => Self::Draw,
+        }
+    }
+
+    pub(crate) fn swapped(self) -> Self {
+        match self {
+            Self::Player0Win => Self::Player1Win,
+            Self::Player1Win => Self::Player0Win,
+            Self::Draw => Self::Draw,
+        }
+    }
+
+    pub(crate) fn winner_label(self) -> &'static str {
+        match self {
+            Self::Player0Win => "Player0",
+            Self::Player1Win => "Player1",
+            Self::Draw => "Draw",
+        }
+    }
 }
 
 impl Cell {
@@ -727,24 +796,52 @@ impl Strategy for RandomStrategy {
 pub struct AlphaZeroStrategy {
     net: Network<InferenceBackend>,  // Use Network enum to support both CNN and Transformer
     simulations: usize,
+    cpuct: f32,
     name: String,
     training_level: TrainingLevel,
 }
 
 impl AlphaZeroStrategy {
-    pub fn new(simulations: usize) -> Self {
+    pub fn new(simulations: usize) -> Result<Self, String> {
         Self::new_with_training_level(simulations, TrainingLevel::Trained, "alphazero_model")
     }
 
     pub fn new_untrained(simulations: usize) -> Self {
         Self::new_with_training_level(simulations, TrainingLevel::Untrained, "alphazero_model")
+            .expect("untrained constructor should not fail")
     }
 
-    pub fn new_with_model_path(simulations: usize, model_path: &str) -> Self {
+    pub fn new_with_model_path(simulations: usize, model_path: &str) -> Result<Self, String> {
         Self::new_with_training_level(simulations, TrainingLevel::Trained, model_path)
     }
 
-    fn new_with_training_level(simulations: usize, training: TrainingLevel, model_path: &str) -> Self {
+    pub fn new_with_model_path_and_cpuct(
+        simulations: usize,
+        model_path: &str,
+        cpuct: f32,
+    ) -> Result<Self, String> {
+        Self::new_with_training_level_config(
+            simulations,
+            TrainingLevel::Trained,
+            model_path,
+            cpuct,
+        )
+    }
+
+    fn new_with_training_level(
+        simulations: usize,
+        training: TrainingLevel,
+        model_path: &str,
+    ) -> Result<Self, String> {
+        Self::new_with_training_level_config(simulations, training, model_path, 0.75)
+    }
+
+    fn new_with_training_level_config(
+        simulations: usize,
+        training: TrainingLevel,
+        model_path: &str,
+        cpuct: f32,
+    ) -> Result<Self, String> {
         // Load trained network or create new one based on training level
         let net = match training {
             TrainingLevel::Trained => {
@@ -764,11 +861,10 @@ impl AlphaZeroStrategy {
                         println!("Loaded trained {:?} model from '{}'", net_type, model_path);
                         trained_net
                     }
-                    Err(e) => {
-                        println!("Failed to load trained model: {:?}", e);
-                        println!("   Using untrained network instead");
-                        Network::<InferenceBackend>::new(net_type, &device, 3)
-                    }
+                    Err(e) => return Err(format!(
+                        "Failed to load trained model '{}': {:?}",
+                        model_path, e
+                    )),
                 }
             }
             TrainingLevel::Untrained => {
@@ -784,12 +880,13 @@ impl AlphaZeroStrategy {
             }
         };
 
-        Self {
+        Ok(Self {
             net,
             simulations,
+            cpuct,
             name: format!("AlphaZero-{}{}", simulations, if matches!(training, TrainingLevel::Trained) { "-Trained" } else { "" }),
             training_level: training,
-        }
+        })
     }
 
     // Convert tournament GameState to AlphaZero board representation
@@ -827,12 +924,14 @@ impl Strategy for AlphaZeroStrategy {
         let (raw_value, raw_policy) = self.net.forward_inference(&alphazero_board, current_player);
 
         // Run MCTS
-        let policy = mnk::unified_mcts::mcts_search_with_options(
+        let policy = mnk::unified_mcts::mcts_search_with_hyperparams(
             &self.net,
             &alphazero_board,
             current_player,
             self.simulations,
             false,
+            self.cpuct,
+            0.1,
         );
 
         // Convert policy to move by finding the best legal move
@@ -904,34 +1003,96 @@ pub fn play_single_game(
     strategies: [Box<dyn Strategy>; 2],
     verbose: bool,
 ) -> Result<GameState, String> {
-    let mut state = GameState::new(config);
+    let strategy_refs = [strategies[0].as_ref(), strategies[1].as_ref()];
+    run_game_from_state(
+        config,
+        GameState::new(config),
+        strategy_refs,
+        verbose,
+        true,
+    )
+}
+
+fn run_game_from_state(
+    config: &GameConfig,
+    mut state: GameState,
+    strategies: [&dyn Strategy; 2],
+    verbose: bool,
+    print_final_state: bool,
+) -> Result<GameState, String> {
     let mut move_count = 0;
     let max_moves = config.board_width * config.board_height;
-    
+
     while !state.is_terminal && move_count < max_moves {
         if verbose {
             println!("\n--- Move {} (Player {}) ---", move_count + 1, state.current_player);
             print_game_state(&state, None);
         }
-        
-        // Get move from current player's strategy
-        let strategy_index = state.current_player.to_player_id().unwrap() as usize;
+
+        let strategy_index = state.current_player.to_player_id().unwrap_or(0) as usize;
         let move_index = strategies[strategy_index].get_move(&state, config)?;
-        
+
         if verbose {
             println!("Player {} plays at {}", state.current_player, move_index);
         }
-        
+
         state = state.make_move(move_index, config)?;
         move_count += 1;
     }
-    
-    if verbose {
+
+    if verbose && print_final_state {
         println!("\n--- Final State ---");
         print_game_state(&state, None);
     }
-    
+
     Ok(state)
+}
+
+pub(crate) fn play_single_game_from_state(
+    config: &GameConfig,
+    state: GameState,
+    strategies: [&dyn Strategy; 2],
+    verbose: bool,
+) -> Result<GameState, String> {
+    run_game_from_state(config, state, strategies, verbose, false)
+}
+
+pub(crate) fn score_outcome_for_player(outcome: GameOutcome, player: Cell) -> f64 {
+    match outcome {
+        GameOutcome::Draw => 0.5,
+        GameOutcome::Player0Win if player == Cell::Player0 => 1.0,
+        GameOutcome::Player1Win if player == Cell::Player1 => 1.0,
+        _ => 0.0,
+    }
+}
+
+pub(crate) fn tally_outcome_for_player(
+    outcome: GameOutcome,
+    player: Cell,
+    wins: &mut usize,
+    losses: &mut usize,
+    draws: &mut usize,
+) -> f64 {
+    let score = score_outcome_for_player(outcome, player);
+    if score == 1.0 {
+        *wins += 1;
+    } else if score == 0.5 {
+        *draws += 1;
+    } else {
+        *losses += 1;
+    }
+    score
+}
+
+fn record_tournament_outcome(result: &mut TournamentResult, outcome: GameOutcome) {
+    let _ = tally_outcome_for_player(
+        outcome,
+        Cell::Player0,
+        &mut result.player0_wins,
+        &mut result.player1_wins,
+        &mut result.draws,
+    );
+    result.total_games += 1;
 }
 
 // Tournament results
@@ -1010,233 +1171,15 @@ where
         
         let final_state = play_single_game(config, strategies, verbose && i < 3)?;
         
-        // Adjust winner for alternating starts
-        let winner = if i % 2 == 1 {
-            match final_state.winner {
-                Winner::Player0 => Winner::Player1,
-                Winner::Player1 => Winner::Player0,
-                other => other,
-            }
-        } else {
-            final_state.winner
-        };
-        
-        match winner {
-            Winner::Player0 => result.player0_wins += 1,
-            Winner::Player1 => result.player1_wins += 1,
-            Winner::Draw | Winner::None => result.draws += 1,
+        let mut outcome = GameOutcome::from_winner(final_state.winner);
+        if i % 2 == 1 {
+            outcome = outcome.swapped();
         }
-        
-        result.total_games += 1;
+        record_tournament_outcome(&mut result, outcome);
     }
     
     Ok(result)
 }
-
-/// Interleaved tournament that batches AlphaZero neural network calls across games
-/// Significantly faster than sequential tournaments due to batched inference
-pub fn play_interleaved_tournament(
-    config: &GameConfig,
-    model_path: &str,
-    opponent: impl Strategy + Clone,
-    num_games: usize,
-    mcts_simulations: usize,
-) -> Result<TournamentResult, String> {
-    use std::path::Path;
-    use mnk::alphazero::AlphaZeroNet;
-    use mnk::inference_backend::{InferenceBackend, InferenceDevice};
-    use burn::record::{BinFileRecorder, FullPrecisionSettings, Recorder};
-
-    #[cfg(feature = "cuda")]
-    let device = InferenceDevice::new(0);
-    #[cfg(not(feature = "cuda"))]
-    let device = burn_ndarray::NdArrayDevice::default();
-
-    let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
-    let net_type = infer_network_type(model_path);
-    let net = match recorder.load(model_path.into(), &device) {
-        Ok(record) => Network::<InferenceBackend>::new(net_type, &device, 3).load_record(record),
-        Err(e) => return Err(format!("Failed to load model from {}: {:?}", model_path, e)),
-    };
-
-    // Create game states - alternating who goes first
-    let mut game_states: Vec<Vec<Option<u8>>> = Vec::new();
-    let mut current_players: Vec<u8> = Vec::new();
-    let mut alphazero_players: Vec<u8> = Vec::new(); // Which player AlphaZero is in each game
-    let mut game_active: Vec<bool> = Vec::new();
-    let mut move_histories: Vec<Vec<usize>> = Vec::new();
-
-    for i in 0..num_games {
-        game_states.push(vec![None; 9]);
-        current_players.push(0);
-        alphazero_players.push((i % 2) as u8); // Alternate: 0, 1, 0, 1...
-        game_active.push(true);
-        move_histories.push(Vec::new());
-    }
-
-    // Play all games concurrently
-    while game_active.iter().any(|&active| active) {
-        // Collect positions where AlphaZero needs to move
-        let mut alphazero_positions = Vec::new();
-        let mut alphazero_game_ids = Vec::new();
-
-        for (game_id, &active) in game_active.iter().enumerate() {
-            if !active {
-                continue;
-            }
-
-            let current_player = current_players[game_id];
-            let alphazero_player = alphazero_players[game_id];
-
-            if current_player == alphazero_player {
-                // AlphaZero's turn - collect for batched evaluation
-                alphazero_positions.push((&game_states[game_id], current_player));
-                alphazero_game_ids.push(game_id);
-            }
-        }
-
-        // Batch evaluate all AlphaZero positions
-        if !alphazero_positions.is_empty() {
-            // Prepare boards and players for batch evaluation
-            let boards: Vec<&[Option<u8>]> = alphazero_positions.iter()
-                .map(|(board, _)| board.as_slice())
-                .collect();
-            let players: Vec<u8> = alphazero_positions.iter()
-                .map(|(_, player)| *player)
-                .collect();
-
-            // Use unified MCTS with batching for all positions
-            let policies: Vec<Vec<f32>> = boards.iter().zip(players.iter())
-                .map(|(board, &player)| {
-                    mnk::unified_mcts::mcts_search_with_options(
-                        &net,
-                        board,
-                        player,
-                        mcts_simulations,
-                        false,
-                    )
-                })
-                .collect();
-
-            // Apply moves for AlphaZero
-            for (idx, game_id) in alphazero_game_ids.iter().enumerate() {
-                let policy = &policies[idx];
-
-                // Select best legal move from policy (only empty cells)
-                let selected_move = policy.iter()
-                    .enumerate()
-                    .filter(|(i, _)| game_states[*game_id][*i].is_none())
-                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-                    .map(|(i, _)| i)
-                    .unwrap_or(0);
-
-                // Make the move
-                game_states[*game_id][selected_move] = Some(current_players[*game_id]);
-                move_histories[*game_id].push(selected_move);
-
-                // Check for game end
-                if let Some(winner) = mnk::alphazero::check_winner(&game_states[*game_id]) {
-                    game_active[*game_id] = false;
-                } else if move_histories[*game_id].len() == 9 {
-                    game_active[*game_id] = false;
-                } else {
-                    current_players[*game_id] = 1 - current_players[*game_id];
-                }
-            }
-        }
-
-        // Process opponent moves for active games
-        for game_id in 0..num_games {
-            if !game_active[game_id] {
-                continue;
-            }
-
-            let current_player = current_players[game_id];
-            let alphazero_player = alphazero_players[game_id];
-
-            if current_player != alphazero_player {
-                // Opponent's turn
-                // Convert to GameState format for opponent strategy
-                let mut cells = Vec::new();
-                for &cell in &game_states[game_id] {
-                    cells.push(match cell {
-                        Some(0) => Cell::Player0,
-                        Some(1) => Cell::Player1,
-                        _ => Cell::Empty,
-                    });
-                }
-
-                let board = Board {
-                    cells,
-                    width: 3,
-                    height: 3,
-                };
-
-                // Determine current player in play.rs format
-                let current = if current_player == 0 { Cell::Player0 } else { Cell::Player1 };
-
-                // Check if game is terminal
-                let winner_opt = mnk::alphazero::check_winner(&game_states[game_id]);
-                let is_terminal = winner_opt.is_some() || move_histories[game_id].len() == 9;
-
-                let winner = match winner_opt {
-                    Some(0) => Winner::Player0,
-                    Some(1) => Winner::Player1,
-                    None if move_histories[game_id].len() == 9 => Winner::Draw,
-                    _ => Winner::None,
-                };
-
-                let game_state = GameState {
-                    board,
-                    current_player: current,
-                    last_move: move_histories[game_id].last().cloned(),
-                    is_terminal,
-                    winner,
-                };
-
-                // Get opponent move
-                match opponent.get_move(&game_state, config) {
-                    Ok(selected_move) => {
-                        game_states[game_id][selected_move] = Some(current_player);
-                        move_histories[game_id].push(selected_move);
-
-                        // Check for game end
-                        if let Some(winner) = mnk::alphazero::check_winner(&game_states[game_id]) {
-                            game_active[game_id] = false;
-                        } else if move_histories[game_id].len() == 9 {
-                            game_active[game_id] = false;
-                        } else {
-                            current_players[game_id] = 1 - current_player;
-                        }
-                    }
-                    Err(e) => {
-                        // Error in opponent strategy - mark game as ended
-                        println!("Opponent error in game {}: {}", game_id, e);
-                        game_active[game_id] = false;
-                    }
-                }
-            }
-        }
-    }
-
-    // Collect results
-    let mut result = TournamentResult::new();
-
-    for (game_id, game_state) in game_states.iter().enumerate() {
-        let winner = mnk::alphazero::check_winner(game_state);
-        let alphazero_player = alphazero_players[game_id];
-
-        match winner {
-            Some(w) if w == alphazero_player => result.player0_wins += 1,  // AlphaZero wins
-            Some(_) => result.player1_wins += 1,  // Opponent wins
-            None => result.draws += 1,
-        }
-        result.total_games += 1;
-    }
-
-    Ok(result)
-}
-
 
 // Demo functions
 
@@ -1328,7 +1271,7 @@ fn demo_tournament(model_path: &str, tournament_games: usize) -> Result<(), Stri
     // AlphaZero vs Deep Minimax - show first 2 games verbose
     let result = play_tournament(
         &config,
-        AlphaZeroStrategy::new_with_model_path(25, model_path),
+        AlphaZeroStrategy::new_with_model_path(25, model_path)?,
         MinimaxStrategy::new(3),
         tournament_games,
         true,
@@ -1338,7 +1281,7 @@ fn demo_tournament(model_path: &str, tournament_games: usize) -> Result<(), Stri
     // AlphaZero vs Medium Minimax
     let result = play_tournament(
         &config,
-        AlphaZeroStrategy::new_with_model_path(25, model_path),
+        AlphaZeroStrategy::new_with_model_path(25, model_path)?,
         MinimaxStrategy::new(2),
         tournament_games,
         false,
@@ -1348,7 +1291,7 @@ fn demo_tournament(model_path: &str, tournament_games: usize) -> Result<(), Stri
     // AlphaZero vs Random
     let result = play_tournament(
         &config,
-        AlphaZeroStrategy::new_with_model_path(25, model_path),
+        AlphaZeroStrategy::new_with_model_path(25, model_path)?,
         RandomStrategy::new(),
         tournament_games,
         false,
@@ -1358,8 +1301,8 @@ fn demo_tournament(model_path: &str, tournament_games: usize) -> Result<(), Stri
     // Different AlphaZero simulation counts
     let result = play_tournament(
         &config,
-        AlphaZeroStrategy::new_with_model_path(50, model_path),
-        AlphaZeroStrategy::new_with_model_path(10, model_path),
+        AlphaZeroStrategy::new_with_model_path(50, model_path)?,
+        AlphaZeroStrategy::new_with_model_path(10, model_path)?,
         tournament_games,
         false,
     )?;
@@ -1428,11 +1371,11 @@ fn demo_head_to_head(model1: &str, model2: &str, tournament_games: usize) -> Res
     use std::io::Write;
     print!("Loading model 1: {} ... ", model1);
     std::io::stdout().flush().ok();
-    let s1 = AlphaZeroStrategy::new_with_model_path(sims, model1);
+    let s1 = AlphaZeroStrategy::new_with_model_path(sims, model1)?;
     println!("done");
     print!("Loading model 2: {} ... ", model2);
     std::io::stdout().flush().ok();
-    let s2 = AlphaZeroStrategy::new_with_model_path(sims, model2);
+    let s2 = AlphaZeroStrategy::new_with_model_path(sims, model2)?;
     println!("done");
 
     let result = play_tournament(&config, s1, s2, tournament_games, false)?;
@@ -1456,6 +1399,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Functional M,N,K Game Implementation in Rust");
     println!("{}", "=".repeat(45));
+
+    if args.fixed_suite_eval {
+        fixed_suite::run_fixed_suite_eval(&args).map_err(std::io::Error::other)?;
+        print_gpu_memory("Tournament end");
+        println!("\nDone!");
+        return Ok(());
+    }
 
     if let Some(ref model2) = args.model_path2 {
         // Head-to-head mode: just run the two models against each other
