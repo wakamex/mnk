@@ -224,10 +224,6 @@ impl ReplayBuffer {
         self.entries.len()
     }
 
-    fn is_ready(&self, batch_size: usize) -> bool {
-        self.len() >= batch_size
-    }
-
     fn total_weight(&self) -> f32 {
         self.entries.values().map(|entry| entry.count).sum()
     }
@@ -555,7 +551,7 @@ fn main() {
         w
     });
 
-    let replay_buffer_size = args.replay_buffer_size.max(batch_size).max(1);
+    let replay_buffer_size = args.replay_buffer_size.max(1);
     let mut replay_buffer = ReplayBuffer::new(replay_buffer_size);
 
     let start_time = std::time::Instant::now();
@@ -623,13 +619,18 @@ fn main() {
         );
 
         let mut replay_examples = replay_buffer.to_weighted_examples();
-        if !replay_buffer.is_ready(batch_size) || replay_examples.len() < batch_size {
+        if replay_examples.is_empty() {
             println!(
-                "  Replay warm-up: need at least {} unique samples, have {} (skipping training this iter)",
-                batch_size,
-                replay_examples.len()
+                "  Replay empty after ingest (skipping training this iter)"
             );
             continue;
+        }
+        let effective_batch_size = batch_size.min(replay_examples.len());
+        if effective_batch_size < batch_size {
+            println!(
+                "  Effective batch size: {} (configured {})",
+                effective_batch_size, batch_size
+            );
         }
 
         // Training loop
@@ -645,8 +646,8 @@ fn main() {
             let mut epoch_policy_loss = 0.0f32;
             let mut num_batches = 0;
 
-            for batch_start in (0..replay_examples.len()).step_by(batch_size) {
-                let batch_end = batch_start + batch_size;
+            for batch_start in (0..replay_examples.len()).step_by(effective_batch_size) {
+                let batch_end = batch_start + effective_batch_size;
                 if batch_end > replay_examples.len() {
                     break; // Skip incomplete last batch to keep tensor sizes constant (avoids CubeCL VRAM leak)
                 }

@@ -144,14 +144,6 @@ impl GameOutcome {
             Self::Draw => Self::Draw,
         }
     }
-
-    pub(crate) fn winner_label(self) -> &'static str {
-        match self {
-            Self::Player0Win => "Player0",
-            Self::Player1Win => "Player1",
-            Self::Draw => "Draw",
-        }
-    }
 }
 
 impl Cell {
@@ -830,7 +822,6 @@ pub struct AlphaZeroStrategy {
     simulations: usize,
     cpuct: f32,
     name: String,
-    training_level: TrainingLevel,
 }
 
 impl AlphaZeroStrategy {
@@ -949,7 +940,6 @@ impl AlphaZeroStrategy {
             simulations,
             cpuct,
             name: format!("AlphaZero-{}{}", simulations, if matches!(training, TrainingLevel::Trained) { "-Trained" } else { "" }),
-            training_level: training,
         })
     }
 
@@ -1134,15 +1124,6 @@ fn run_game_from_state(
     }
 
     Ok(state)
-}
-
-pub(crate) fn play_single_game_from_state(
-    config: &GameConfig,
-    state: GameState,
-    strategies: [&dyn Strategy; 2],
-    verbose: bool,
-) -> Result<GameState, String> {
-    run_game_from_state(config, state, strategies, verbose, false)
 }
 
 pub(crate) fn score_outcome_for_player(outcome: GameOutcome, player: Cell) -> f64 {
