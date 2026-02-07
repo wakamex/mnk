@@ -18,6 +18,14 @@ Old roadmap/planning notes were removed to keep this document current.
 
 Rationale: lr/mcts from Phase 1 CNN sweep. Value weight and temperature from Phase 2 policy investigation. `vw=2.0, temp=1.25` scored vsR=87%, vsD=38%, vsM=45.5% — best balanced config across all opponents. The earlier `vw=4.0, temp=1.75` winner (49.5% vsD) traded too much vsR for vsD.
 
+## Architecture update (2026-02-07)
+
+- CNN heads were refactored to be board-size-agnostic:
+  - Policy: conv-only per-cell logits (`1x1` conv to one channel, then flatten to `H*W`)
+  - Value: spatial global average pooling first, then small FC stack to scalar
+- Result: no `H*W`-dependent parameter shapes in CNN heads, so a checkpoint trained on 3x3 can be loaded into larger-board CNN models for transfer learning.
+- Trainer internals were also updated to use dynamic board-size tensors/symmetry transforms; current self-play/MCTS logic is still 3x3-specific and remains the next blocker for full larger-board CNN training.
+
 ## Latest completed sweep (CNN lr x mcts)
 
 Sweep grid:
@@ -97,6 +105,10 @@ The `vw=2.0, temp=1.0` result from the 4x4 grid (50%/50% vsD/vsM) did not reprod
 
 ## Next experiments
 
+### Board-size self-play unblocker (priority)
+
+CNN weights are now transfer-compatible across board sizes, but self-play search still assumes 3x3 in `src/unified_mcts.rs` (fixed `9`-cell arrays/loops and 3x3 win detection). Next step is to parameterize MCTS with board width (and win condition) so we can actually train/evaluate transferred CNN checkpoints on 5x5+ boards.
+
 ### Reproducibility check (priority)
 
 All sweep results are n=1 per config. The `vw=2.0, temp=1.0` non-reproduction shows this is a problem. Run the best config 5 times to get confidence intervals:
@@ -133,9 +145,9 @@ python parallel_sweep.py --net-type cnn -i 20 -g 1000 \
 
 ### Phase 3: Transformer on Larger Boards
 
-The Transformer (800K params) is ~20x overparameterized for 3x3. Instead of sweeping on 3x3:
+The current MiniBT4 default is right-sized to ~101K params (close to CNN ~103K), so capacity mismatch is no longer the main concern for 3x3. Instead of broad sweeps on 3x3:
 - **Sanity check**: One quick Transformer run on 3x3 (5 iterations) to confirm it trains
-- **Real test**: Transformer on 5x5 or 7x7 boards where CNN can't go and the capacity is justified
+- **Real test**: Transformer on 5x5 or 7x7 boards where capacity is more justified than 3x3
 - Compare Transformer learning curves on larger boards against random/minimax baselines
 
 ## Useful commands

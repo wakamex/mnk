@@ -4,8 +4,8 @@ Tic-Tac-Toe (3,3,3 game) with AlphaZero-style training using the [Burn](https://
 
 ## Architecture
 
-- **CNN Network** (`src/alphazero.rs`) — 3-layer conv backbone, policy head (raw logits), value head (tanh-bounded)
-- **Transformer Network** (`src/minibt4.rs`) — Variable board size support
+- **CNN Network** (`src/alphazero.rs`) — 3-layer conv backbone with board-agnostic heads: policy uses conv-only per-cell logits, value uses global pooling + MLP (transfer-ready across board sizes)
+- **Transformer Network** (`src/minibt4.rs`) — Variable board size support with CNN-comparable default budget (~101K params)
 - **Network Enum** (`src/network.rs`) — Swappable CNN/Transformer behind a common interface
 - **MCTS** (`src/unified_mcts.rs`) — Proper AlphaZero tree search with PUCT, Dirichlet noise, batched multi-game self-play
 - **Training** (`src/train_alphazero_unified.rs`) — SGD with momentum, logit clamping, 8x symmetry augmentation
@@ -53,5 +53,6 @@ Current CNN sweep snapshot (`sweep_results/cnn_lr_mcts_20260206_125932.csv`):
 
 - **Optimizer**: SGD with momentum 0.9, weight decay 1e-4, gradient clipping norm 1.0
 - **Logit clamping**: Policy logits clamped to [-20, 20] before cross-entropy to prevent unbounded growth
-- **Data augmentation**: 8x via dihedral symmetries of the square board
+- **Data augmentation**: 8x via dihedral symmetries of square boards (generic size support in trainer)
 - **Self-play batching**: N games run simultaneously; leaf nodes collected into batches for single GPU inference call
+- **CNN transfer readiness**: no board-size-dependent FC head parameters, so a 3x3 checkpoint can initialize larger-board CNN models directly

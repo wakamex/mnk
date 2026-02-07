@@ -29,12 +29,20 @@ pub struct MiniBT4Net<B: Backend> {
 }
 
 impl<B: Backend> MiniBT4Net<B> {
+    // Default "budget-matched" config: roughly 101k params, close to CNN baselines (~103k).
+    const DEFAULT_D_MODEL: usize = 64;
+    const DEFAULT_N_LAYERS: usize = 2;
+    const DEFAULT_N_HEADS: usize = 8;
+    const DEFAULT_MAX_BOARD_SIZE: usize = 15;
+
     pub fn new(device: &B::Device, d_model: usize, n_layers: usize, max_board_size: usize) -> Self {
         Self::new_with_board_width(device, d_model, n_layers, max_board_size, 3) // Default to 3x3
     }
 
     pub fn new_with_board_width(device: &B::Device, d_model: usize, n_layers: usize, max_board_size: usize, board_width: usize) -> Self {
-        let n_heads = 8;
+        assert!(d_model % 2 == 0, "d_model must be even for row/col positional split");
+        let n_heads = Self::DEFAULT_N_HEADS;
+        assert!(d_model % n_heads == 0, "d_model must be divisible by n_heads");
 
         Self {
             // Project board state (empty/player0/player1) to d_model
@@ -59,10 +67,32 @@ impl<B: Backend> MiniBT4Net<B> {
 
     /// Create a network configured for a specific board size
     pub fn new_for_board(device: &B::Device, board_width: usize) -> Self {
-        let d_model = 128;
-        let n_layers = 4;
-        let max_board_size = 15; // Support up to 15x15
+        let d_model = Self::DEFAULT_D_MODEL;
+        let n_layers = Self::DEFAULT_N_LAYERS;
+        let max_board_size = Self::DEFAULT_MAX_BOARD_SIZE; // Support up to 15x15
         Self::new_with_board_width(device, d_model, n_layers, max_board_size, board_width)
+    }
+
+    /// Closed-form estimate of trainable parameters for this architecture.
+    ///
+    /// For Burn 0.17 encoder blocks:
+    /// - MHA per layer: 4 * (d_model*d_model + d_model)
+    /// - FFN per layer: (d_model*d_ff + d_ff) + (d_ff*d_model + d_model), where d_ff = 4*d_model
+    /// - LayerNorm per layer: 2 norms * (gamma+beta) = 4*d_model
+    /// Plus: input projection, row/col embeddings, value head, policy head.
+    pub fn estimated_parameter_count(d_model: usize, n_layers: usize, max_board_size: usize) -> usize {
+        let d_ff = d_model * 4;
+
+        let input_proj = d_model + d_model; // Linear(1 -> d_model): weight + bias
+        let pos_embeds = max_board_size * d_model; // row(d/2) + col(d/2)
+        let heads = (d_model + 1) + (d_model + 1); // value + policy linear heads
+
+        let mha_per_layer = 4 * (d_model * d_model + d_model);
+        let ffn_per_layer = (d_model * d_ff + d_ff) + (d_ff * d_model + d_model);
+        let layer_norms_per_layer = 4 * d_model;
+        let per_layer = mha_per_layer + ffn_per_layer + layer_norms_per_layer;
+
+        input_proj + pos_embeds + heads + n_layers * per_layer
     }
 
     /// Get current board width
@@ -234,6 +264,22 @@ mod tests {
     use burn::backend::NdArray;
 
     type Backend = NdArray;
+
+    #[test]
+    fn test_default_param_budget_is_cnn_comparable() {
+        let minibt4_params = MiniBT4Net::<Backend>::estimated_parameter_count(
+            MiniBT4Net::<Backend>::DEFAULT_D_MODEL,
+            MiniBT4Net::<Backend>::DEFAULT_N_LAYERS,
+            MiniBT4Net::<Backend>::DEFAULT_MAX_BOARD_SIZE,
+        );
+
+        // /code/alpha-zero default (6x6) reference count from policy_value_net.py
+        let alpha_zero_reference = 103_403usize;
+        let delta = alpha_zero_reference.abs_diff(minibt4_params);
+
+        assert_eq!(minibt4_params, 101_186);
+        assert!(delta <= 3_000, "MiniBT4 params ({minibt4_params}) should stay close to CNN budget");
+    }
 
     #[test]
     fn test_minibt4_3x3() {
