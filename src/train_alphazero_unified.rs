@@ -1,21 +1,24 @@
-use burn::prelude::*;
 use burn::backend::Autodiff;
+use burn::grad_clipping::GradientClippingConfig;
 use burn::module::AutodiffModule;
-use burn::optim::{SgdConfig, Optimizer, GradientsParams};
-use burn::optim::momentum::MomentumConfig;
 use burn::optim::decay::WeightDecayConfig;
-use burn::grad_clipping::{GradientClippingConfig};
-use burn::tensor::backend::AutodiffBackend;
+use burn::optim::momentum::MomentumConfig;
+use burn::optim::{GradientsParams, Optimizer, SgdConfig};
+use burn::prelude::*;
 use burn::tensor::activation;
-use mnk::alphazero::evaluate_vs_random;
-use mnk::unified_mcts::TrainingExample;
-use mnk::network::{Network, NetworkType};
+use burn::tensor::backend::AutodiffBackend;
 use clap::Parser;
+use mnk::alphazero::evaluate_vs_random;
+use mnk::network::{Network, NetworkType};
+use mnk::unified_mcts::TrainingExample;
 
 /// Query GPU VRAM usage via nvidia-smi. Returns (used_mb, total_mb) or None.
 fn gpu_vram_mb() -> Option<(u64, u64)> {
     let output = std::process::Command::new("nvidia-smi")
-        .args(["--query-gpu=memory.used,memory.total", "--format=csv,noheader,nounits"])
+        .args([
+            "--query-gpu=memory.used,memory.total",
+            "--format=csv,noheader,nounits",
+        ])
         .output()
         .ok()?;
     let s = String::from_utf8_lossy(&output.stdout);
@@ -41,7 +44,6 @@ use burn_ndarray::{NdArray, NdArrayDevice};
 #[cfg(not(feature = "cuda"))]
 type MyBackend = Autodiff<NdArray>;
 
-
 // Symmetry augmentation for 8x data efficiency
 fn apply_symmetry_augmentation(examples: &[TrainingExample]) -> Vec<TrainingExample> {
     let mut augmented = Vec::with_capacity(examples.len() * 8);
@@ -66,7 +68,8 @@ fn get_all_symmetries(example: &TrainingExample) -> Vec<TrainingExample> {
         Transform::FlipDiag2,
     ];
 
-    transforms.iter()
+    transforms
+        .iter()
         .map(|&transform| apply_transform(example, transform))
         .collect()
 }
@@ -84,49 +87,66 @@ enum Transform {
 }
 
 fn apply_transform(example: &TrainingExample, transform: Transform) -> TrainingExample {
+    let board_width = board_width_from_len(example.board.len());
     TrainingExample {
-        board: transform_board(&example.board, transform),
+        board: transform_board(&example.board, board_width, transform),
         player: example.player,
-        policy: transform_policy(&example.policy, transform),
+        policy: transform_policy(&example.policy, board_width, transform),
         value: example.value,
     }
 }
 
-fn transform_board(board: &[Option<u8>], transform: Transform) -> Vec<Option<u8>> {
-    let mut new_board = vec![None; 9];
+fn board_width_from_len(len: usize) -> usize {
+    let width = (len as f64).sqrt() as usize;
+    assert_eq!(
+        width * width,
+        len,
+        "Expected square board length, got {}",
+        len
+    );
+    width
+}
 
-    for old_pos in 0..9 {
-        let new_pos = transform_position(old_pos, transform);
+fn transform_board(
+    board: &[Option<u8>],
+    board_width: usize,
+    transform: Transform,
+) -> Vec<Option<u8>> {
+    let mut new_board = vec![None; board.len()];
+
+    for old_pos in 0..board.len() {
+        let new_pos = transform_position(old_pos, board_width, transform);
         new_board[new_pos] = board[old_pos];
     }
 
     new_board
 }
 
-fn transform_policy(policy: &[f32], transform: Transform) -> Vec<f32> {
-    let mut new_policy = vec![0.0; 9];
+fn transform_policy(policy: &[f32], board_width: usize, transform: Transform) -> Vec<f32> {
+    let mut new_policy = vec![0.0; policy.len()];
 
-    for old_pos in 0..9 {
-        let new_pos = transform_position(old_pos, transform);
+    for old_pos in 0..policy.len() {
+        let new_pos = transform_position(old_pos, board_width, transform);
         new_policy[new_pos] = policy[old_pos];
     }
 
     new_policy
 }
 
-fn transform_position(pos: usize, transform: Transform) -> usize {
-    let (row, col) = (pos / 3, pos % 3);
+fn transform_position(pos: usize, board_width: usize, transform: Transform) -> usize {
+    let (row, col) = (pos / board_width, pos % board_width);
+    let last = board_width - 1;
     let (new_row, new_col) = match transform {
         Transform::Identity => (row, col),
-        Transform::Rotate90 => (col, 2 - row),
-        Transform::Rotate180 => (2 - row, 2 - col),
-        Transform::Rotate270 => (2 - col, row),
-        Transform::FlipHorizontal => (row, 2 - col),
-        Transform::FlipVertical => (2 - row, col),
+        Transform::Rotate90 => (col, last - row),
+        Transform::Rotate180 => (last - row, last - col),
+        Transform::Rotate270 => (last - col, row),
+        Transform::FlipHorizontal => (row, last - col),
+        Transform::FlipVertical => (last - row, col),
         Transform::FlipDiag1 => (col, row),
-        Transform::FlipDiag2 => (2 - col, 2 - row),
+        Transform::FlipDiag2 => (last - col, last - row),
     };
-    new_row * 3 + new_col
+    new_row * board_width + new_col
 }
 
 #[derive(Parser, Debug)]
@@ -169,7 +189,7 @@ struct Args {
     #[arg(long, default_value = "cnn")]
     net_type: String,
 
-    /// Board width (transformer supports variable sizes, cnn only supports 3)
+    /// Board width used to initialize the network
     #[arg(long, default_value = "3")]
     board_width: usize,
 
@@ -211,10 +231,17 @@ fn main() {
     let device = NdArrayDevice::default();
 
     // Parse network type from CLI
-    let net_type: NetworkType = args.net_type.parse().expect("Invalid network type. Use 'cnn' or 'transformer'");
+    let net_type: NetworkType = args
+        .net_type
+        .parse()
+        .expect("Invalid network type. Use 'cnn' or 'transformer'");
     let board_width = args.board_width;
+    let board_size = board_width * board_width;
 
-    println!("Network: {:?} (board: {}x{})", net_type, board_width, board_width);
+    println!(
+        "Network: {:?} (board: {}x{})",
+        net_type, board_width, board_width
+    );
 
     let mut net = Network::<MyBackend>::new(net_type, &device, board_width);
 
@@ -267,8 +294,15 @@ fn main() {
         // IMPORTANT: Run inference-heavy self-play on the non-autodiff model.
         // Using Autodiff backend here builds graphs that are never backpropagated.
         let net_valid = net.valid();
-        let game_training_examples = mnk::unified_mcts::generate_training_data_batched::<<MyBackend as AutodiffBackend>::InnerBackend, _>(
-            &net_valid, games_per_iter, args.mcts_simulations, args.temperature, 64
+        let game_training_examples = mnk::unified_mcts::generate_training_data_batched::<
+            <MyBackend as AutodiffBackend>::InnerBackend,
+            _,
+        >(
+            &net_valid,
+            games_per_iter,
+            args.mcts_simulations,
+            args.temperature,
+            64,
         );
         let selfplay_time = selfplay_start.elapsed();
         let iter_games_per_sec = games_per_iter as f32 / selfplay_time.as_secs_f32();
@@ -277,20 +311,26 @@ fn main() {
             all_examples.extend(game_examples);
         }
 
-        println!("  Self-play: {:.3}s for {} games ({:.1} games/sec, {} MCTS sims, batched)",
-                 selfplay_time.as_secs_f32(),
-                 games_per_iter,
-                 iter_games_per_sec,
-                 args.mcts_simulations);
+        println!(
+            "  Self-play: {:.3}s for {} games ({:.1} games/sec, {} MCTS sims, batched)",
+            selfplay_time.as_secs_f32(),
+            games_per_iter,
+            iter_games_per_sec,
+            args.mcts_simulations
+        );
 
         let original_count = all_examples.len();
 
         // Apply 8x symmetry augmentation for data efficiency
         let augmented_examples = apply_symmetry_augmentation(&all_examples);
 
-        println!("Iteration {}: {} → {} examples ({}x symmetry)",
-                 iteration, original_count, augmented_examples.len(),
-                 augmented_examples.len() as f32 / original_count as f32);
+        println!(
+            "Iteration {}: {} → {} examples ({}x symmetry)",
+            iteration,
+            original_count,
+            augmented_examples.len(),
+            augmented_examples.len() as f32 / original_count as f32
+        );
 
         // Use augmented examples for training
         let mut all_examples = augmented_examples;
@@ -321,7 +361,21 @@ fn main() {
                 let mut policy_targets: Vec<f32> = Vec::new();
 
                 for ex in batch {
-                    let mut input = vec![0.0f32; 9];
+                    assert_eq!(
+                        ex.board.len(),
+                        board_size,
+                        "Training example board length {} != configured board size {}",
+                        ex.board.len(),
+                        board_size
+                    );
+                    assert_eq!(
+                        ex.policy.len(),
+                        board_size,
+                        "Training example policy length {} != configured board size {}",
+                        ex.policy.len(),
+                        board_size
+                    );
+                    let mut input = vec![0.0f32; board_size];
                     for (i, &cell) in ex.board.iter().enumerate() {
                         input[i] = match cell {
                             Some(p) if p == ex.player => 1.0,
@@ -335,20 +389,16 @@ fn main() {
                 }
 
                 // Create tensors
-                let boards = Tensor::<MyBackend, 1>::from_floats(
-                    board_data.as_slice(),
-                    &device
-                ).reshape([batch.len(), 9]);
+                let boards = Tensor::<MyBackend, 1>::from_floats(board_data.as_slice(), &device)
+                    .reshape([batch.len(), board_size]);
 
-                let target_values = Tensor::<MyBackend, 1>::from_floats(
-                    value_targets.as_slice(),
-                    &device
-                ).reshape([batch.len(), 1]);
+                let target_values =
+                    Tensor::<MyBackend, 1>::from_floats(value_targets.as_slice(), &device)
+                        .reshape([batch.len(), 1]);
 
-                let target_policies = Tensor::<MyBackend, 1>::from_floats(
-                    policy_targets.as_slice(),
-                    &device
-                ).reshape([batch.len(), 9]);
+                let target_policies =
+                    Tensor::<MyBackend, 1>::from_floats(policy_targets.as_slice(), &device)
+                        .reshape([batch.len(), board_size]);
 
                 // Forward pass
                 let (pred_values, pred_logits) = net.forward(boards);
@@ -363,8 +413,10 @@ fn main() {
                 let log_probs = activation::log_softmax(pred_logits, 1);
                 let epsilon = 1e-8;
                 let safe_target_policies = target_policies.clone() + epsilon;
-                let safe_target_policies = safe_target_policies.clone() / safe_target_policies.sum_dim(1).unsqueeze();
-                let policy_loss = -(safe_target_policies * log_probs).sum() / target_policies.dims()[0] as f32;
+                let safe_target_policies =
+                    safe_target_policies.clone() / safe_target_policies.sum_dim(1).unsqueeze();
+                let policy_loss =
+                    -(safe_target_policies * log_probs).sum() / target_policies.dims()[0] as f32;
 
                 // Track per-component losses (single GPU sync for both)
                 let vl = value_loss.clone().into_scalar();
@@ -375,7 +427,10 @@ fn main() {
                 let total_batch_loss = value_loss * value_weight + policy_loss;
 
                 if !(vl.is_finite() && pl.is_finite()) {
-                    eprintln!("ERROR: NaN/Inf loss (value={}, policy={}). Training failed.", vl, pl);
+                    eprintln!(
+                        "ERROR: NaN/Inf loss (value={}, policy={}). Training failed.",
+                        vl, pl
+                    );
                     std::process::exit(1);
                 }
 
@@ -393,22 +448,29 @@ fn main() {
             final_policy_loss = epoch_policy_loss / num_batches as f32;
 
             if epoch == 0 || epoch == epochs - 1 {
-                println!("  Epoch {}: value_loss={:.4}, policy_loss={:.4}, total={:.4}",
-                         epoch + 1, final_value_loss, final_policy_loss,
-                         final_value_loss * args.value_weight + final_policy_loss);
+                println!(
+                    "  Epoch {}: value_loss={:.4}, policy_loss={:.4}, total={:.4}",
+                    epoch + 1,
+                    final_value_loss,
+                    final_policy_loss,
+                    final_value_loss * args.value_weight + final_policy_loss
+                );
             }
         }
         let training_time = training_start.elapsed();
 
         let iter_time = iter_start.elapsed();
-        println!("  Self-play: {:.2}s, Training: {:.2}s, Total: {:.2}s",
-                 selfplay_time.as_secs_f32(),
-                 training_time.as_secs_f32(),
-                 iter_time.as_secs_f32());
+        println!(
+            "  Self-play: {:.2}s, Training: {:.2}s, Total: {:.2}s",
+            selfplay_time.as_secs_f32(),
+            training_time.as_secs_f32(),
+            iter_time.as_secs_f32()
+        );
 
         // Evaluate every iteration (~0.5s overhead, gives continuous quality signal)
         let net_valid = net.valid();
-        let win_rate = evaluate_vs_random::<<MyBackend as AutodiffBackend>::InnerBackend, _>(&net_valid);
+        let win_rate =
+            evaluate_vs_random::<<MyBackend as AutodiffBackend>::InnerBackend, _>(&net_valid);
         println!("  vs Random: {:.1}%", win_rate * 100.0);
         let vs_random = Some(win_rate);
 
@@ -424,11 +486,20 @@ fn main() {
             let wall_clock = start_time.elapsed().as_secs_f32();
             let vs_random_str = vs_random.map_or(String::new(), |v| format!("{:.4}", v));
             let vram_str = vram_used.map_or(String::new(), |v| format!("{}", v));
-            writeln!(w, "{},{:.2},{:.3},{:.3},{:.1},{:.4},{:.4},{},{}",
-                     iteration, wall_clock,
-                     selfplay_time.as_secs_f32(), training_time.as_secs_f32(),
-                     iter_games_per_sec, final_value_loss, final_policy_loss,
-                     vs_random_str, vram_str).unwrap();
+            writeln!(
+                w,
+                "{},{:.2},{:.3},{:.3},{:.1},{:.4},{:.4},{},{}",
+                iteration,
+                wall_clock,
+                selfplay_time.as_secs_f32(),
+                training_time.as_secs_f32(),
+                iter_games_per_sec,
+                final_value_loss,
+                final_policy_loss,
+                vs_random_str,
+                vram_str
+            )
+            .unwrap();
             w.flush().unwrap();
         }
     }
@@ -438,16 +509,25 @@ fn main() {
 
     // Test the trained model immediately with some positions
     println!("Testing trained model with sample positions...");
-    let test_board = vec![None; 9]; // Empty board
+    let test_board = vec![None; board_size]; // Empty board
     let net_valid = net.valid();
     let (value, policy) = net_valid.forward_inference(&test_board, 0);
-    println!("  Empty board evaluation: value={:.3}, policy_max={:.3}", value, policy.iter().fold(0.0f32, |a, &b| a.max(b)));
+    println!(
+        "  Empty board evaluation: value={:.3}, policy_max={:.3}",
+        value,
+        policy.iter().fold(0.0f32, |a, &b| a.max(b))
+    );
 
     // Test with one move made
-    let mut test_board2 = vec![None; 9];
-    test_board2[4] = Some(0); // Center move
+    let mut test_board2 = vec![None; board_size];
+    let center = (board_width / 2) * board_width + (board_width / 2);
+    test_board2[center] = Some(0); // Center move
     let (value2, policy2) = net_valid.forward_inference(&test_board2, 1);
-    println!("  After center move: value={:.3}, policy_max={:.3}", value2, policy2.iter().fold(0.0f32, |a, &b| a.max(b)));
+    println!(
+        "  After center move: value={:.3}, policy_max={:.3}",
+        value2,
+        policy2.iter().fold(0.0f32, |a, &b| a.max(b))
+    );
 
     // Save the trained model using Burn's record system (INFERENCE COMPATIBLE!)
     println!("Saving trained model for inference compatibility...");
@@ -458,7 +538,7 @@ fn main() {
     let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
 
     let model_name = if args.model_path.ends_with(".bin") {
-        &args.model_path[..args.model_path.len()-4]
+        &args.model_path[..args.model_path.len() - 4]
     } else {
         &args.model_path
     };
@@ -467,7 +547,7 @@ fn main() {
         Ok(_) => {
             println!("✅ Model saved successfully to '{}'!", args.model_path);
             println!("🔧 Model is compatible with inference backend (no Autodiff wrapper needed)");
-        },
+        }
         Err(e) => println!("❌ Failed to save model: {:?}", e),
     }
 

@@ -1,10 +1,9 @@
 // Simplified AlphaZero with Burn that actually compiles and works
 
-use burn::prelude::*;
-use burn::nn::{Linear, LinearConfig, conv::Conv2d, conv::Conv2dConfig,
-               PaddingConfig2d};
-use burn::tensor::activation;
 use burn::module::Module;
+use burn::nn::{conv::Conv2d, conv::Conv2dConfig, Linear, LinearConfig, PaddingConfig2d};
+use burn::prelude::*;
+use burn::tensor::activation;
 use rand::seq::SliceRandom;
 
 #[derive(Module, Debug)]
@@ -14,11 +13,11 @@ pub struct AlphaZeroNet<B: Backend> {
     conv2: Conv2d<B>,
     conv3: Conv2d<B>,
 
-    // Policy head
+    // Policy head (board-agnostic: conv-only logits per cell)
     policy_conv: Conv2d<B>,
-    policy_fc: Linear<B>,
+    policy_logits_conv: Conv2d<B>,
 
-    // Value head
+    // Value head (board-agnostic: global pooling + small MLP)
     value_conv: Conv2d<B>,
     value_fc1: Linear<B>,
     value_fc2: Linear<B>,
@@ -29,11 +28,7 @@ pub struct AlphaZeroNet<B: Backend> {
 
 impl<B: Backend> AlphaZeroNet<B> {
     /// Create a new CNN network for the specified board size
-    /// Note: CNN currently only supports 3x3 boards due to FC layer dimensions
     pub fn new(device: &B::Device, board_width: usize) -> Self {
-        assert_eq!(board_width, 3, "CNN architecture currently only supports 3x3 boards. Use transformer for larger sizes.");
-        let board_size = board_width * board_width;
-
         Self {
             // Shared convolutional backbone: 1 -> 32 -> 64 -> 128 filters
             conv1: Conv2dConfig::new([1, 32], [3, 3])
@@ -46,13 +41,13 @@ impl<B: Backend> AlphaZeroNet<B> {
                 .with_padding(PaddingConfig2d::Same)
                 .init(device),
 
-            // Policy head (action selection)
-            policy_conv: Conv2dConfig::new([128, 4], [1, 1]).init(device),
-            policy_fc: LinearConfig::new(4 * board_size, board_size).init(device),
+            // Policy head: [B, 128, H, W] -> [B, 32, H, W] -> [B, 1, H, W]
+            policy_conv: Conv2dConfig::new([128, 32], [1, 1]).init(device),
+            policy_logits_conv: Conv2dConfig::new([32, 1], [1, 1]).init(device),
 
-            // Value head (position evaluation)
-            value_conv: Conv2dConfig::new([128, 2], [1, 1]).init(device),
-            value_fc1: LinearConfig::new(2 * board_size, 64).init(device),
+            // Value head: [B, 128, H, W] -> [B, 32, H, W] -> global average pool -> [B, 32]
+            value_conv: Conv2dConfig::new([128, 32], [1, 1]).init(device),
+            value_fc1: LinearConfig::new(32, 64).init(device),
             value_fc2: LinearConfig::new(64, 1).init(device),
 
             board_width,
@@ -78,16 +73,15 @@ impl<B: Backend> AlphaZeroNet<B> {
         // Shared convolutional backbone
         let x = activation::relu(self.conv1.forward(x));
         let x = activation::relu(self.conv2.forward(x));
-        let x = activation::relu(self.conv3.forward(x)); // [batch_size, 128, 3, 3]
+        let x = activation::relu(self.conv3.forward(x)); // [batch_size, 128, H, W]
 
-        // Policy head - CRITICAL: Return raw logits, not probabilities
-        let policy_x = activation::relu(self.policy_conv.forward(x.clone())); // [batch_size, 4, 3, 3]
-        let policy_x = policy_x.flatten(1, 3); // Flatten from dim 1 to 3 -> [batch_size, 4*3*3]
-        let policy_logits = self.policy_fc.forward(policy_x); // [batch_size, 9] - RAW LOGITS
+        // Policy head - return raw logits, one logit per board cell.
+        let policy_x = activation::relu(self.policy_conv.forward(x.clone())); // [batch_size, 32, H, W]
+        let policy_logits = self.policy_logits_conv.forward(policy_x).flatten(1, 3); // [batch_size, H*W]
 
         // Value head
-        let value_x = activation::relu(self.value_conv.forward(x)); // [batch_size, 2, 3, 3]
-        let value_x = value_x.flatten(1, 3); // Flatten from dim 1 to 3 -> [batch_size, 2*3*3]
+        let value_x = activation::relu(self.value_conv.forward(x)); // [batch_size, 32, H, W]
+        let value_x = value_x.mean_dim(3).mean_dim(2).flatten(1, 3); // Global average pooling over H,W -> [batch_size, 32]
         let value_x = activation::relu(self.value_fc1.forward(value_x)); // [batch_size, 64]
         let value = activation::tanh(self.value_fc2.forward(value_x)); // [batch_size, 1]
 
@@ -98,6 +92,17 @@ impl<B: Backend> AlphaZeroNet<B> {
     where
         B: Backend<FloatElem = f32>,
     {
+        let board_size = self.board_width * self.board_width;
+        assert_eq!(
+            board.len(),
+            board_size,
+            "Board length {} does not match network board size {} ({}x{})",
+            board.len(),
+            board_size,
+            self.board_width,
+            self.board_width
+        );
+
         let input = board_to_tensor(board, player, &self.conv1.devices()[0]);
         let (value, policy_logits) = self.forward(input);
 
@@ -112,11 +117,19 @@ impl<B: Backend> AlphaZeroNet<B> {
     }
 
     // Batch inference method for processing multiple positions simultaneously
-    pub fn forward_batch_inference(&self, boards: &[&[Option<u8>]], players: &[u8]) -> (Vec<f32>, Vec<Vec<f32>>)
+    pub fn forward_batch_inference(
+        &self,
+        boards: &[&[Option<u8>]],
+        players: &[u8],
+    ) -> (Vec<f32>, Vec<Vec<f32>>)
     where
         B: Backend<FloatElem = f32>,
     {
-        assert_eq!(boards.len(), players.len(), "Boards and players must have same length");
+        assert_eq!(
+            boards.len(),
+            players.len(),
+            "Boards and players must have same length"
+        );
 
         if boards.is_empty() {
             return (vec![], vec![]);
@@ -125,6 +138,17 @@ impl<B: Backend> AlphaZeroNet<B> {
         let device = &self.conv1.devices()[0];
         let batch_size = boards.len();
         let board_size = self.board_width * self.board_width;
+        for &board in boards {
+            assert_eq!(
+                board.len(),
+                board_size,
+                "Board length {} does not match network board size {} ({}x{})",
+                board.len(),
+                board_size,
+                self.board_width,
+                self.board_width
+            );
+        }
 
         // Create batch input tensor
         let mut batch_data = vec![0.0f32; batch_size * board_size];
@@ -162,11 +186,15 @@ impl<B: Backend> AlphaZeroNet<B> {
     }
 }
 
-pub fn board_to_tensor<B: Backend>(board: &[Option<u8>], player: u8, device: &B::Device) -> Tensor<B, 2>
+pub fn board_to_tensor<B: Backend>(
+    board: &[Option<u8>],
+    player: u8,
+    device: &B::Device,
+) -> Tensor<B, 2>
 where
     B: Backend<FloatElem = f32>,
 {
-    let mut data = vec![0.0f32; 9];
+    let mut data = vec![0.0f32; board.len()];
     for (i, &cell) in board.iter().enumerate() {
         data[i] = match cell {
             Some(p) if p == player => 1.0,
@@ -177,14 +205,19 @@ where
 
     // Create tensor from floats and reshape
     let tensor: Tensor<B, 1> = Tensor::from_floats(data.as_slice(), device);
-    tensor.reshape([1, 9])
+    tensor.reshape([1, board.len()])
 }
 
 pub fn check_winner(board: &[Option<u8>]) -> Option<u8> {
     let lines = [
-        [0, 1, 2], [3, 4, 5], [6, 7, 8],  // rows
-        [0, 3, 6], [1, 4, 7], [2, 5, 8],  // columns
-        [0, 4, 8], [2, 4, 6],              // diagonals
+        [0, 1, 2],
+        [3, 4, 5],
+        [6, 7, 8], // rows
+        [0, 3, 6],
+        [1, 4, 7],
+        [2, 5, 8], // columns
+        [0, 4, 8],
+        [2, 4, 6], // diagonals
     ];
 
     for line in &lines {
@@ -214,8 +247,6 @@ pub fn batch_evaluate_positions<B: Backend<FloatElem = f32>>(
     net.forward_batch_inference(&board_refs, players)
 }
 
-
-
 pub fn evaluate_vs_random<B, N>(net: &N) -> f32
 where
     B: Backend<FloatElem = f32>,
@@ -230,7 +261,8 @@ where
         let net_player = (game % 2) as u8;
 
         loop {
-            let valid: Vec<usize> = board.iter()
+            let valid: Vec<usize> = board
+                .iter()
                 .enumerate()
                 .filter_map(|(i, &c)| if c.is_none() { Some(i) } else { None })
                 .collect();
@@ -249,10 +281,9 @@ where
 
             let selected = if player == net_player {
                 let (_value, policy) = net.forward_inference(&board, player);
-                valid.iter()
-                    .max_by(|&&a, &&b| {
-                        policy[a].partial_cmp(&policy[b]).unwrap()
-                    })
+                valid
+                    .iter()
+                    .max_by(|&&a, &&b| policy[a].partial_cmp(&policy[b]).unwrap())
                     .copied()
                     .unwrap()
             } else {
@@ -265,4 +296,43 @@ where
     }
 
     (wins as f32 + 0.5 * draws as f32) / 100.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use burn::backend::NdArray;
+    use burn::module::Module;
+
+    type TestBackend = NdArray;
+
+    #[test]
+    fn cnn_output_shape_scales_with_board_size() {
+        let device = Default::default();
+
+        for &width in &[3usize, 5usize] {
+            let board_size = width * width;
+            let net = AlphaZeroNet::<TestBackend>::new(&device, width);
+            let board = vec![None; board_size];
+            let (value, policy) = net.forward_inference(&board, 0);
+
+            assert!(value >= -1.0 && value <= 1.0);
+            assert_eq!(policy.len(), board_size);
+            let prob_sum: f32 = policy.iter().sum();
+            assert!((prob_sum - 1.0).abs() < 0.01);
+        }
+    }
+
+    #[test]
+    fn cnn_record_loads_across_board_sizes() {
+        let device = Default::default();
+        let net_3x3 = AlphaZeroNet::<TestBackend>::new(&device, 3);
+        let record = net_3x3.clone().into_record();
+
+        // Transfer-learning check: weights from 3x3 should load into 5x5 shape.
+        let net_5x5 = AlphaZeroNet::<TestBackend>::new(&device, 5).load_record(record);
+        let board = vec![None; 25];
+        let (_value, policy) = net_5x5.forward_inference(&board, 0);
+        assert_eq!(policy.len(), 25);
+    }
 }
