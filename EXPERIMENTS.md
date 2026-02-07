@@ -31,6 +31,39 @@ Critical finding:
 - `--dirichlet-alpha`: `0.1`
 - `--cpuct`: `0.75`
 
+## MCTS-only scaling sweep (2026-02-07)
+
+Run:
+- `python parallel_sweep.py --mcts 100,200,400,800,1200 --sweep-name mcts_only_high`
+- Training-sweep mode (no tournament), ranking by in-training `fixed_suite_vs_deep`.
+
+Summary from `sweep_results/mcts_only_high_20260207_160627.csv`:
+- `mcts100`: final `vs_Deep=47.0%`, max `48.0%`, training time `431.5s`
+- `mcts200`: final `36.0%`, max `43.0%`, training time `593.4s`
+- `mcts400`: final `41.0%`, max `49.0%`, training time `841.5s`
+- `mcts800`: final `40.0%`, max `45.0%`, training time `1277.8s`
+- `mcts1200`: final `46.0%`, max `49.0%`, training time `1568.6s`
+
+Conclusion:
+- Keep `mcts=100` as the practical default for now.
+- Higher MCTS (`400/1200`) can hit similar or slightly higher peak `vs_Deep`, but did not produce a clearly better final/stable score in this n=1 run and costs 2-4x wall-clock.
+- Treat 1-2 point differences as likely eval noise at this suite size; only change default after multi-seed confirmation.
+
+Follow-up multi-seed runs:
+- `sweep_results/mcts_only_high_2_20260207_171707.csv`
+- `sweep_results/mcts_only_high_3_20260207_175130.csv`
+
+Aggregate over 3 runs (`mcts_only_high`, `_2`, `_3`):
+- `mcts100`: mean `vs_Deep=44.33%`, std `2.49`, mean time `429.0s`
+- `mcts200`: mean `42.67%`, std `4.71`, mean time `581.1s`
+- `mcts400`: mean `42.33%`, std `4.19`, mean time `843.4s`
+- `mcts800`: mean `41.67%`, std `1.25`, mean time `1257.4s`
+- `mcts1200`: mean `45.33%`, std `2.49`, mean time `1560.5s`
+
+Decision:
+- Keep `mcts=100` as default.
+- `mcts1200` is ~1.0pp higher on mean `vs_Deep`, but at ~3.6x wall-clock cost; not worth defaulting to for current iteration speed goals.
+
 Rationale:
 - Temp-cutoff sweep (`sweep_results/temp_cutoff_v1_20260207_000025.csv`) selected `tcut=1` as the only setting that kept `vsDeep=25%` while reaching `vsMedium=50%`.
 - Dirichlet sweep at `tcut=1` (`sweep_results/dirichlet_tcut1_v1_20260207_001159.csv`) selected `dalpha=0.1` as top balanced config (`vsR=89.5%, vsD=25.0%, vsM=50.0%`).

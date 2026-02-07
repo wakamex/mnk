@@ -29,7 +29,7 @@ class ExperimentConfig:
     name: str
     args: str
     tournament_games: int = 100  # Number of games per tournament matchup
-    training_timeout: int = 600  # 10 minutes max for training
+    training_timeout: Optional[int] = None  # No timeout: allow long training runs
     tournament_timeout: int = 900  # 15 minutes max for tournament
 
 
@@ -56,14 +56,24 @@ class GPUInfo:
     @staticmethod
     def get_gpu_memory() -> int:
         """Get GPU memory in MB"""
-        try:
-            result = subprocess.run(
-                ['nvidia-smi', '--query-gpu=memory.total', '--format=csv,noheader,nounits'],
-                capture_output=True, text=True, timeout=5
+        result = subprocess.run(
+            ['nvidia-smi', '--query-gpu=memory.total', '--format=csv,noheader,nounits'],
+            capture_output=True, text=True, timeout=5
+        )
+        stdout = result.stdout.strip()
+        stderr = result.stderr.strip()
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"nvidia-smi failed (exit {result.returncode}). "
+                f"stdout={stdout!r} stderr={stderr!r}"
             )
-            return int(result.stdout.strip())
-        except:
-            return 0
+        first_line = stdout.splitlines()[0].strip() if stdout else ""
+        try:
+            return int(first_line)
+        except ValueError as e:
+            raise RuntimeError(
+                f"unexpected nvidia-smi output for memory.total: {stdout!r}"
+            ) from e
 
     @staticmethod
     def get_cpu_cores() -> int:
@@ -78,8 +88,13 @@ class AlphaZeroSweep:
     """Advanced hyperparameter sweep with intelligent resource management"""
 
     def __init__(self, max_parallel_jobs: Optional[int] = None, cpu_tournaments: bool = True, tournament_jobs: Optional[int] = None):
-        self.gpu_memory = GPUInfo.get_gpu_memory()
+        try:
+            self.gpu_memory = GPUInfo.get_gpu_memory()
+        except Exception as e:
+            print(f"❌ GPU detection failed: {e}", file=sys.stderr)
+            raise
         self.cpu_cores = GPUInfo.get_cpu_cores()
+        self._vram_query_warned = False
 
         # Intelligent parallelism detection based on GPU VRAM
         # With net.valid() fix (non-Autodiff self-play), each process uses ~1.3GB
@@ -128,7 +143,7 @@ class AlphaZeroSweep:
 
         print(f"🚀 AlphaZero Advanced Sweep Harness")
         print(f"   CPU Cores: {self.cpu_cores}")
-        print(f"   GPU Memory: {self.gpu_memory}MB" if self.gpu_memory else "   GPU: Not detected")
+        print(f"   GPU Memory: {self.gpu_memory}MB")
         print(f"   Max Parallel Jobs: {self.max_parallel_jobs}")
         print(f"   Train binary: {self.train_binary}")
 
@@ -151,7 +166,7 @@ class AlphaZeroSweep:
 
         return training_timeout, tournament_timeout
 
-    def run_training_only(self, config: ExperimentConfig) -> Tuple[bool, float, float, str, str]:
+    def run_training_only(self, config: ExperimentConfig) -> Tuple[bool, float, float, float, str, str, str]:
         """Run only the training phase of an experiment"""
         work_dir = self.results_dir / config.name
         work_dir.mkdir(exist_ok=True)
@@ -171,8 +186,7 @@ class AlphaZeroSweep:
             result = subprocess.run(
                 cmd,
                 capture_output=True,
-                text=True,
-                timeout=config.training_timeout
+                text=True
             )
 
             training_time = time.time() - training_start
@@ -185,11 +199,16 @@ class AlphaZeroSweep:
 
                 # Read metrics from CSV log (more reliable than regex on stdout)
                 training_games_per_sec = 0.0
+                vs_deep = "N/A"
                 if Path(csv_log).exists():
                     try:
                         log_df = pd.read_csv(csv_log)
                         if not log_df.empty:
                             training_games_per_sec = log_df['games_per_sec'].mean()
+                            if 'fixed_suite_vs_deep' in log_df.columns:
+                                deep_series = pd.to_numeric(log_df['fixed_suite_vs_deep'], errors='coerce').dropna()
+                                if not deep_series.empty:
+                                    vs_deep = f"{deep_series.iloc[-1]:.1f}%"
                     except Exception:
                         pass
 
@@ -199,20 +218,18 @@ class AlphaZeroSweep:
                     with open(work_dir / 'training.log', 'w') as f:
                         f.write(output)
 
-                    return True, training_time, empty_board_value, training_games_per_sec, "", unique_model
+                    return True, training_time, empty_board_value, training_games_per_sec, vs_deep, "", unique_model
                 else:
                     with open(work_dir / 'training.log', 'w') as f:
                         f.write("STDOUT:\n" + result.stdout + "\n\nSTDERR:\n" + result.stderr)
-                    return False, training_time, 0.0, 0.0, f"Training failed - no model produced. Check {work_dir}/training.log", ""
+                    return False, training_time, 0.0, 0.0, "N/A", f"Training failed - no model produced. Check {work_dir}/training.log", ""
             else:
                 with open(work_dir / 'training.log', 'w') as f:
                     f.write("STDOUT:\n" + result.stdout + "\n\nSTDERR:\n" + result.stderr)
-                return False, training_time, 0.0, 0.0, f"Training failed with code {result.returncode}. Check {work_dir}/training.log", ""
+                return False, training_time, 0.0, 0.0, "N/A", f"Training failed with code {result.returncode}. Check {work_dir}/training.log", ""
 
-        except subprocess.TimeoutExpired:
-            return False, config.training_timeout, 0.0, 0.0, "Training timeout", ""
         except Exception as e:
-            return False, 0.0, 0.0, 0.0, str(e), ""
+            return False, 0.0, 0.0, 0.0, "N/A", str(e), ""
 
     def run_tournament_only(self, config: ExperimentConfig, model_file: str = "alphazero_model.bin") -> Tuple[bool, float, str, str, str]:
         """Run only the tournament phase of an experiment with isolated model file"""
@@ -306,9 +323,20 @@ class AlphaZeroSweep:
                 ['nvidia-smi', '--query-gpu=memory.used', '--format=csv,noheader,nounits'],
                 capture_output=True, text=True, timeout=2
             )
-            return int(result.stdout.strip())
-        except:
-            return 0
+            stdout = result.stdout.strip()
+            stderr = result.stderr.strip()
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"nvidia-smi failed (exit {result.returncode}). "
+                    f"stdout={stdout!r} stderr={stderr!r}"
+                )
+            first_line = stdout.splitlines()[0].strip() if stdout else ""
+            return int(first_line)
+        except Exception as e:
+            if not self._vram_query_warned:
+                print(f"⚠️ VRAM query failed: {e}", file=sys.stderr)
+                self._vram_query_warned = True
+            return -1
 
     def create_status_summary(self, experiments: List[ExperimentConfig], results: Dict[str, ExperimentResult],
                             running_training: Dict[str, float], running_tournaments: Dict[str, float]) -> str:
@@ -316,7 +344,7 @@ class AlphaZeroSweep:
         current_time = time.time()
         completed = len(results)
         total = len(experiments)
-        success = sum(1 for r in results.values() if r.training_success and r.tournament_success)
+        success = sum(1 for r in results.values() if r.training_success)
 
         # Real-time activity counts
         active_training = len(running_training)
@@ -324,7 +352,11 @@ class AlphaZeroSweep:
 
         # Real-time VRAM monitoring
         current_vram = self.get_current_vram_usage()
-        vram_percentage = f"{current_vram/self.gpu_memory*100:.1f}%" if self.gpu_memory and current_vram else "N/A"
+        vram_percentage = (
+            f"{current_vram/self.gpu_memory*100:.1f}%"
+            if self.gpu_memory and current_vram >= 0
+            else "N/A"
+        )
 
         # Activity status
         activity_status = []
@@ -335,7 +367,8 @@ class AlphaZeroSweep:
         if not activity_status:
             activity_status.append("idle")
 
-        status = f"Progress: {completed}/{total} | Success: {success}/{completed} | Active: {', '.join(activity_status)} | VRAM: {current_vram}MB ({vram_percentage})"
+        vram_display = f"{current_vram}MB" if current_vram >= 0 else "unavailable"
+        status = f"Progress: {completed}/{total} | Success: {success}/{completed} | Active: {', '.join(activity_status)} | VRAM: {vram_display} ({vram_percentage})"
         return status
 
     def print_experiment_status(self, experiments: List[ExperimentConfig], results: Dict[str, ExperimentResult],
@@ -413,256 +446,84 @@ class AlphaZeroSweep:
         return max_training_only, max_tournaments_only, False
 
     def run_sweep(self, experiments: List[ExperimentConfig], sweep_name: str = "sweep") -> pd.DataFrame:
-        """Run optimally concurrent sweep: training + tournaments together when VRAM allows"""
-
-        # Initial setup
-        training_timeout, tournament_timeout = self.calculate_timeouts()
-        for exp in experiments:
-            exp.training_timeout = training_timeout
-            exp.tournament_timeout = tournament_timeout
+        """Run training-only sweep. Uses fixed-suite vs_Deep from training logs."""
 
         start_time = time.time()
-        training_results = {}
-        final_results = {}
-        running_training = {}
-        running_tournaments = {}
+        final_results: Dict[str, ExperimentResult] = {}
+        running_training: Dict[str, float] = {}
+        training_jobs = self.max_parallel_jobs
 
-        # Determine concurrency strategy based on tournament type
-        if self.cpu_tournaments:
-            # CPU tournaments: run concurrently since they don't compete for GPU
-            training_jobs = self.max_parallel_jobs
-            actual_tournament_jobs = self.tournament_jobs
-            can_run_concurrent = True  # CPU tournaments can overlap with GPU training
-            print(f"🚀 [CPU TOURNAMENT MODE] GPU Training ({training_jobs}) + CPU Tournaments ({actual_tournament_jobs})")
-            print(f"   Tournaments start immediately when training completes (no GPU contention)")
-        else:
-            # GPU tournaments: use calculated optimal concurrency
-            training_jobs, calculated_tournament_jobs, can_run_concurrent = self.calculate_optimal_concurrency()
-            actual_tournament_jobs = calculated_tournament_jobs  # Use calculated for GPU
+        print(f"🚀 [TRAINING SWEEP MODE] Parallel training ({training_jobs} jobs)")
+        print("   Success is based on training completion.")
 
-            if can_run_concurrent:
-                print(f"🚀 [GPU CONCURRENT MODE] Training ({training_jobs}) + Tournaments ({actual_tournament_jobs})")
-                print(f"   GPU Memory: {self.gpu_memory}MB, Estimated usage: {training_jobs * 300 + actual_tournament_jobs * 5200}MB")
-            else:
-                print(f"🚀 [GPU SEQUENTIAL MODE] Training ({training_jobs}) → Tournaments ({actual_tournament_jobs})")
-                print(f"   GPU Memory: {self.gpu_memory}MB (insufficient for concurrent)")
-
-        if can_run_concurrent:
-            # Concurrent Mode: separate pools for GPU training and CPU tournaments
-            training_executor = ThreadPoolExecutor(max_workers=training_jobs)
-            tournament_executor = ThreadPoolExecutor(max_workers=actual_tournament_jobs)
-
-            # Submit all training jobs (pool limits concurrency to training_jobs)
+        with ThreadPoolExecutor(max_workers=training_jobs) as executor:
             print(f"  🚀 Starting {len(experiments)} training jobs (max {training_jobs} concurrent)...", flush=True)
             training_futures = {}
             for i, exp in enumerate(experiments, 1):
-                future = training_executor.submit(self.run_training_only, exp)
+                future = executor.submit(self.run_training_only, exp)
                 training_futures[future] = exp
+                running_training[exp.name] = time.time()
                 print(f"    [{i}/{len(experiments)}] Queued: {exp.name}", flush=True)
             print(f"  ✅ All {len(experiments)} training jobs queued", flush=True)
 
-            for future, exp in training_futures.items():
-                running_training[exp.name] = time.time()
-
-            tournament_futures = {}
             completed_training = 0
-
             last_status_update = time.time()
             status_update_interval = 30
 
-            # Process training completions and submit tournaments
             for future in as_completed(training_futures):
                 exp = training_futures[future]
+                if exp.name in running_training:
+                    del running_training[exp.name]
+
                 try:
-                    success, train_time, empty_value, training_games_per_sec, error, model_file = future.result()
-                    training_results[exp.name] = (success, train_time, empty_value, training_games_per_sec, error, model_file)
+                    success, train_time, empty_value, training_games_per_sec, vs_deep, error, _ = future.result()
                     completed_training += 1
 
-                    if exp.name in running_training:
-                        del running_training[exp.name]
+                    if success:
+                        print(
+                            f"  ✅ Training {completed_training}/{len(experiments)}: "
+                            f"{exp.name} - {train_time:.1f}s, value={empty_value:.3f}, "
+                            f"vs_Deep={vs_deep}, {training_games_per_sec:.1f} games/sec"
+                        )
+                    else:
+                        print(f"  ❌ Training {completed_training}/{len(experiments)}: {exp.name} - {error}")
 
-                    print(f"  ✅ Training {completed_training}/{len(experiments)}: {exp.name} - {train_time:.1f}s, value={empty_value:.3f}, {training_games_per_sec:.1f} games/sec" if success else f"  ❌ Training: {exp.name} - {error}")
-
-                    # Submit tournament to separate CPU pool
-                    if success and model_file:
-                        tournament_future = tournament_executor.submit(self.run_tournament_only, exp, model_file)
-                        tournament_futures[tournament_future] = (exp, train_time, empty_value)
-                        running_tournaments[exp.name] = time.time()
-
-                    # Preliminary result
                     final_results[exp.name] = ExperimentResult(
                         name=exp.name,
                         args=exp.args,
                         training_time=train_time,
                         training_success=success,
                         empty_board_value=empty_value,
-                        vs_random="⏳" if success else "N/A",
-                        vs_deep="⏳" if success else "N/A",
-                        vs_medium="⏳" if success else "N/A",
-                        tournament_success=False,
-                        total_time=train_time,
                         training_games_per_sec=training_games_per_sec,
+                        vs_random="N/A",
+                        vs_deep=vs_deep if success else "N/A",
+                        vs_medium="N/A",
+                        tournament_success=success,
                         tournament_games_per_sec=0.0,
+                        total_time=train_time,
                     )
 
                     current_time = time.time()
                     if current_time - last_status_update > status_update_interval:
-                        print(f"\n[STATUS] {self.create_status_summary(experiments, final_results, running_training, running_tournaments)}")
+                        print(f"\n[STATUS] {self.create_status_summary(experiments, final_results, running_training, {})}")
                         last_status_update = current_time
-
                 except Exception as e:
-                    print(f"❌ Training exception in {exp.name}: {e}")
-                    if exp.name in running_training:
-                        del running_training[exp.name]
-
-            training_executor.shutdown(wait=False)
-
-            # Wait for remaining tournaments
-            print(f"\n📋 Waiting for {len(tournament_futures)} tournaments...", flush=True)
-            for future in as_completed(tournament_futures):
-                exp, train_time, empty_value = tournament_futures[future]
-                if exp.name in running_tournaments:
-                    del running_tournaments[exp.name]
-                try:
-                    success, tournament_games_per_sec, vs_random, vs_deep, vs_medium = future.result(timeout=300)
-                    training_games_per_sec = training_results[exp.name][3] if exp.name in training_results else 0.0
+                    completed_training += 1
+                    print(f"❌ Training exception {completed_training}/{len(experiments)} in {exp.name}: {e}")
                     final_results[exp.name] = ExperimentResult(
                         name=exp.name,
                         args=exp.args,
-                        training_time=train_time,
-                        training_success=True,
-                        empty_board_value=empty_value,
-                        vs_random=vs_random,
-                        vs_deep=vs_deep,
-                        vs_medium=vs_medium,
-                        tournament_success=success,
-                        total_time=train_time,
-                        training_games_per_sec=training_games_per_sec,
-                        tournament_games_per_sec=tournament_games_per_sec,
+                        training_time=0.0,
+                        training_success=False,
+                        empty_board_value=0.0,
+                        training_games_per_sec=0.0,
+                        vs_random="N/A",
+                        vs_deep="N/A",
+                        vs_medium="N/A",
+                        tournament_success=False,
+                        tournament_games_per_sec=0.0,
+                        total_time=0.0,
                     )
-                    if success:
-                        print(f"  ✅ Tournament: {exp.name} - Random={vs_random}, Deep={vs_deep}, Medium={vs_medium}")
-                    else:
-                        print(f"  ❌ Tournament failed: {exp.name}")
-                except Exception as e:
-                    print(f"❌ Tournament exception in {exp.name}: {e}")
-
-            tournament_executor.shutdown()
-
-        else:
-            # Sequential Mode: Training first, then tournaments
-            # Phase 1: Parallel Training
-            with ThreadPoolExecutor(max_workers=training_jobs) as executor:
-                print(f"  🚀 Starting {len(experiments)} training jobs...", flush=True)
-                training_futures = {}
-                for i, exp in enumerate(experiments, 1):
-                    print(f"    [{i}/{len(experiments)}] Submitting: {exp.name}", flush=True)
-                    future = executor.submit(self.run_training_only, exp)
-                    training_futures[future] = exp
-                    print(f"    [{i}/{len(experiments)}] ✅ Queued: {exp.name}", flush=True)
-                print(f"  ✅ All {len(experiments)} training jobs submitted", flush=True)
-
-                for future, exp in training_futures.items():
-                    running_training[exp.name] = time.time()
-
-                # Status update interval
-                last_status_update = time.time()
-                status_update_interval = 10  # seconds (more frequent updates)
-
-                for future in as_completed(training_futures):
-                    exp = training_futures[future]
-                    try:
-                        success, train_time, empty_value, training_games_per_sec, error, model_file = future.result()
-                        training_results[exp.name] = (success, train_time, empty_value, training_games_per_sec, error, model_file)
-
-                        if exp.name in running_training:
-                            del running_training[exp.name]
-
-                        final_results[exp.name] = ExperimentResult(
-                            name=exp.name,
-                            args=exp.args,
-                            training_time=train_time,
-                            training_success=success,
-                            empty_board_value=empty_value,
-                            vs_random="⏳" if success else "N/A",
-                            vs_deep="⏳" if success else "N/A",
-                            vs_medium="⏳" if success else "N/A",
-                            tournament_success=False,
-                            total_time=train_time,
-                            training_games_per_sec=training_games_per_sec,
-                            tournament_games_per_sec=0.0  # Not yet available
-                        )
-
-                        print(f"  ✅ Training: {exp.name} - {train_time:.1f}s, value={empty_value:.3f}, {training_games_per_sec:.1f} games/sec" if success else f"  ❌ Training: {exp.name} - {error}")
-
-                        # Periodic status updates
-                        current_time = time.time()
-                        if current_time - last_status_update > status_update_interval:
-                            print(f"\n[STATUS] {self.create_status_summary(experiments, final_results, running_training, {})}")
-                            last_status_update = current_time
-
-                    except Exception as e:
-                        print(f"❌ Exception in {exp.name}: {e}")
-                        if exp.name in running_training:
-                            del running_training[exp.name]
-
-            # Phase 2: Parallel Tournaments
-            print(f"\n🏆 [PHASE 2] Parallel Tournaments ({self.tournament_jobs} jobs)")
-            successful_training = [exp for exp in experiments if training_results.get(exp.name, (False,))[0]]
-
-            with ThreadPoolExecutor(max_workers=self.tournament_jobs) as tournament_executor:
-                tournament_futures = {}
-                running_tournaments = {}
-                for exp in successful_training:
-                    train_success, train_time, empty_value, training_games_per_sec, error, model_file = training_results[exp.name]
-                    if model_file:
-                        future = tournament_executor.submit(self.run_tournament_only, exp, model_file)
-                        tournament_futures[future] = (exp, train_time, empty_value)
-                        running_tournaments[exp.name] = time.time()
-
-                # Status update interval
-                last_status_update = time.time()
-
-                for i, future in enumerate(as_completed(tournament_futures), 1):
-                    exp, train_time, empty_value = tournament_futures[future]
-
-                    if exp.name in running_tournaments:
-                        del running_tournaments[exp.name]
-
-                    print(f"  🎯 Tournament {i}/{len(tournament_futures)}: {exp.name}")
-
-                    try:
-                        success, tournament_games_per_sec, vs_random, vs_deep, vs_medium = future.result()
-
-                        training_games_per_sec = training_results[exp.name][3] if exp.name in training_results else 0.0
-                        final_results[exp.name] = ExperimentResult(
-                            name=exp.name,
-                            args=exp.args,
-                            training_time=train_time,
-                            training_success=True,
-                            empty_board_value=empty_value,
-                            vs_random=vs_random,
-                            vs_deep=vs_deep,
-                            vs_medium=vs_medium,
-                            tournament_success=success,
-                            total_time=train_time,  # Sequential, but report training time only
-                            training_games_per_sec=training_games_per_sec,
-                            tournament_games_per_sec=tournament_games_per_sec
-                        )
-
-                        if success:
-                            print(f"    ✅ Results: Random={vs_random}, Deep={vs_deep}, Medium={vs_medium}, {tournament_games_per_sec:.1f} games/sec")
-                        else:
-                            print(f"    ❌ Tournament failed")
-
-                    except Exception as e:
-                        print(f"❌ Tournament exception in {exp.name}: {e}")
-
-                    # Periodic status updates
-                    current_time = time.time()
-                    if current_time - last_status_update > status_update_interval:
-                        print(f"\n[STATUS] {self.create_status_summary(experiments, final_results, {}, running_tournaments)}")
-                        last_status_update = current_time
 
         total_time = time.time() - start_time
 
@@ -679,7 +540,7 @@ class AlphaZeroSweep:
                 'vs_Random': r.vs_random,
                 'vs_Deep': r.vs_deep,
                 'vs_Medium': r.vs_medium,
-                'Status': 'SUCCESS' if r.training_success and r.tournament_success else 'FAILED',
+                'Status': 'SUCCESS' if r.training_success else 'FAILED',
                 'Total_Time': f"{r.total_time:.1f}s"
             }
             for r in final_results.values()
@@ -727,20 +588,13 @@ class AlphaZeroSweep:
 
             if not successful_experiments.empty:
                 successful_experiments = successful_experiments.copy()
-                successful_experiments['Random_Score'] = successful_experiments['vs_Random'].apply(extract_score)
                 successful_experiments['Deep_Score'] = successful_experiments['vs_Deep'].apply(extract_score)
-                successful_experiments['Medium_Score'] = successful_experiments['vs_Medium'].apply(extract_score)
-                successful_experiments['Total_Score'] = (
-                    successful_experiments['Random_Score'] +
-                    successful_experiments['Deep_Score'] +
-                    successful_experiments['Medium_Score']
-                )
+                successful_experiments['Total_Score'] = successful_experiments['Deep_Score']
 
-                # Top 5 by combined score across opponents
+                # Top 5 by in-training fixed-suite vs_Deep
                 top_performers = successful_experiments.nlargest(5, 'Total_Score')
                 for idx, row in top_performers.iterrows():
-                    print(f"   {row['Experiment']}: {row['Total_Score']:.1f} total score "
-                          f"(R:{row['vs_Random']}, D:{row['vs_Deep']}, M:{row['vs_Medium']})")
+                    print(f"   {row['Experiment']}: vs_Deep={row['vs_Deep']}")
 
         # Display full results table
         print(f"\n📋 DETAILED RESULTS")
