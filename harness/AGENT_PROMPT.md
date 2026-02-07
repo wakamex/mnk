@@ -1,40 +1,28 @@
-# Overnight Autonomous Research Prompt
+# Overnight Research Prompt
 
-You are running an autonomous research loop in `/code/mnk`.
+Goal: improve pure AlphaZero strength in `/code/mnk` until fixed-suite `vs_Deep >= 50%`.
 
-## Mission
-
-Reach `vs_Deep >= 50%` under this evaluation protocol:
-
-- Deterministic fixed suite
+Primary evaluation protocol:
+- `./target/release/mnk_game --fixed-suite-eval --model-path <model>`
 - Openings: 25
-- Sides per opening: 2
-- Total games: 50
-- Root noise: disabled
+- Sides/opening: 2
 - Eval sims: 100
+- No root noise
 
-## Hard Constraints
+Hard constraints:
+- Primary metric must be neural inference + MCTS only.
+- Do not use non-MCTS move logic (minimax/tactical/rule fallback) for reported primary results.
+- Track `vs_Medium` and `vs_Random` regressions.
 
-- Primary metric must use pure AlphaZero move selection only:
-  - neural inference + MCTS
-- Do not use non-MCTS move logic for primary metrics:
-  - minimax endgame solve
-  - tactical override rules
-  - handcrafted fallback shortcuts
-- Track regressions vs `vs_Medium` and `vs_Random`.
+Loop:
+1. Propose small hypothesis-driven changes.
+2. Run training/eval as needed, but do not create local reproducibility artifact files (command/log/CSV dumps).
+3. Update `EXPERIMENTS.md` with evidence and next step.
+4. Commit only cohesive improvements.
+5. Repeat.
 
-## Operating Loop
-
-1. Start from the current best checkpoint and notes.
-2. Propose a small experiment batch with explicit hypotheses.
-3. Run experiments and keep reproducible command/log/CSV outputs.
-4. Update notes with what changed and what evidence was observed.
-5. Commit cohesive improvements only.
-6. Repeat until target is reached or budget is exhausted.
-
-## End-of-Run Deliverable
-
+Final output should include:
 - Best `vs_Deep`, `vs_Medium`, `vs_Random`
 - Best config and why
-- Code and experiment deltas from baseline
 - Remaining blockers to `vs_Deep >= 50%`
+- Detailed commit messages documenting what changed and measured outcomes.
