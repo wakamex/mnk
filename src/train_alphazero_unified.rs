@@ -8,7 +8,9 @@ use burn::prelude::*;
 use burn::tensor::activation;
 use burn::tensor::backend::AutodiffBackend;
 use clap::Parser;
-use mnk::fixed_suite_eval::{evaluate_fixed_suite_inprocess, FixedSuiteConfig, FixedSuiteEvaluation};
+use mnk::fixed_suite_eval::{
+    evaluate_fixed_suite_vs_deep_inprocess, FixedSuiteConfig, FixedSuiteDeepEvaluation,
+};
 use mnk::network::{Network, NetworkType};
 use mnk::unified_mcts::NetworkInference;
 use mnk::unified_mcts::TrainingExample;
@@ -299,29 +301,29 @@ fn canonicalize_example(example: &TrainingExample) -> TrainingExample {
     best_example.expect("at least one symmetry candidate")
 }
 
-fn run_lightweight_fixed_suite_eval<B, N>(
+fn run_fixed_suite_eval<B, N>(
     net: &N,
     args: &Args,
     iteration: usize,
-) -> Option<FixedSuiteEvaluation>
+) -> Option<FixedSuiteDeepEvaluation>
 where
     B: Backend<FloatElem = f32>,
     N: NetworkInference<B>,
 {
-    if args.light_eval_every == 0 || iteration % args.light_eval_every != 0 {
+    if args.fixed_suite_every == 0 || iteration % args.fixed_suite_every != 0 {
         return None;
     }
 
     let cfg = FixedSuiteConfig {
-        openings: args.light_eval_openings,
-        sides: args.light_eval_sides,
-        sims: args.light_eval_sims,
-        cpuct: args.light_eval_cpuct,
-        max_plies: args.light_eval_max_plies,
-        seed: args.light_eval_seed,
+        openings: args.fixed_suite_openings,
+        sides: args.fixed_suite_sides,
+        sims: args.fixed_suite_sims,
+        cpuct: args.fixed_suite_cpuct,
+        max_plies: args.fixed_suite_max_plies,
+        seed: args.fixed_suite_seed,
         csv_path: None,
     };
-    match evaluate_fixed_suite_inprocess::<B, N>(net, &cfg) {
+    match evaluate_fixed_suite_vs_deep_inprocess::<B, N>(net, &cfg) {
         Ok(eval) => Some(eval),
         Err(e) => {
             eprintln!("Fixed-suite eval skipped: {}", e);
@@ -400,31 +402,31 @@ struct Args {
 
     /// Run fixed-suite check every N iterations (0 disables)
     #[arg(long, default_value = "1")]
-    light_eval_every: usize,
+    fixed_suite_every: usize,
 
     /// Fixed-suite openings
     #[arg(long, default_value = "25")]
-    light_eval_openings: usize,
+    fixed_suite_openings: usize,
 
     /// Fixed-suite sides per opening
     #[arg(long, default_value = "2")]
-    light_eval_sides: usize,
+    fixed_suite_sides: usize,
 
     /// Fixed-suite MCTS sims
     #[arg(long, default_value = "100")]
-    light_eval_sims: usize,
+    fixed_suite_sims: usize,
 
     /// Fixed-suite PUCT
     #[arg(long, default_value = "0.75")]
-    light_eval_cpuct: f32,
+    fixed_suite_cpuct: f32,
 
     /// Fixed-suite max opening plies
     #[arg(long, default_value = "4")]
-    light_eval_max_plies: usize,
+    fixed_suite_max_plies: usize,
 
     /// Fixed-suite deterministic random seed
     #[arg(long, default_value = "20260207")]
-    light_eval_seed: u64,
+    fixed_suite_seed: u64,
 }
 
 fn main() {
@@ -504,16 +506,16 @@ fn main() {
     );
     println!("  Dirichlet alpha: {}", args.dirichlet_alpha);
     println!("  Replay buffer size: {}", args.replay_buffer_size);
-    if args.light_eval_every > 0 {
+    if args.fixed_suite_every > 0 {
         println!(
-            "  Fixed-suite eval: every {} iters (openings={}, sides={}, sims={}, cpuct={}, max_plies={}, seed={})",
-            args.light_eval_every,
-            args.light_eval_openings,
-            args.light_eval_sides,
-            args.light_eval_sims,
-            args.light_eval_cpuct,
-            args.light_eval_max_plies,
-            args.light_eval_seed
+            "  Fixed-suite eval (Deep): every {} iters (openings={}, sides={}, sims={}, cpuct={}, max_plies={}, seed={})",
+            args.fixed_suite_every,
+            args.fixed_suite_openings,
+            args.fixed_suite_sides,
+            args.fixed_suite_sims,
+            args.fixed_suite_cpuct,
+            args.fixed_suite_max_plies,
+            args.fixed_suite_seed
         );
     } else {
         println!("  Fixed-suite eval: disabled");
@@ -525,7 +527,11 @@ fn main() {
         let file = std::fs::File::create(path).expect("Failed to create CSV log file");
         let mut w = std::io::BufWriter::new(file);
         use std::io::Write;
-        writeln!(w, "iteration,wall_clock_s,selfplay_s,training_s,games_per_sec,value_loss,policy_loss,vs_random,vs_deep_light,vs_medium_light,vs_random_light,vram_used_mb").unwrap();
+        writeln!(
+            w,
+            "iteration,wall_clock_s,selfplay_s,training_s,games_per_sec,value_loss,policy_loss,fixed_suite_vs_deep,vram_used_mb"
+        )
+        .unwrap();
         w
     });
 
@@ -747,22 +753,15 @@ fn main() {
 
         // Evaluate every iteration and report timing.
         let net_valid = net.valid();
-        let fixed_suite_eval = run_lightweight_fixed_suite_eval::<
+        let fixed_suite_eval = run_fixed_suite_eval::<
             <MyBackend as AutodiffBackend>::InnerBackend,
             _,
         >(&net_valid, &args, iteration);
-        let fixed_suite_metrics = fixed_suite_eval.map(|eval| eval.metrics());
-        let vs_random = fixed_suite_metrics.map(|m| m.vs_random / 100.0);
         if let Some(eval) = fixed_suite_eval {
-            let metrics = eval.metrics();
             println!(
-                "  Fixed-suite: vs_Deep={:.1}% vs_Medium={:.1}% vs_Random={:.1}% (Deep {:.2}s, Medium {:.2}s, Random {:.2}s, Total {:.2}s)",
-                metrics.vs_deep,
-                metrics.vs_medium,
-                metrics.vs_random,
+                "  Fixed-suite: vs_Deep={:.1}% (Deep {:.2}s, Total {:.2}s)",
+                eval.score_percent(),
                 eval.timing.deep_s,
-                eval.timing.medium_s,
-                eval.timing.random_s,
                 eval.timing.total_s
             );
         }
@@ -777,17 +776,13 @@ fn main() {
         if let Some(ref mut w) = csv_writer {
             use std::io::Write;
             let wall_clock = start_time.elapsed().as_secs_f32();
-            let vs_random_str = vs_random.map_or(String::new(), |v| format!("{:.4}", v));
-            let vs_deep_light_str =
-                fixed_suite_metrics.map_or(String::new(), |m| format!("{:.1}", m.vs_deep));
-            let vs_medium_light_str =
-                fixed_suite_metrics.map_or(String::new(), |m| format!("{:.1}", m.vs_medium));
-            let vs_random_light_str =
-                fixed_suite_metrics.map_or(String::new(), |m| format!("{:.1}", m.vs_random));
+            let fixed_suite_vs_deep = fixed_suite_eval
+                .map(|eval| format!("{:.1}", eval.score_percent()))
+                .unwrap_or_default();
             let vram_str = vram_used.map_or(String::new(), |v| format!("{}", v));
             writeln!(
                 w,
-                "{},{:.2},{:.3},{:.3},{:.1},{:.4},{:.4},{},{},{},{},{}",
+                "{},{:.2},{:.3},{:.3},{:.1},{:.4},{:.4},{},{}",
                 iteration,
                 wall_clock,
                 selfplay_time.as_secs_f32(),
@@ -795,10 +790,7 @@ fn main() {
                 iter_games_per_sec,
                 final_value_loss,
                 final_policy_loss,
-                vs_random_str,
-                vs_deep_light_str,
-                vs_medium_light_str,
-                vs_random_light_str,
+                fixed_suite_vs_deep,
                 vram_str
             )
             .unwrap();

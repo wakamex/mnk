@@ -92,10 +92,28 @@ impl FixedSuiteEvaluation {
 }
 
 #[derive(Clone, Copy, Debug)]
+pub struct FixedSuiteDeepEvaluation {
+    pub deep: MatchupResult,
+    pub timing: FixedSuiteDeepTiming,
+}
+
+impl FixedSuiteDeepEvaluation {
+    pub fn score_percent(&self) -> f32 {
+        self.deep.score_percent()
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
 pub struct FixedSuiteTiming {
     pub deep_s: f32,
     pub medium_s: f32,
     pub random_s: f32,
+    pub total_s: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct FixedSuiteDeepTiming {
+    pub deep_s: f32,
     pub total_s: f32,
 }
 
@@ -148,6 +166,9 @@ impl Opponent {
         }
     }
 }
+
+const OPPONENTS_FULL: [Opponent; 3] = [Opponent::Deep, Opponent::Medium, Opponent::Random];
+const OPPONENTS_DEEP_ONLY: [Opponent; 1] = [Opponent::Deep];
 
 #[derive(Clone, Copy, Debug)]
 enum GameOutcome {
@@ -533,10 +554,22 @@ fn evaluate_matchup<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
     Ok(aggregate)
 }
 
-pub fn evaluate_fixed_suite_inprocess<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
+struct FixedSuiteRunData {
+    deep: Option<MatchupResult>,
+    medium: Option<MatchupResult>,
+    random: Option<MatchupResult>,
+    timing: FixedSuiteTiming,
+}
+
+fn require_result(result: Option<MatchupResult>, label: &str) -> Result<MatchupResult, String> {
+    result.ok_or_else(|| format!("fixed-suite run missing {}", label))
+}
+
+fn evaluate_fixed_suite_with_opponents<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
     net: &N,
     cfg: &FixedSuiteConfig,
-) -> Result<FixedSuiteEvaluation, String> {
+    opponents: &[Opponent],
+) -> Result<FixedSuiteRunData, String> {
     let total_start = Instant::now();
     if cfg.openings == 0 {
         return Err("openings must be >= 1".to_string());
@@ -556,26 +589,75 @@ pub fn evaluate_fixed_suite_inprocess<B: Backend<FloatElem = f32>, N: NetworkInf
 
     let mut csv_writer = prepare_csv_writer(cfg.csv_path.as_ref())?;
 
-    let deep_start = Instant::now();
-    let deep = evaluate_matchup(net, cfg, &openings, Opponent::Deep, &mut csv_writer)?;
-    let deep_s = deep_start.elapsed().as_secs_f32();
-    let medium_start = Instant::now();
-    let medium = evaluate_matchup(net, cfg, &openings, Opponent::Medium, &mut csv_writer)?;
-    let medium_s = medium_start.elapsed().as_secs_f32();
-    let random_start = Instant::now();
-    let random = evaluate_matchup(net, cfg, &openings, Opponent::Random, &mut csv_writer)?;
-    let random_s = random_start.elapsed().as_secs_f32();
-    let total_s = total_start.elapsed().as_secs_f32();
+    let mut deep = None;
+    let mut medium = None;
+    let mut random = None;
+    let mut timing = FixedSuiteTiming {
+        deep_s: 0.0,
+        medium_s: 0.0,
+        random_s: 0.0,
+        total_s: 0.0,
+    };
 
-    Ok(FixedSuiteEvaluation {
+    for &opponent in opponents {
+        let start = Instant::now();
+        let result = evaluate_matchup(net, cfg, &openings, opponent, &mut csv_writer)?;
+        let elapsed_s = start.elapsed().as_secs_f32();
+        match opponent {
+            Opponent::Deep => {
+                deep = Some(result);
+                timing.deep_s = elapsed_s;
+            }
+            Opponent::Medium => {
+                medium = Some(result);
+                timing.medium_s = elapsed_s;
+            }
+            Opponent::Random => {
+                random = Some(result);
+                timing.random_s = elapsed_s;
+            }
+        }
+    }
+
+    timing.total_s = total_start.elapsed().as_secs_f32();
+
+    Ok(FixedSuiteRunData {
         deep,
         medium,
         random,
-        timing: FixedSuiteTiming {
-            deep_s,
-            medium_s,
-            random_s,
-            total_s,
+        timing,
+    })
+}
+
+pub fn evaluate_fixed_suite_inprocess<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
+    net: &N,
+    cfg: &FixedSuiteConfig,
+) -> Result<FixedSuiteEvaluation, String> {
+    let run = evaluate_fixed_suite_with_opponents(net, cfg, &OPPONENTS_FULL)?;
+
+    Ok(FixedSuiteEvaluation {
+        deep: require_result(run.deep, "Deep result")?,
+        medium: require_result(run.medium, "Medium result")?,
+        random: require_result(run.random, "Random result")?,
+        timing: run.timing,
+    })
+}
+
+pub fn evaluate_fixed_suite_vs_deep_inprocess<
+    B: Backend<FloatElem = f32>,
+    N: NetworkInference<B>,
+>(
+    net: &N,
+    cfg: &FixedSuiteConfig,
+) -> Result<FixedSuiteDeepEvaluation, String> {
+    let run = evaluate_fixed_suite_with_opponents(net, cfg, &OPPONENTS_DEEP_ONLY)?;
+    let deep = require_result(run.deep, "Deep result")?;
+
+    Ok(FixedSuiteDeepEvaluation {
+        deep,
+        timing: FixedSuiteDeepTiming {
+            deep_s: run.timing.deep_s,
+            total_s: run.timing.total_s,
         },
     })
 }
