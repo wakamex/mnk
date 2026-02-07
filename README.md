@@ -22,7 +22,7 @@ bash build.sh
 ### Host vs Container (quick note)
 
 - **Build**: use `bash build.sh` (runs inside `cuda-dev` via `podman exec`).
-- **Run eval/tournament**: run on host with `./target/release/mnk_game ...` (no container required).
+- **Run eval/tournament**: run on host with `./target/release/mnk_game ...` (no container required). Add `--cpu` to force CPU inference.
 - **Run training**: host or `cuda-dev` both work; host requires a working NVIDIA driver/CUDA runtime setup.
 
 ## Training

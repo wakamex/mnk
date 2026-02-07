@@ -4,6 +4,7 @@ use std::collections::{HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::PathBuf;
+use std::time::Instant;
 
 use crate::unified_mcts::{mcts_search_with_hyperparams, NetworkInference};
 
@@ -77,6 +78,7 @@ pub struct FixedSuiteEvaluation {
     pub deep: MatchupResult,
     pub medium: MatchupResult,
     pub random: MatchupResult,
+    pub timing: FixedSuiteTiming,
 }
 
 impl FixedSuiteEvaluation {
@@ -87,6 +89,14 @@ impl FixedSuiteEvaluation {
             vs_random: self.random.score_percent(),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct FixedSuiteTiming {
+    pub deep_s: f32,
+    pub medium_s: f32,
+    pub random_s: f32,
+    pub total_s: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -527,6 +537,7 @@ pub fn evaluate_fixed_suite_inprocess<B: Backend<FloatElem = f32>, N: NetworkInf
     net: &N,
     cfg: &FixedSuiteConfig,
 ) -> Result<FixedSuiteEvaluation, String> {
+    let total_start = Instant::now();
     if cfg.openings == 0 {
         return Err("openings must be >= 1".to_string());
     }
@@ -545,14 +556,27 @@ pub fn evaluate_fixed_suite_inprocess<B: Backend<FloatElem = f32>, N: NetworkInf
 
     let mut csv_writer = prepare_csv_writer(cfg.csv_path.as_ref())?;
 
+    let deep_start = Instant::now();
     let deep = evaluate_matchup(net, cfg, &openings, Opponent::Deep, &mut csv_writer)?;
+    let deep_s = deep_start.elapsed().as_secs_f32();
+    let medium_start = Instant::now();
     let medium = evaluate_matchup(net, cfg, &openings, Opponent::Medium, &mut csv_writer)?;
+    let medium_s = medium_start.elapsed().as_secs_f32();
+    let random_start = Instant::now();
     let random = evaluate_matchup(net, cfg, &openings, Opponent::Random, &mut csv_writer)?;
+    let random_s = random_start.elapsed().as_secs_f32();
+    let total_s = total_start.elapsed().as_secs_f32();
 
     Ok(FixedSuiteEvaluation {
         deep,
         medium,
         random,
+        timing: FixedSuiteTiming {
+            deep_s,
+            medium_s,
+            random_s,
+            total_s,
+        },
     })
 }
 

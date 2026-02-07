@@ -9,7 +9,7 @@ use burn::tensor::activation;
 use burn::tensor::backend::AutodiffBackend;
 use clap::Parser;
 use mnk::alphazero::evaluate_vs_random;
-use mnk::fixed_suite_eval::{evaluate_fixed_suite_inprocess, FixedSuiteConfig, FixedSuiteMetrics};
+use mnk::fixed_suite_eval::{evaluate_fixed_suite_inprocess, FixedSuiteConfig, FixedSuiteEvaluation};
 use mnk::network::{Network, NetworkType};
 use mnk::unified_mcts::NetworkInference;
 use mnk::unified_mcts::TrainingExample;
@@ -329,7 +329,7 @@ fn run_lightweight_fixed_suite_eval<B, N>(
     net: &N,
     args: &Args,
     iteration: usize,
-) -> Option<FixedSuiteMetrics>
+) -> Option<FixedSuiteEvaluation>
 where
     B: Backend<FloatElem = f32>,
     N: NetworkInference<B>,
@@ -348,9 +348,9 @@ where
         csv_path: None,
     };
     match evaluate_fixed_suite_inprocess::<B, N>(net, &cfg) {
-        Ok(eval) => Some(eval.metrics()),
+        Ok(eval) => Some(eval),
         Err(e) => {
-            eprintln!("Light fixed-suite eval skipped: {}", e);
+            eprintln!("Fixed-suite eval skipped: {}", e);
             None
         }
     }
@@ -424,31 +424,31 @@ struct Args {
     #[arg(long, default_value = "20000")]
     replay_buffer_size: usize,
 
-    /// Run lightweight fixed-suite check every N iterations (0 disables)
-    #[arg(long, default_value = "5")]
+    /// Run fixed-suite check every N iterations (0 disables)
+    #[arg(long, default_value = "1")]
     light_eval_every: usize,
 
-    /// Lightweight fixed-suite openings
-    #[arg(long, default_value = "8")]
+    /// Fixed-suite openings
+    #[arg(long, default_value = "25")]
     light_eval_openings: usize,
 
-    /// Lightweight fixed-suite sides per opening
+    /// Fixed-suite sides per opening
     #[arg(long, default_value = "2")]
     light_eval_sides: usize,
 
-    /// Lightweight fixed-suite MCTS sims
-    #[arg(long, default_value = "50")]
+    /// Fixed-suite MCTS sims
+    #[arg(long, default_value = "100")]
     light_eval_sims: usize,
 
-    /// Lightweight fixed-suite PUCT
+    /// Fixed-suite PUCT
     #[arg(long, default_value = "0.75")]
     light_eval_cpuct: f32,
 
-    /// Lightweight fixed-suite max opening plies
-    #[arg(long, default_value = "2")]
+    /// Fixed-suite max opening plies
+    #[arg(long, default_value = "4")]
     light_eval_max_plies: usize,
 
-    /// Lightweight fixed-suite deterministic random seed
+    /// Fixed-suite deterministic random seed
     #[arg(long, default_value = "20260207")]
     light_eval_seed: u64,
 }
@@ -532,7 +532,7 @@ fn main() {
     println!("  Replay buffer size: {}", args.replay_buffer_size);
     if args.light_eval_every > 0 {
         println!(
-            "  Light fixed-suite eval: every {} iters (openings={}, sides={}, sims={}, cpuct={}, max_plies={}, seed={})",
+            "  Fixed-suite eval: every {} iters (openings={}, sides={}, sims={}, cpuct={}, max_plies={}, seed={})",
             args.light_eval_every,
             args.light_eval_openings,
             args.light_eval_sides,
@@ -542,7 +542,7 @@ fn main() {
             args.light_eval_seed
         );
     } else {
-        println!("  Light fixed-suite eval: disabled");
+        println!("  Fixed-suite eval: disabled");
     }
     println!();
 
@@ -774,20 +774,34 @@ fn main() {
             iter_time.as_secs_f32()
         );
 
-        // Evaluate every iteration (~0.5s overhead, gives continuous quality signal)
+        // Evaluate every iteration and report timing.
         let net_valid = net.valid();
+        let vs_random_eval_start = std::time::Instant::now();
         let win_rate =
             evaluate_vs_random::<<MyBackend as AutodiffBackend>::InnerBackend, _>(&net_valid);
-        println!("  vs Random: {:.1}%", win_rate * 100.0);
+        let vs_random_eval_s = vs_random_eval_start.elapsed().as_secs_f32();
+        println!(
+            "  vs Random: {:.1}% (eval {:.2}s)",
+            win_rate * 100.0,
+            vs_random_eval_s
+        );
         let vs_random = Some(win_rate);
-        let light_metrics = run_lightweight_fixed_suite_eval::<
+        let fixed_suite_eval = run_lightweight_fixed_suite_eval::<
             <MyBackend as AutodiffBackend>::InnerBackend,
             _,
         >(&net_valid, &args, iteration);
-        if let Some(metrics) = light_metrics {
+        let fixed_suite_metrics = fixed_suite_eval.map(|eval| eval.metrics());
+        if let Some(eval) = fixed_suite_eval {
+            let metrics = eval.metrics();
             println!(
-                "  Light fixed-suite: vs_Deep={:.1}% vs_Medium={:.1}% vs_Random={:.1}%",
-                metrics.vs_deep, metrics.vs_medium, metrics.vs_random
+                "  Fixed-suite: vs_Deep={:.1}% vs_Medium={:.1}% vs_Random={:.1}% (Deep {:.2}s, Medium {:.2}s, Random {:.2}s, Total {:.2}s)",
+                metrics.vs_deep,
+                metrics.vs_medium,
+                metrics.vs_random,
+                eval.timing.deep_s,
+                eval.timing.medium_s,
+                eval.timing.random_s,
+                eval.timing.total_s
             );
         }
 
@@ -803,11 +817,11 @@ fn main() {
             let wall_clock = start_time.elapsed().as_secs_f32();
             let vs_random_str = vs_random.map_or(String::new(), |v| format!("{:.4}", v));
             let vs_deep_light_str =
-                light_metrics.map_or(String::new(), |m| format!("{:.1}", m.vs_deep));
+                fixed_suite_metrics.map_or(String::new(), |m| format!("{:.1}", m.vs_deep));
             let vs_medium_light_str =
-                light_metrics.map_or(String::new(), |m| format!("{:.1}", m.vs_medium));
+                fixed_suite_metrics.map_or(String::new(), |m| format!("{:.1}", m.vs_medium));
             let vs_random_light_str =
-                light_metrics.map_or(String::new(), |m| format!("{:.1}", m.vs_random));
+                fixed_suite_metrics.map_or(String::new(), |m| format!("{:.1}", m.vs_random));
             let vram_str = vram_used.map_or(String::new(), |v| format!("{}", v));
             writeln!(
                 w,

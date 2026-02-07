@@ -221,16 +221,14 @@ class AlphaZeroSweep:
         try:
             tournament_start = time.time()
 
-            # Choose CPU or GPU binary based on configuration
-            if self.cpu_tournaments and os.path.exists("./target/release/mnk_game_cpu"):
-                binary = "./target/release/mnk_game_cpu"
-            else:
-                binary = "./target/release/mnk_game"
+            binary = "./target/release/mnk_game"
 
             cmd = [
                 binary, "--model-path", model_file,
                 "--tournament-games", str(config.tournament_games)
             ]
+            if self.cpu_tournaments:
+                cmd.append("--cpu")
 
             # Use Popen for better process control
             process = subprocess.Popen(

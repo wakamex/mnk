@@ -5,10 +5,10 @@ use clap::Parser;
 
 // Import the actual AlphaZero implementation from the shared library
 use mnk::network::{Network, NetworkType};
-use mnk::inference_backend::InferenceBackend;
-#[cfg(feature = "cuda")]
-use mnk::inference_backend::InferenceDevice;
 use burn::prelude::*;
+use burn_ndarray::NdArrayDevice;
+#[cfg(feature = "cuda")]
+use burn_cuda::{Cuda, CudaDevice};
 
 mod fixed_suite;
 
@@ -16,6 +16,27 @@ mod fixed_suite;
 pub enum TrainingLevel {
     Trained,
     Untrained,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InferenceMode {
+    Cpu,
+    #[cfg(feature = "cuda")]
+    Gpu,
+}
+
+fn select_inference_mode(force_cpu: bool) -> InferenceMode {
+    if force_cpu {
+        return InferenceMode::Cpu;
+    }
+    #[cfg(feature = "cuda")]
+    {
+        InferenceMode::Gpu
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        InferenceMode::Cpu
+    }
 }
 
 #[derive(Parser)]
@@ -65,6 +86,10 @@ struct Args {
     /// CSV output path for per-game fixed-suite results
     #[arg(long, default_value = "research_runs/fixed_suite_latest.csv")]
     fixed_suite_csv: Option<String>,
+
+    /// Force CPU inference backend for tournaments/eval
+    #[arg(long, default_value_t = false)]
+    cpu: bool,
 }
 
 /// Infer network type from model filename
@@ -793,8 +818,15 @@ impl Strategy for RandomStrategy {
 
 // AlphaZero Strategy Implementation using actual neural network
 #[derive(Clone)]
+enum StrategyNet {
+    Cpu(Network<burn_ndarray::NdArray>),
+    #[cfg(feature = "cuda")]
+    Gpu(Network<Cuda>),
+}
+
+#[derive(Clone)]
 pub struct AlphaZeroStrategy {
-    net: Network<InferenceBackend>,  // Use Network enum to support both CNN and Transformer
+    net: StrategyNet,
     simulations: usize,
     cpuct: f32,
     name: String,
@@ -803,16 +835,24 @@ pub struct AlphaZeroStrategy {
 
 impl AlphaZeroStrategy {
     pub fn new(simulations: usize) -> Result<Self, String> {
-        Self::new_with_training_level(simulations, TrainingLevel::Trained, "alphazero_model")
+        Self::new_with_training_level(simulations, TrainingLevel::Trained, "alphazero_model", false)
     }
 
     pub fn new_untrained(simulations: usize) -> Self {
-        Self::new_with_training_level(simulations, TrainingLevel::Untrained, "alphazero_model")
+        Self::new_with_training_level(simulations, TrainingLevel::Untrained, "alphazero_model", false)
             .expect("untrained constructor should not fail")
     }
 
     pub fn new_with_model_path(simulations: usize, model_path: &str) -> Result<Self, String> {
-        Self::new_with_training_level(simulations, TrainingLevel::Trained, model_path)
+        Self::new_with_training_level(simulations, TrainingLevel::Trained, model_path, false)
+    }
+
+    pub fn new_with_model_path_runtime(
+        simulations: usize,
+        model_path: &str,
+        force_cpu: bool,
+    ) -> Result<Self, String> {
+        Self::new_with_training_level(simulations, TrainingLevel::Trained, model_path, force_cpu)
     }
 
     pub fn new_with_model_path_and_cpuct(
@@ -820,20 +860,25 @@ impl AlphaZeroStrategy {
         model_path: &str,
         cpuct: f32,
     ) -> Result<Self, String> {
-        Self::new_with_training_level_config(
-            simulations,
-            TrainingLevel::Trained,
-            model_path,
-            cpuct,
-        )
+        Self::new_with_training_level_config(simulations, TrainingLevel::Trained, model_path, cpuct, false)
+    }
+
+    pub fn new_with_model_path_and_cpuct_runtime(
+        simulations: usize,
+        model_path: &str,
+        cpuct: f32,
+        force_cpu: bool,
+    ) -> Result<Self, String> {
+        Self::new_with_training_level_config(simulations, TrainingLevel::Trained, model_path, cpuct, force_cpu)
     }
 
     fn new_with_training_level(
         simulations: usize,
         training: TrainingLevel,
         model_path: &str,
+        force_cpu: bool,
     ) -> Result<Self, String> {
-        Self::new_with_training_level_config(simulations, training, model_path, 0.75)
+        Self::new_with_training_level_config(simulations, training, model_path, 0.75, force_cpu)
     }
 
     fn new_with_training_level_config(
@@ -841,43 +886,62 @@ impl AlphaZeroStrategy {
         training: TrainingLevel,
         model_path: &str,
         cpuct: f32,
+        force_cpu: bool,
     ) -> Result<Self, String> {
+        use burn::record::{BinFileRecorder, FullPrecisionSettings, Recorder};
+
+        let mode = select_inference_mode(force_cpu);
+        let net_type = infer_network_type(model_path);
+
         // Load trained network or create new one based on training level
         let net = match training {
-            TrainingLevel::Trained => {
-                use burn::record::{BinFileRecorder, FullPrecisionSettings, Recorder};
-
-                #[cfg(feature = "cuda")]
-                let device = InferenceDevice::new(0);
-
-                #[cfg(not(feature = "cuda"))]
-                let device = burn_ndarray::NdArrayDevice::default();
-
-                let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
-                let net_type = infer_network_type(model_path);
-                match recorder.load(model_path.into(), &device) {
-                    Ok(record) => {
-                        let trained_net = Network::<InferenceBackend>::new(net_type, &device, 3).load_record(record);
-                        println!("Loaded trained {:?} model from '{}'", net_type, model_path);
-                        trained_net
+            TrainingLevel::Trained => match mode {
+                InferenceMode::Cpu => {
+                    let device = NdArrayDevice::default();
+                    let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
+                    match recorder.load(model_path.into(), &device) {
+                        Ok(record) => {
+                            let trained_net = Network::<burn_ndarray::NdArray>::new(net_type, &device, 3)
+                                .load_record(record);
+                            println!("Loaded trained {:?} model on CPU from '{}'", net_type, model_path);
+                            StrategyNet::Cpu(trained_net)
+                        }
+                        Err(e) => return Err(format!(
+                            "Failed to load trained model '{}': {:?}",
+                            model_path, e
+                        )),
                     }
-                    Err(e) => return Err(format!(
-                        "Failed to load trained model '{}': {:?}",
-                        model_path, e
-                    )),
                 }
-            }
-            TrainingLevel::Untrained => {
-                println!("Creating new untrained network");
-
                 #[cfg(feature = "cuda")]
-                let device = InferenceDevice::new(0);
-
-                #[cfg(not(feature = "cuda"))]
-                let device = burn_ndarray::NdArrayDevice::default();
-
-                Network::<InferenceBackend>::new(NetworkType::Cnn, &device, 3)
-            }
+                InferenceMode::Gpu => {
+                    let device = CudaDevice::new(0);
+                    let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
+                    match recorder.load(model_path.into(), &device) {
+                        Ok(record) => {
+                            let trained_net = Network::<Cuda>::new(net_type, &device, 3).load_record(record);
+                            println!("Loaded trained {:?} model on GPU from '{}'", net_type, model_path);
+                            StrategyNet::Gpu(trained_net)
+                        }
+                        Err(e) => return Err(format!(
+                            "Failed to load trained model '{}': {:?}",
+                            model_path, e
+                        )),
+                    }
+                }
+            },
+            TrainingLevel::Untrained => match mode {
+                InferenceMode::Cpu => {
+                    println!("Creating new untrained network on CPU");
+                    let device = NdArrayDevice::default();
+                    StrategyNet::Cpu(Network::<burn_ndarray::NdArray>::new(NetworkType::Cnn, &device, 3))
+                }
+                #[cfg(feature = "cuda")]
+                InferenceMode::Gpu => {
+                    println!("Creating new untrained network on GPU");
+                    let device = CudaDevice::new(0);
+                    StrategyNet::Gpu(Network::<Cuda>::new(NetworkType::Cnn, &device, 3))
+                }
+            },
         };
 
         Ok(Self {
@@ -912,6 +976,38 @@ impl AlphaZeroStrategy {
             Cell::Empty => 0, // shouldn't happen
         }
     }
+
+    fn forward_inference(&self, board: &[Option<u8>], player: u8) -> (f32, Vec<f32>) {
+        match &self.net {
+            StrategyNet::Cpu(net) => net.forward_inference(board, player),
+            #[cfg(feature = "cuda")]
+            StrategyNet::Gpu(net) => net.forward_inference(board, player),
+        }
+    }
+
+    fn mcts_policy(&self, board: &[Option<u8>], player: u8) -> Vec<f32> {
+        match &self.net {
+            StrategyNet::Cpu(net) => mnk::unified_mcts::mcts_search_with_hyperparams(
+                net,
+                board,
+                player,
+                self.simulations,
+                false,
+                self.cpuct,
+                0.1,
+            ),
+            #[cfg(feature = "cuda")]
+            StrategyNet::Gpu(net) => mnk::unified_mcts::mcts_search_with_hyperparams(
+                net,
+                board,
+                player,
+                self.simulations,
+                false,
+                self.cpuct,
+                0.1,
+            ),
+        }
+    }
 }
 
 impl Strategy for AlphaZeroStrategy {
@@ -921,18 +1017,10 @@ impl Strategy for AlphaZeroStrategy {
         let current_player = self.current_player_to_u8(state.current_player);
 
         // Get raw neural net evaluation (before MCTS)
-        let (raw_value, raw_policy) = self.net.forward_inference(&alphazero_board, current_player);
+        let (raw_value, raw_policy) = self.forward_inference(&alphazero_board, current_player);
 
         // Run MCTS
-        let policy = mnk::unified_mcts::mcts_search_with_hyperparams(
-            &self.net,
-            &alphazero_board,
-            current_player,
-            self.simulations,
-            false,
-            self.cpuct,
-            0.1,
-        );
+        let policy = self.mcts_policy(&alphazero_board, current_player);
 
         // Convert policy to move by finding the best legal move
         let valid_moves = generate_valid_moves(state, config);
@@ -1197,7 +1285,7 @@ fn demo_single_game() -> Result<(), String> {
     Ok(())
 }
 
-fn demo_tournament(model_path: &str, tournament_games: usize) -> Result<(), String> {
+fn demo_tournament(model_path: &str, tournament_games: usize, force_cpu: bool) -> Result<(), String> {
     println!("\n=== Tournament Demo ===");
     let config = GameConfig::new(3, 3, 3);
     
@@ -1271,7 +1359,7 @@ fn demo_tournament(model_path: &str, tournament_games: usize) -> Result<(), Stri
     // AlphaZero vs Deep Minimax - show first 2 games verbose
     let result = play_tournament(
         &config,
-        AlphaZeroStrategy::new_with_model_path(25, model_path)?,
+        AlphaZeroStrategy::new_with_model_path_runtime(25, model_path, force_cpu)?,
         MinimaxStrategy::new(3),
         tournament_games,
         true,
@@ -1281,7 +1369,7 @@ fn demo_tournament(model_path: &str, tournament_games: usize) -> Result<(), Stri
     // AlphaZero vs Medium Minimax
     let result = play_tournament(
         &config,
-        AlphaZeroStrategy::new_with_model_path(25, model_path)?,
+        AlphaZeroStrategy::new_with_model_path_runtime(25, model_path, force_cpu)?,
         MinimaxStrategy::new(2),
         tournament_games,
         false,
@@ -1291,7 +1379,7 @@ fn demo_tournament(model_path: &str, tournament_games: usize) -> Result<(), Stri
     // AlphaZero vs Random
     let result = play_tournament(
         &config,
-        AlphaZeroStrategy::new_with_model_path(25, model_path)?,
+        AlphaZeroStrategy::new_with_model_path_runtime(25, model_path, force_cpu)?,
         RandomStrategy::new(),
         tournament_games,
         false,
@@ -1301,8 +1389,8 @@ fn demo_tournament(model_path: &str, tournament_games: usize) -> Result<(), Stri
     // Different AlphaZero simulation counts
     let result = play_tournament(
         &config,
-        AlphaZeroStrategy::new_with_model_path(50, model_path)?,
-        AlphaZeroStrategy::new_with_model_path(10, model_path)?,
+        AlphaZeroStrategy::new_with_model_path_runtime(50, model_path, force_cpu)?,
+        AlphaZeroStrategy::new_with_model_path_runtime(10, model_path, force_cpu)?,
         tournament_games,
         false,
     )?;
@@ -1360,7 +1448,7 @@ fn demo_performance() -> Result<(), String> {
     Ok(())
 }
 
-fn demo_head_to_head(model1: &str, model2: &str, tournament_games: usize) -> Result<(), String> {
+fn demo_head_to_head(model1: &str, model2: &str, tournament_games: usize, force_cpu: bool) -> Result<(), String> {
     let config = GameConfig::new(3, 3, 3);
 
     println!("\n=== Head-to-Head Tournament ===");
@@ -1371,11 +1459,11 @@ fn demo_head_to_head(model1: &str, model2: &str, tournament_games: usize) -> Res
     use std::io::Write;
     print!("Loading model 1: {} ... ", model1);
     std::io::stdout().flush().ok();
-    let s1 = AlphaZeroStrategy::new_with_model_path(sims, model1)?;
+    let s1 = AlphaZeroStrategy::new_with_model_path_runtime(sims, model1, force_cpu)?;
     println!("done");
     print!("Loading model 2: {} ... ", model2);
     std::io::stdout().flush().ok();
-    let s2 = AlphaZeroStrategy::new_with_model_path(sims, model2)?;
+    let s2 = AlphaZeroStrategy::new_with_model_path_runtime(sims, model2, force_cpu)?;
     println!("done");
 
     let result = play_tournament(&config, s1, s2, tournament_games, false)?;
@@ -1393,12 +1481,14 @@ fn demo_head_to_head(model1: &str, model2: &str, tournament_games: usize) -> Res
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+    let inference_mode = select_inference_mode(args.cpu);
 
     // Print GPU memory usage at start
     print_gpu_memory("Tournament start");
 
     println!("Functional M,N,K Game Implementation in Rust");
     println!("{}", "=".repeat(45));
+    println!("Inference mode: {:?}", inference_mode);
 
     if args.fixed_suite_eval {
         fixed_suite::run_fixed_suite_eval(&args).map_err(std::io::Error::other)?;
@@ -1409,14 +1499,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Some(ref model2) = args.model_path2 {
         // Head-to-head mode: just run the two models against each other
-        demo_head_to_head(&args.model_path, model2, args.tournament_games)?;
+        demo_head_to_head(&args.model_path, model2, args.tournament_games, args.cpu)?;
     } else {
         // Full demo mode
         demo_board_analysis()?;
         demo_single_game()?;
 
         print_gpu_memory("Before AlphaZero tournaments");
-        demo_tournament(&args.model_path, args.tournament_games)?;
+        demo_tournament(&args.model_path, args.tournament_games, args.cpu)?;
         print_gpu_memory("After AlphaZero tournaments");
 
         demo_performance()?;
