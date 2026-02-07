@@ -1,5 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::time::Instant;
 use clap::Parser;
 
@@ -29,6 +30,46 @@ struct Args {
     /// Number of games per tournament matchup
     #[arg(long, default_value = "10")]
     tournament_games: usize,
+
+    /// Run deterministic fixed-opening evaluation suite and exit
+    #[arg(long, default_value_t = false)]
+    fixed_suite_eval: bool,
+
+    /// Number of opening states used in fixed-suite evaluation
+    #[arg(long, default_value_t = 25)]
+    fixed_suite_openings: usize,
+
+    /// Number of sides played per opening state (2 evaluates both sides)
+    #[arg(long, default_value_t = 2)]
+    fixed_suite_sides: usize,
+
+    /// AlphaZero MCTS simulations per move during fixed-suite evaluation
+    #[arg(long, default_value_t = 100)]
+    fixed_suite_sims: usize,
+
+    /// AlphaZero PUCT constant during fixed-suite evaluation
+    #[arg(long, default_value_t = 0.75)]
+    fixed_suite_cpuct: f32,
+
+    /// Enable immediate tactical win/block override before MCTS
+    #[arg(long, default_value_t = false)]
+    fixed_suite_tactical_override: bool,
+
+    /// If >0, solve endgames with minimax when empty cells <= threshold
+    #[arg(long, default_value_t = 0)]
+    fixed_suite_endgame_solve_threshold: usize,
+
+    /// Maximum opening plies used when constructing deterministic opening states
+    #[arg(long, default_value_t = 4)]
+    fixed_suite_max_plies: usize,
+
+    /// Seed for deterministic random baseline in fixed-suite evaluation
+    #[arg(long, default_value_t = 20260207u64)]
+    fixed_suite_seed: u64,
+
+    /// Optional CSV output path for per-game fixed-suite results
+    #[arg(long)]
+    fixed_suite_csv: Option<String>,
 }
 
 /// Infer network type from model filename
@@ -722,11 +763,55 @@ impl Strategy for RandomStrategy {
     }
 }
 
+/// Deterministic random baseline for reproducible fixed-suite evaluation.
+#[derive(Clone)]
+pub struct SeededRandomStrategy {
+    seed: u64,
+    name: String,
+}
+
+impl SeededRandomStrategy {
+    pub fn new(seed: u64) -> Self {
+        Self {
+            seed,
+            name: format!("Random-Seeded-{}", seed),
+        }
+    }
+}
+
+impl Strategy for SeededRandomStrategy {
+    fn get_move(&self, state: &GameState, config: &GameConfig) -> Result<usize, String> {
+        use std::collections::hash_map::DefaultHasher;
+
+        let valid_moves = generate_valid_moves(state, config);
+        if valid_moves.is_empty() {
+            return Err("No valid moves available".to_string());
+        }
+
+        let mut hasher = DefaultHasher::new();
+        self.seed.hash(&mut hasher);
+        state.current_player.hash(&mut hasher);
+        state.last_move.hash(&mut hasher);
+        for cell in &state.board.cells {
+            cell.hash(&mut hasher);
+        }
+        let idx = (hasher.finish() as usize) % valid_moves.len();
+        Ok(valid_moves[idx])
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
 // AlphaZero Strategy Implementation using actual neural network
 #[derive(Clone)]
 pub struct AlphaZeroStrategy {
     net: Network<InferenceBackend>,  // Use Network enum to support both CNN and Transformer
     simulations: usize,
+    cpuct: f32,
+    tactical_override: bool,
+    endgame_solve_threshold: usize,
     name: String,
     training_level: TrainingLevel,
 }
@@ -744,7 +829,51 @@ impl AlphaZeroStrategy {
         Self::new_with_training_level(simulations, TrainingLevel::Trained, model_path)
     }
 
+    pub fn new_with_model_path_and_cpuct(simulations: usize, model_path: &str, cpuct: f32) -> Self {
+        Self::new_with_training_level_config(
+            simulations,
+            TrainingLevel::Trained,
+            model_path,
+            cpuct,
+            false,
+            0,
+            false,
+        )
+        .expect("non-strict constructor should not fail")
+    }
+
+    pub fn try_new_with_model_path_config(
+        simulations: usize,
+        model_path: &str,
+        cpuct: f32,
+        tactical_override: bool,
+        endgame_solve_threshold: usize,
+    ) -> Result<Self, String> {
+        Self::new_with_training_level_config(
+            simulations,
+            TrainingLevel::Trained,
+            model_path,
+            cpuct,
+            tactical_override,
+            endgame_solve_threshold,
+            true,
+        )
+    }
+
     fn new_with_training_level(simulations: usize, training: TrainingLevel, model_path: &str) -> Self {
+        Self::new_with_training_level_config(simulations, training, model_path, 0.75, false, 0, false)
+            .expect("non-strict constructor should not fail")
+    }
+
+    fn new_with_training_level_config(
+        simulations: usize,
+        training: TrainingLevel,
+        model_path: &str,
+        cpuct: f32,
+        tactical_override: bool,
+        endgame_solve_threshold: usize,
+        strict_model_load: bool,
+    ) -> Result<Self, String> {
         // Load trained network or create new one based on training level
         let net = match training {
             TrainingLevel::Trained => {
@@ -765,6 +894,12 @@ impl AlphaZeroStrategy {
                         trained_net
                     }
                     Err(e) => {
+                        if strict_model_load {
+                            return Err(format!(
+                                "Failed to load trained model '{}': {:?}",
+                                model_path, e
+                            ));
+                        }
                         println!("Failed to load trained model: {:?}", e);
                         println!("   Using untrained network instead");
                         Network::<InferenceBackend>::new(net_type, &device, 3)
@@ -784,12 +919,15 @@ impl AlphaZeroStrategy {
             }
         };
 
-        Self {
+        Ok(Self {
             net,
             simulations,
+            cpuct,
+            tactical_override,
+            endgame_solve_threshold,
             name: format!("AlphaZero-{}{}", simulations, if matches!(training, TrainingLevel::Trained) { "-Trained" } else { "" }),
             training_level: training,
-        }
+        })
     }
 
     // Convert tournament GameState to AlphaZero board representation
@@ -815,10 +953,68 @@ impl AlphaZeroStrategy {
             Cell::Empty => 0, // shouldn't happen
         }
     }
+
+    fn tactical_override_move(
+        &self,
+        state: &GameState,
+        config: &GameConfig,
+    ) -> Result<Option<usize>, String> {
+        if !self.tactical_override {
+            return Ok(None);
+        }
+
+        let valid_moves = generate_valid_moves(state, config);
+        if valid_moves.is_empty() {
+            return Ok(None);
+        }
+
+        // Immediate win if available.
+        let current_winner = match state.current_player {
+            Cell::Player0 => Winner::Player0,
+            Cell::Player1 => Winner::Player1,
+            Cell::Empty => Winner::None,
+        };
+        for &mv in &valid_moves {
+            let next = state.make_move(mv, config)?;
+            if next.winner == current_winner {
+                return Ok(Some(mv));
+            }
+        }
+
+        // Otherwise block opponent's immediate win.
+        let opponent = state.current_player.opponent().unwrap_or(Cell::Empty);
+        let opponent_winner = match opponent {
+            Cell::Player0 => Winner::Player0,
+            Cell::Player1 => Winner::Player1,
+            Cell::Empty => Winner::None,
+        };
+        for &mv in &valid_moves {
+            let board_if_opp_moves = state.board.clone().set_cell(mv, opponent)?;
+            if check_winner(&board_if_opp_moves, config.winning_size) == opponent_winner {
+                return Ok(Some(mv));
+            }
+        }
+
+        Ok(None)
+    }
 }
 
 impl Strategy for AlphaZeroStrategy {
     fn get_move(&self, state: &GameState, config: &GameConfig) -> Result<usize, String> {
+        if self.endgame_solve_threshold > 0 {
+            let empty_cells = state.board.get_empty_positions().len();
+            if empty_cells <= self.endgame_solve_threshold {
+                let solve_config = config.clone().with_depth(empty_cells.max(1));
+                if let Ok(solution) = find_best_move(state, &solve_config) {
+                    return Ok(solution.move_index);
+                }
+            }
+        }
+
+        if let Some(tactical_move) = self.tactical_override_move(state, config)? {
+            return Ok(tactical_move);
+        }
+
         // Convert to AlphaZero format
         let alphazero_board = self.game_state_to_alphazero_board(state, config);
         let current_player = self.current_player_to_u8(state.current_player);
@@ -827,12 +1023,14 @@ impl Strategy for AlphaZeroStrategy {
         let (raw_value, raw_policy) = self.net.forward_inference(&alphazero_board, current_player);
 
         // Run MCTS
-        let policy = mnk::unified_mcts::mcts_search_with_options(
+        let policy = mnk::unified_mcts::mcts_search_with_hyperparams(
             &self.net,
             &alphazero_board,
             current_player,
             self.simulations,
             false,
+            self.cpuct,
+            0.1,
         );
 
         // Convert policy to move by finding the best legal move
@@ -932,6 +1130,374 @@ pub fn play_single_game(
     }
     
     Ok(state)
+}
+
+fn play_single_game_from_state(
+    config: &GameConfig,
+    mut state: GameState,
+    strategies: [&dyn Strategy; 2],
+    verbose: bool,
+) -> Result<GameState, String> {
+    let mut move_count = 0;
+    let max_moves = config.board_width * config.board_height;
+
+    while !state.is_terminal && move_count < max_moves {
+        if verbose {
+            println!("\n--- Move {} (Player {}) ---", move_count + 1, state.current_player);
+            print_game_state(&state, None);
+        }
+
+        let strategy_index = state.current_player.to_player_id().unwrap_or(0) as usize;
+        let move_index = strategies[strategy_index].get_move(&state, config)?;
+
+        if verbose {
+            println!("Player {} plays at {}", state.current_player, move_index);
+        }
+
+        state = state.make_move(move_index, config)?;
+        move_count += 1;
+    }
+
+    Ok(state)
+}
+
+fn state_key(state: &GameState) -> String {
+    let mut key = String::with_capacity(state.board.cells.len() + 1);
+    for cell in &state.board.cells {
+        key.push(match cell {
+            Cell::Empty => '.',
+            Cell::Player0 => 'X',
+            Cell::Player1 => 'O',
+        });
+    }
+    key.push(match state.current_player {
+        Cell::Player0 => 'x',
+        Cell::Player1 => 'o',
+        Cell::Empty => '.',
+    });
+    key
+}
+
+fn opening_plies(state: &GameState) -> usize {
+    state
+        .board
+        .cells
+        .iter()
+        .filter(|&&cell| cell != Cell::Empty)
+        .count()
+}
+
+fn generate_fixed_openings(
+    config: &GameConfig,
+    num_openings: usize,
+    max_plies: usize,
+) -> Vec<GameState> {
+    // Center-first ordering gives a more representative mix than pure index order.
+    let move_order = [4usize, 0, 2, 6, 8, 1, 3, 5, 7];
+    let mut openings = Vec::with_capacity(num_openings);
+    let mut queue = VecDeque::new();
+    let mut seen = HashSet::new();
+
+    let root = GameState::new(config);
+    seen.insert(state_key(&root));
+    queue.push_back(root);
+
+    while let Some(state) = queue.pop_front() {
+        if !state.is_terminal {
+            openings.push(state.clone());
+            if openings.len() >= num_openings {
+                break;
+            }
+        }
+
+        if state.is_terminal || opening_plies(&state) >= max_plies {
+            continue;
+        }
+
+        for &mv in &move_order {
+            if state.board.get_cell(mv) != Some(Cell::Empty) {
+                continue;
+            }
+            if let Ok(next) = state.make_move(mv, config) {
+                if next.is_terminal {
+                    continue;
+                }
+                let key = state_key(&next);
+                if seen.insert(key) {
+                    queue.push_back(next);
+                }
+            }
+        }
+    }
+
+    openings
+}
+
+#[derive(Debug, Clone)]
+struct FixedSuiteAggregate {
+    az_wins: usize,
+    opponent_wins: usize,
+    draws: usize,
+    total: usize,
+}
+
+impl FixedSuiteAggregate {
+    fn new() -> Self {
+        Self {
+            az_wins: 0,
+            opponent_wins: 0,
+            draws: 0,
+            total: 0,
+        }
+    }
+
+    fn score_percent(&self) -> f64 {
+        if self.total == 0 {
+            0.0
+        } else {
+            (self.az_wins as f64 + 0.5 * self.draws as f64) * 100.0 / self.total as f64
+        }
+    }
+}
+
+fn evaluate_fixed_suite_matchup<S: Strategy>(
+    config: &GameConfig,
+    openings: &[GameState],
+    sides_per_opening: usize,
+    az: &AlphaZeroStrategy,
+    opponent: &S,
+    opponent_label: &str,
+    csv_writer: &mut Option<std::io::BufWriter<std::fs::File>>,
+) -> Result<FixedSuiteAggregate, String> {
+    use std::io::Write;
+
+    let mut aggregate = FixedSuiteAggregate::new();
+
+    for (opening_idx, opening) in openings.iter().enumerate() {
+        let opening_player = opening.current_player;
+
+        for side in 0..sides_per_opening {
+            let az_player = if side % 2 == 0 {
+                opening_player
+            } else {
+                opening_player.opponent().unwrap_or(opening_player)
+            };
+
+            let strategies: [&dyn Strategy; 2] = if az_player == Cell::Player0 {
+                [az, opponent]
+            } else {
+                [opponent, az]
+            };
+
+            let final_state =
+                play_single_game_from_state(config, opening.clone(), strategies, false)?;
+
+            let (winner_label, az_score) = match final_state.winner {
+                Winner::Draw | Winner::None => {
+                    aggregate.draws += 1;
+                    ("Draw", 0.5f64)
+                }
+                Winner::Player0 if az_player == Cell::Player0 => {
+                    aggregate.az_wins += 1;
+                    ("Player0", 1.0f64)
+                }
+                Winner::Player1 if az_player == Cell::Player1 => {
+                    aggregate.az_wins += 1;
+                    ("Player1", 1.0f64)
+                }
+                Winner::Player0 => {
+                    aggregate.opponent_wins += 1;
+                    ("Player0", 0.0f64)
+                }
+                Winner::Player1 => {
+                    aggregate.opponent_wins += 1;
+                    ("Player1", 0.0f64)
+                }
+            };
+
+            aggregate.total += 1;
+
+            if let Some(writer) = csv_writer.as_mut() {
+                let az_player_label = match az_player {
+                    Cell::Player0 => "Player0",
+                    Cell::Player1 => "Player1",
+                    Cell::Empty => "Empty",
+                };
+                writeln!(
+                    writer,
+                    "{},{},{},{},{},{:.1},{}",
+                    opponent_label,
+                    opening_idx,
+                    side,
+                    az_player_label,
+                    winner_label,
+                    az_score,
+                    state_key(opening)
+                )
+                .map_err(|e| format!("Failed writing fixed-suite CSV row: {}", e))?;
+            }
+        }
+    }
+
+    if let Some(writer) = csv_writer.as_mut() {
+        writer
+            .flush()
+            .map_err(|e| format!("Failed flushing fixed-suite CSV: {}", e))?;
+    }
+
+    Ok(aggregate)
+}
+
+fn run_fixed_suite_eval(args: &Args) -> Result<(), String> {
+    use std::io::Write;
+    use std::path::Path;
+
+    if args.fixed_suite_openings == 0 {
+        return Err("fixed_suite_openings must be >= 1".to_string());
+    }
+    if args.fixed_suite_sides == 0 {
+        return Err("fixed_suite_sides must be >= 1".to_string());
+    }
+
+    let config = GameConfig::new(3, 3, 3);
+    let openings = generate_fixed_openings(
+        &config,
+        args.fixed_suite_openings,
+        args.fixed_suite_max_plies.max(1),
+    );
+
+    if openings.len() < args.fixed_suite_openings {
+        return Err(format!(
+            "Only generated {} openings (requested {}). Increase --fixed-suite-max-plies.",
+            openings.len(),
+            args.fixed_suite_openings
+        ));
+    }
+
+    let mut csv_writer = if let Some(path) = args.fixed_suite_csv.as_ref() {
+        let csv_path = Path::new(path);
+        if let Some(parent) = csv_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    format!(
+                        "Failed creating parent directory for fixed-suite CSV '{}': {}",
+                        path, e
+                    )
+                })?;
+            }
+        }
+        let file = std::fs::File::create(csv_path)
+            .map_err(|e| format!("Failed creating fixed-suite CSV '{}': {}", path, e))?;
+        let mut writer = std::io::BufWriter::new(file);
+        writeln!(
+            writer,
+            "matchup,opening_idx,side,az_player,winner,az_score,opening_key"
+        )
+        .map_err(|e| format!("Failed writing fixed-suite CSV header: {}", e))?;
+        Some(writer)
+    } else {
+        None
+    };
+
+    let total_games = args.fixed_suite_openings * args.fixed_suite_sides;
+
+    println!("=== Fixed Deterministic Evaluation Suite ===");
+    println!("Model: {}", args.model_path);
+    println!(
+        "Protocol: openings={}, sides/opening={}, total_games_per_matchup={}, eval_sims={}, eval_cpuct={}, root_noise=false",
+        args.fixed_suite_openings,
+        args.fixed_suite_sides,
+        total_games,
+        args.fixed_suite_sims,
+        args.fixed_suite_cpuct
+    );
+    println!(
+        "Opening generation: deterministic BFS, max_plies={}, move_order=center-first",
+        args.fixed_suite_max_plies
+    );
+    println!("Deterministic random seed: {}", args.fixed_suite_seed);
+    println!(
+        "AZ tactical override: {}, endgame solve threshold: {}",
+        args.fixed_suite_tactical_override,
+        args.fixed_suite_endgame_solve_threshold
+    );
+    if let Some(path) = args.fixed_suite_csv.as_ref() {
+        println!("CSV output: {}", path);
+    }
+    println!();
+
+    let az = AlphaZeroStrategy::try_new_with_model_path_config(
+        args.fixed_suite_sims,
+        &args.model_path,
+        args.fixed_suite_cpuct,
+        args.fixed_suite_tactical_override,
+        args.fixed_suite_endgame_solve_threshold,
+    )?;
+
+    let deep = MinimaxStrategy::new(3);
+    let medium = MinimaxStrategy::new(2);
+    let random = SeededRandomStrategy::new(args.fixed_suite_seed);
+
+    let deep_result = evaluate_fixed_suite_matchup(
+        &config,
+        &openings,
+        args.fixed_suite_sides,
+        &az,
+        &deep,
+        "Deep",
+        &mut csv_writer,
+    )?;
+    let medium_result = evaluate_fixed_suite_matchup(
+        &config,
+        &openings,
+        args.fixed_suite_sides,
+        &az,
+        &medium,
+        "Medium",
+        &mut csv_writer,
+    )?;
+    let random_result = evaluate_fixed_suite_matchup(
+        &config,
+        &openings,
+        args.fixed_suite_sides,
+        &az,
+        &random,
+        "Random",
+        &mut csv_writer,
+    )?;
+
+    println!("Results (AZ score = win + 0.5*draw):");
+    println!(
+        "vs_Deep:   {:.1}%   (W-L-D: {}-{}-{})",
+        deep_result.score_percent(),
+        deep_result.az_wins,
+        deep_result.opponent_wins,
+        deep_result.draws
+    );
+    println!(
+        "vs_Medium: {:.1}%   (W-L-D: {}-{}-{})",
+        medium_result.score_percent(),
+        medium_result.az_wins,
+        medium_result.opponent_wins,
+        medium_result.draws
+    );
+    println!(
+        "vs_Random: {:.1}%   (W-L-D: {}-{}-{})",
+        random_result.score_percent(),
+        random_result.az_wins,
+        random_result.opponent_wins,
+        random_result.draws
+    );
+    println!();
+
+    println!(
+        "FIXED_SUITE_METRIC vs_Deep={:.1} vs_Medium={:.1} vs_Random={:.1}",
+        deep_result.score_percent(),
+        medium_result.score_percent(),
+        random_result.score_percent()
+    );
+
+    Ok(())
 }
 
 // Tournament results
@@ -1456,6 +2022,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Functional M,N,K Game Implementation in Rust");
     println!("{}", "=".repeat(45));
+
+    if args.fixed_suite_eval {
+        run_fixed_suite_eval(&args).map_err(std::io::Error::other)?;
+        print_gpu_memory("Tournament end");
+        println!("\nDone!");
+        return Ok(());
+    }
 
     if let Some(ref model2) = args.model_path2 {
         // Head-to-head mode: just run the two models against each other

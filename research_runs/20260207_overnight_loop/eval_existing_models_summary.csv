@@ -1,0 +1,13 @@
+model,vs_deep,vs_medium,vs_random
+alphazero_model_i20_g1000_vw2_0_mcts50_netcnn_temp1_25_tcut1_dalpha0_1_cpuct0_75.bin,30.0,38.0,81.0
+alphazero_model_i20_g1000_vw2_0_mcts50_netcnn_temp1_25_tcut1_dalpha0_1_cpuct1_0.bin,22.0,38.0,93.0
+alphazero_model_i20_g1000_vw2_0_mcts50_netcnn_temp1_25_tcut1_dalpha0_1_cpuct1_5.bin,37.0,41.0,90.0
+alphazero_model_i20_g1000_vw2_0_mcts50_netcnn_temp1_25_tcut1_dalpha0_1_cpuct2_0.bin,34.0,41.0,89.0
+alphazero_model_i20_g1000_vw2_0_mcts50_netcnn_temp1_25_tcut1_dalpha0_1_cpuct3_0.bin,35.0,37.0,93.0
+alphazero_model_i20_g1000_vw2_0_mcts50_netcnn_temp1_25_tcut1_dalpha0_1_cpuct5_0.bin,32.0,32.0,91.0
+alphazero_model_i20_g1000_vw4_0_netcnn_temp1_75.bin,35.0,48.0,88.0
+alphazero_model_i20_g1000_vw2_0_netcnn_temp1_0.bin,37.0,51.0,92.0
+alphazero_model_i20_g1000_vw2_0_netcnn_temp1_25.bin,41.0,49.0,91.0
+alphazero_model_i20_g1000_lr0_005_mcts25_netcnn.bin,48.0,54.0,91.0
+alphazero_model_i20_g1000_lr0_02_mcts50_netcnn.bin,39.0,49.0,91.0
+alphazero_model_i20_g1000_lr0_05_mcts50_netcnn.bin,45.0,56.0,93.0
