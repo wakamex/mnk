@@ -61,8 +61,21 @@ Aggregate over 3 runs (`mcts_only_high`, `_2`, `_3`):
 - `mcts1200`: mean `45.33%`, std `2.49`, mean time `1560.5s`
 
 Decision:
-- Keep `mcts=100` as default.
+- Keep `mcts=100` as interim default relative to `200/400/800/1200`.
 - `mcts1200` is ~1.0pp higher on mean `vs_Deep`, but at ~3.6x wall-clock cost; not worth defaulting to for current iteration speed goals.
+
+Focused default check (`mcts50` vs `mcts100`):
+- `sweep_results/mcts_50_vs_100_20260207_181239.csv`
+- `sweep_results/mcts_50_vs_100_2_20260207_181743.csv`
+- `sweep_results/mcts_50_vs_100_3_20260207_182258.csv`
+
+Aggregate over 3 runs:
+- `mcts50`: mean `vs_Deep=46.67%`, std `0.47`, mean time `225.8s`, `vs_Deep/hour=744.0`
+- `mcts100`: mean `vs_Deep=46.67%`, std `2.36`, mean time `283.4s`, `vs_Deep/hour=592.7`
+
+Final default decision:
+- Revert to `mcts=50` as global default.
+- `mcts100` does not show better mean `vs_Deep` in repeated runs and is slower (~26%).
 
 Rationale:
 - Temp-cutoff sweep (`sweep_results/temp_cutoff_v1_20260207_000025.csv`) selected `tcut=1` as the only setting that kept `vsDeep=25%` while reaching `vsMedium=50%`.
