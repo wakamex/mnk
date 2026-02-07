@@ -14,6 +14,12 @@ Given a branch and config, it writes:
 The project needs broad research loops (including code changes) to push
 `vs_Deep` to 50% with controlled budgets and reproducible notes.
 
+## Research goal guardrail
+
+Primary objective is pure AlphaZero net strength:
+- Only neural inference + MCTS move selection counts toward the target metric.
+- Do not count runs that rely on minimax endgame solves, tactical override rules, or other non-MCTS move logic.
+
 ## Usage
 
 ```bash

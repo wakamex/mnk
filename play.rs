@@ -51,14 +51,6 @@ struct Args {
     #[arg(long, default_value_t = 0.75)]
     fixed_suite_cpuct: f32,
 
-    /// Enable immediate tactical win/block override before MCTS
-    #[arg(long, default_value_t = false)]
-    fixed_suite_tactical_override: bool,
-
-    /// If >0, solve endgames with minimax when empty cells <= threshold
-    #[arg(long, default_value_t = 0)]
-    fixed_suite_endgame_solve_threshold: usize,
-
     /// Maximum opening plies used when constructing deterministic opening states
     #[arg(long, default_value_t = 4)]
     fixed_suite_max_plies: usize,
@@ -67,8 +59,8 @@ struct Args {
     #[arg(long, default_value_t = 20260207u64)]
     fixed_suite_seed: u64,
 
-    /// Optional CSV output path for per-game fixed-suite results
-    #[arg(long)]
+    /// CSV output path for per-game fixed-suite results
+    #[arg(long, default_value = "research_runs/fixed_suite_latest.csv")]
     fixed_suite_csv: Option<String>,
 }
 
@@ -810,59 +802,43 @@ pub struct AlphaZeroStrategy {
     net: Network<InferenceBackend>,  // Use Network enum to support both CNN and Transformer
     simulations: usize,
     cpuct: f32,
-    tactical_override: bool,
-    endgame_solve_threshold: usize,
     name: String,
     training_level: TrainingLevel,
 }
 
 impl AlphaZeroStrategy {
-    pub fn new(simulations: usize) -> Self {
+    pub fn new(simulations: usize) -> Result<Self, String> {
         Self::new_with_training_level(simulations, TrainingLevel::Trained, "alphazero_model")
     }
 
     pub fn new_untrained(simulations: usize) -> Self {
         Self::new_with_training_level(simulations, TrainingLevel::Untrained, "alphazero_model")
+            .expect("untrained constructor should not fail")
     }
 
-    pub fn new_with_model_path(simulations: usize, model_path: &str) -> Self {
+    pub fn new_with_model_path(simulations: usize, model_path: &str) -> Result<Self, String> {
         Self::new_with_training_level(simulations, TrainingLevel::Trained, model_path)
     }
 
-    pub fn new_with_model_path_and_cpuct(simulations: usize, model_path: &str, cpuct: f32) -> Self {
-        Self::new_with_training_level_config(
-            simulations,
-            TrainingLevel::Trained,
-            model_path,
-            cpuct,
-            false,
-            0,
-            false,
-        )
-        .expect("non-strict constructor should not fail")
-    }
-
-    pub fn try_new_with_model_path_config(
+    pub fn new_with_model_path_and_cpuct(
         simulations: usize,
         model_path: &str,
         cpuct: f32,
-        tactical_override: bool,
-        endgame_solve_threshold: usize,
     ) -> Result<Self, String> {
         Self::new_with_training_level_config(
             simulations,
             TrainingLevel::Trained,
             model_path,
             cpuct,
-            tactical_override,
-            endgame_solve_threshold,
-            true,
         )
     }
 
-    fn new_with_training_level(simulations: usize, training: TrainingLevel, model_path: &str) -> Self {
-        Self::new_with_training_level_config(simulations, training, model_path, 0.75, false, 0, false)
-            .expect("non-strict constructor should not fail")
+    fn new_with_training_level(
+        simulations: usize,
+        training: TrainingLevel,
+        model_path: &str,
+    ) -> Result<Self, String> {
+        Self::new_with_training_level_config(simulations, training, model_path, 0.75)
     }
 
     fn new_with_training_level_config(
@@ -870,9 +846,6 @@ impl AlphaZeroStrategy {
         training: TrainingLevel,
         model_path: &str,
         cpuct: f32,
-        tactical_override: bool,
-        endgame_solve_threshold: usize,
-        strict_model_load: bool,
     ) -> Result<Self, String> {
         // Load trained network or create new one based on training level
         let net = match training {
@@ -893,17 +866,10 @@ impl AlphaZeroStrategy {
                         println!("Loaded trained {:?} model from '{}'", net_type, model_path);
                         trained_net
                     }
-                    Err(e) => {
-                        if strict_model_load {
-                            return Err(format!(
-                                "Failed to load trained model '{}': {:?}",
-                                model_path, e
-                            ));
-                        }
-                        println!("Failed to load trained model: {:?}", e);
-                        println!("   Using untrained network instead");
-                        Network::<InferenceBackend>::new(net_type, &device, 3)
-                    }
+                    Err(e) => return Err(format!(
+                        "Failed to load trained model '{}': {:?}",
+                        model_path, e
+                    )),
                 }
             }
             TrainingLevel::Untrained => {
@@ -923,8 +889,6 @@ impl AlphaZeroStrategy {
             net,
             simulations,
             cpuct,
-            tactical_override,
-            endgame_solve_threshold,
             name: format!("AlphaZero-{}{}", simulations, if matches!(training, TrainingLevel::Trained) { "-Trained" } else { "" }),
             training_level: training,
         })
@@ -953,68 +917,10 @@ impl AlphaZeroStrategy {
             Cell::Empty => 0, // shouldn't happen
         }
     }
-
-    fn tactical_override_move(
-        &self,
-        state: &GameState,
-        config: &GameConfig,
-    ) -> Result<Option<usize>, String> {
-        if !self.tactical_override {
-            return Ok(None);
-        }
-
-        let valid_moves = generate_valid_moves(state, config);
-        if valid_moves.is_empty() {
-            return Ok(None);
-        }
-
-        // Immediate win if available.
-        let current_winner = match state.current_player {
-            Cell::Player0 => Winner::Player0,
-            Cell::Player1 => Winner::Player1,
-            Cell::Empty => Winner::None,
-        };
-        for &mv in &valid_moves {
-            let next = state.make_move(mv, config)?;
-            if next.winner == current_winner {
-                return Ok(Some(mv));
-            }
-        }
-
-        // Otherwise block opponent's immediate win.
-        let opponent = state.current_player.opponent().unwrap_or(Cell::Empty);
-        let opponent_winner = match opponent {
-            Cell::Player0 => Winner::Player0,
-            Cell::Player1 => Winner::Player1,
-            Cell::Empty => Winner::None,
-        };
-        for &mv in &valid_moves {
-            let board_if_opp_moves = state.board.clone().set_cell(mv, opponent)?;
-            if check_winner(&board_if_opp_moves, config.winning_size) == opponent_winner {
-                return Ok(Some(mv));
-            }
-        }
-
-        Ok(None)
-    }
 }
 
 impl Strategy for AlphaZeroStrategy {
     fn get_move(&self, state: &GameState, config: &GameConfig) -> Result<usize, String> {
-        if self.endgame_solve_threshold > 0 {
-            let empty_cells = state.board.get_empty_positions().len();
-            if empty_cells <= self.endgame_solve_threshold {
-                let solve_config = config.clone().with_depth(empty_cells.max(1));
-                if let Ok(solution) = find_best_move(state, &solve_config) {
-                    return Ok(solution.move_index);
-                }
-            }
-        }
-
-        if let Some(tactical_move) = self.tactical_override_move(state, config)? {
-            return Ok(tactical_move);
-        }
-
         // Convert to AlphaZero format
         let alphazero_board = self.game_state_to_alphazero_board(state, config);
         let current_player = self.current_player_to_u8(state.current_player);
@@ -1416,22 +1322,15 @@ fn run_fixed_suite_eval(args: &Args) -> Result<(), String> {
         args.fixed_suite_max_plies
     );
     println!("Deterministic random seed: {}", args.fixed_suite_seed);
-    println!(
-        "AZ tactical override: {}, endgame solve threshold: {}",
-        args.fixed_suite_tactical_override,
-        args.fixed_suite_endgame_solve_threshold
-    );
     if let Some(path) = args.fixed_suite_csv.as_ref() {
         println!("CSV output: {}", path);
     }
     println!();
 
-    let az = AlphaZeroStrategy::try_new_with_model_path_config(
+    let az = AlphaZeroStrategy::new_with_model_path_and_cpuct(
         args.fixed_suite_sims,
         &args.model_path,
         args.fixed_suite_cpuct,
-        args.fixed_suite_tactical_override,
-        args.fixed_suite_endgame_solve_threshold,
     )?;
 
     let deep = MinimaxStrategy::new(3);
@@ -1894,7 +1793,7 @@ fn demo_tournament(model_path: &str, tournament_games: usize) -> Result<(), Stri
     // AlphaZero vs Deep Minimax - show first 2 games verbose
     let result = play_tournament(
         &config,
-        AlphaZeroStrategy::new_with_model_path(25, model_path),
+        AlphaZeroStrategy::new_with_model_path(25, model_path)?,
         MinimaxStrategy::new(3),
         tournament_games,
         true,
@@ -1904,7 +1803,7 @@ fn demo_tournament(model_path: &str, tournament_games: usize) -> Result<(), Stri
     // AlphaZero vs Medium Minimax
     let result = play_tournament(
         &config,
-        AlphaZeroStrategy::new_with_model_path(25, model_path),
+        AlphaZeroStrategy::new_with_model_path(25, model_path)?,
         MinimaxStrategy::new(2),
         tournament_games,
         false,
@@ -1914,7 +1813,7 @@ fn demo_tournament(model_path: &str, tournament_games: usize) -> Result<(), Stri
     // AlphaZero vs Random
     let result = play_tournament(
         &config,
-        AlphaZeroStrategy::new_with_model_path(25, model_path),
+        AlphaZeroStrategy::new_with_model_path(25, model_path)?,
         RandomStrategy::new(),
         tournament_games,
         false,
@@ -1924,8 +1823,8 @@ fn demo_tournament(model_path: &str, tournament_games: usize) -> Result<(), Stri
     // Different AlphaZero simulation counts
     let result = play_tournament(
         &config,
-        AlphaZeroStrategy::new_with_model_path(50, model_path),
-        AlphaZeroStrategy::new_with_model_path(10, model_path),
+        AlphaZeroStrategy::new_with_model_path(50, model_path)?,
+        AlphaZeroStrategy::new_with_model_path(10, model_path)?,
         tournament_games,
         false,
     )?;
@@ -1994,11 +1893,11 @@ fn demo_head_to_head(model1: &str, model2: &str, tournament_games: usize) -> Res
     use std::io::Write;
     print!("Loading model 1: {} ... ", model1);
     std::io::stdout().flush().ok();
-    let s1 = AlphaZeroStrategy::new_with_model_path(sims, model1);
+    let s1 = AlphaZeroStrategy::new_with_model_path(sims, model1)?;
     println!("done");
     print!("Loading model 2: {} ... ", model2);
     std::io::stdout().flush().ok();
-    let s2 = AlphaZeroStrategy::new_with_model_path(sims, model2);
+    let s2 = AlphaZeroStrategy::new_with_model_path(sims, model2)?;
     println!("done");
 
     let result = play_tournament(&config, s1, s2, tournament_games, false)?;

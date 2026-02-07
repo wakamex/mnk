@@ -10,10 +10,13 @@ Reach `{{PRIMARY_METRIC}} >= {{TARGET_PERCENT}}%` under this evaluation protocol
 ## Constraints
 {{SECONDARY_CONSTRAINTS}}
 
+For the primary metric, treat pure AlphaZero as mandatory: move choice must come from neural policy/value + MCTS only.
+
 ## What You Are Allowed To Do
 - Run broad experiments across hyperparameters, training pipeline changes, and architecture choices.
 - Propose and implement new code paths when they are the most promising route.
 - Search the web for relevant papers, repos, and practical ideas, then test adapted variants locally.
+- If exploring non-MCTS helper logic, report it separately as non-primary and do not use it to claim target hit.
 - Compare implementation and training choices against:
 {{REFERENCE_REPOS}}
 

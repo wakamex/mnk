@@ -3,6 +3,8 @@
     "primary_metric": "vs_Deep",
     "target_percent": 50.0,
     "secondary_constraints": [
+      "Primary target is pure AlphaZero net strength: only neural inference + MCTS move selection for reported target metrics.",
+      "Do not use non-MCTS decision logic (minimax endgame solve, tactical win/block overrides, handcrafted rule shortcuts) in any run counted toward the primary metric.",
       "Do not materially regress vs_Medium relative to best known checkpoint unless justified by a stronger path to vs_Deep >= 50%.",
       "Do not materially regress vs_Random relative to best known checkpoint unless justified by a stronger path to vs_Deep >= 50%."
     ]
@@ -17,7 +19,8 @@
     "notes": [
       "Use no root Dirichlet noise during evaluation.",
       "Evaluate both sides for each opening state.",
-      "Track vs_Random, vs_Deep, and vs_Medium for regressions."
+      "Track vs_Random, vs_Deep, and vs_Medium for regressions.",
+      "Primary-metric evaluations must use pure MCTS+NN move selection only (no minimax/tactical override paths)."
     ]
   },
   "research_space": [
