@@ -1,0 +1,53 @@
+{
+  "objective": {
+    "primary_metric": "vs_Deep",
+    "target_percent": 50.0,
+    "secondary_constraints": [
+      "Do not materially regress vs_Medium relative to best known checkpoint unless justified by a stronger path to vs_Deep >= 50%.",
+      "Do not materially regress vs_Random relative to best known checkpoint unless justified by a stronger path to vs_Deep >= 50%."
+    ]
+  },
+  "evaluation_protocol": {
+    "description": "Use a fixed deterministic eval suite to reduce leaderboard noise.",
+    "openings": 25,
+    "sides_per_opening": 2,
+    "total_games": 50,
+    "root_noise": false,
+    "fixed_eval_sims": 100,
+    "notes": [
+      "Use no root Dirichlet noise during evaluation.",
+      "Evaluate both sides for each opening state.",
+      "Track vs_Random, vs_Deep, and vs_Medium for regressions."
+    ]
+  },
+  "research_space": [
+    "Search hyperparameters: mcts_sims, cpuct, temperature schedules, dirichlet_alpha.",
+    "Training pipeline: optimizer/lr schedules, replay buffer strategies, duplicate-handling strategies.",
+    "Modeling: CNN and MiniBT4 size/regularization adjustments with matched parameter budgets.",
+    "Data quality: position diversity, canonical dedup ratios, and weighting effects.",
+    "Implementation changes: add/modify code paths when sweeps alone are unlikely to reach the target."
+  ],
+  "reference_repos": [
+    "/code/alpha-zero",
+    "/code/AlphaZero_Gomoku"
+  ],
+  "allow_web_search": true,
+  "budgets": {
+    "max_wall_hours": 10,
+    "max_experiments": 60,
+    "max_gpu_hours": 8,
+    "stop_if_target_hit": true
+  },
+  "commit_requirements": {
+    "required_sections": [
+      "Motivation",
+      "Hypothesis",
+      "Research Plan",
+      "What Changed",
+      "Evidence",
+      "Next Step"
+    ],
+    "require_metrics": true,
+    "require_paths": true
+  }
+}
