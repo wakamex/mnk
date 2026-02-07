@@ -154,7 +154,7 @@ struct Args {
     learning_rate: f64,
 
     /// Value loss weight (vs policy loss weight of 1.0)
-    #[arg(long, default_value = "4.0")]
+    #[arg(long, default_value = "2.0")]
     value_weight: f32,
 
     /// MCTS simulations per position during self-play
@@ -174,7 +174,7 @@ struct Args {
     board_width: usize,
 
     /// MCTS temperature for move selection (0=argmax, 1=proportional to visits, >1=more exploratory)
-    #[arg(long, default_value = "1.75")]
+    #[arg(long, default_value = "1.25")]
     temperature: f32,
 
     /// Path for CSV training log (iteration metrics with wall-clock time)

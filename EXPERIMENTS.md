@@ -13,10 +13,10 @@ Old roadmap/planning notes were removed to keep this document current.
 
 - `--learning-rate`: `0.02`
 - `--mcts-simulations`: `50`
-- `--value-weight`: `4.0`
-- `--temperature`: `1.75`
+- `--value-weight`: `2.0`
+- `--temperature`: `1.25`
 
-Rationale: lr/mcts from Phase 1 CNN sweep. Value weight and temperature from Phase 2 policy investigation — `vw=4.0, temp=1.75` had the best composite score (vsR=83%, vsD=49.5%, vsM=46%), first config to approach 50% against both Deep and Medium minimax.
+Rationale: lr/mcts from Phase 1 CNN sweep. Value weight and temperature from Phase 2 policy investigation. `vw=2.0, temp=1.25` scored vsR=87%, vsD=38%, vsM=45.5% — best balanced config across all opponents. The earlier `vw=4.0, temp=1.75` winner (49.5% vsD) traded too much vsR for vsD.
 
 ## Latest completed sweep (CNN lr x mcts)
 
@@ -82,35 +82,61 @@ Replaced the binary temp_threshold (sample N moves then argmax) with continuous 
 
 **Note**: `vw=2.0, temp=1.0` scored vsD=50%, vsM=50% but vsR=69.5% — needs further investigation. This region of the parameter space may contain a better balanced config. Consider a focused sweep around `vw=1.5-3.0, temp=0.75-1.25`.
 
-### Focused sweep around vw=2.0, temp=1.0
+### Focused sweep (`sweep_results/policy_focused_vw2_temp1_20260206_171949.csv`)
 
-The `vw=2.0, temp=1.0` config hit 50%/50% vs Deep/Medium but only 69.5% vs Random. A focused grid around this area may find a config that keeps the strong policy without sacrificing vs Random:
+3x3 grid: `temp={0.75,1.0,1.25}` x `vw={1.5,2.0,3.0}`
+
+| Config | vsR | vsD | vsM | Avg |
+|--------|-----|-----|-----|-----|
+| **vw2.0_temp1.25** | **87.0%** | **38.0%** | **45.5%** | **56.8%** |
+| vw1.5_temp1.0 | 74.0% | 25.0% | 43.0% | 47.3% |
+| vw1.5_temp1.25 | 86.5% | 23.5% | 27.5% | 45.8% |
+| vw3.0_temp0.75 | 90.5% | 1.5% | 25.0% | 39.0% |
+
+The `vw=2.0, temp=1.0` result from the 4x4 grid (50%/50% vsD/vsM) did not reproduce (0.5%/0.0%) — confirmed as noise at n=1. `temp=1.25` is consistently the best temperature in this region.
+
+## Next experiments
+
+### Reproducibility check (priority)
+
+All sweep results are n=1 per config. The `vw=2.0, temp=1.0` non-reproduction shows this is a problem. Run the best config 5 times to get confidence intervals:
 
 ```bash
-python parallel_sweep.py \
-  --net-type cnn -i 20 -g 1000 \
-  --temperature 0.75,1.0,1.25 \
-  --value-weight 1.5,2.0,3.0 \
-  --sweep-name policy_focused_vw2_temp1
+# Run 5 identical training runs, compare tournament variance
+for i in 1 2 3 4 5; do
+  python parallel_sweep.py --net-type cnn -i 20 -g 1000 \
+    --value-weight 2.0 --temperature 1.25 \
+    --sweep-name reproducibility_run$i
+done
+```
+
+### Longer training horizon
+
+All sweeps used 20 iterations. The model may still be improving. Run the best config for 50-100 iterations to find the convergence ceiling:
+
+```bash
+python parallel_sweep.py --net-type cnn -i 50,100 -g 1000 \
+  --value-weight 2.0 --temperature 1.25 \
+  --sweep-name longer_training
 ```
 
 ### MCTS sims scaling
 
-More search produces sharper policy targets. Try 200-400 sims in isolated runs now that VRAM is stable.
+More search produces sharper policy targets. Now that VRAM is stable, try higher sims with best params:
+
+```bash
+python parallel_sweep.py --net-type cnn -i 20 -g 1000 \
+  --mcts 50,100,200,400 \
+  --value-weight 2.0 --temperature 1.25 \
+  --sweep-name mcts_scaling
+```
 
 ### Phase 3: Transformer on Larger Boards
 
-The Transformer (800K params) is ~20x overparameterized for 3x3. Running a full sweep on 3x3 would just confirm "right-sized CNN beats overparameterized Transformer on trivial problem."
-
-Instead:
-- **Sanity check**: One quick Transformer run on 3x3 (5 iterations) to confirm it trains without crashing
+The Transformer (800K params) is ~20x overparameterized for 3x3. Instead of sweeping on 3x3:
+- **Sanity check**: One quick Transformer run on 3x3 (5 iterations) to confirm it trains
 - **Real test**: Transformer on 5x5 or 7x7 boards where CNN can't go and the capacity is justified
 - Compare Transformer learning curves on larger boards against random/minimax baselines
-
-### Housekeeping
-
-- Re-test `mcts=200` in isolated runs if needed after policy head improvements
-- Consider training intensity sweep (`--epochs 4,8,16`, `--games-per-iter 500,1000,2000`) once policy head is unblocked
 
 ## Useful commands
 
