@@ -152,9 +152,10 @@ fn transform_position(pos: usize, board_width: usize, transform: Transform) -> u
     new_row * board_width + new_col
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct ReplayBuffer {
-    samples: Vec<TrainingExample>,
+    entries: HashMap<ExampleKey, DedupAccumulator>,
+    slots: Vec<Option<ExampleKey>>,
     capacity: usize,
     ptr: usize,
 }
@@ -162,37 +163,107 @@ struct ReplayBuffer {
 impl ReplayBuffer {
     fn new(capacity: usize) -> Self {
         Self {
-            samples: Vec::with_capacity(capacity),
+            entries: HashMap::with_capacity(capacity),
+            slots: Vec::with_capacity(capacity),
             capacity,
             ptr: 0,
         }
     }
 
-    fn push(&mut self, new_samples: &[TrainingExample]) {
+    fn push(&mut self, new_samples: &[TrainingExample]) -> ReplayInsertStats {
+        let mut stats = ReplayInsertStats::default();
         for sample in new_samples {
-            if self.samples.len() < self.capacity {
-                self.samples.push(sample.clone());
-                if self.samples.len() == self.capacity {
+            let canonical = canonicalize_example(sample);
+            let key = ExampleKey {
+                board: canonical.board.clone(),
+                player: canonical.player,
+            };
+
+            if let Some(entry) = self.entries.get_mut(&key) {
+                entry.count += 1.0;
+                entry.sum_value += canonical.value;
+                for (acc, p) in entry.sum_policy.iter_mut().zip(canonical.policy.iter()) {
+                    *acc += *p;
+                }
+                stats.merged_existing += 1;
+                continue;
+            }
+
+            if self.capacity == 0 {
+                continue;
+            }
+
+            if self.entries.len() >= self.capacity {
+                if let Some(old_key) = self.slots[self.ptr].take() {
+                    self.entries.remove(&old_key);
+                    stats.evicted += 1;
+                }
+                self.slots[self.ptr] = Some(key.clone());
+                self.ptr = (self.ptr + 1) % self.capacity;
+            } else {
+                self.slots.push(Some(key.clone()));
+                if self.entries.len() + 1 == self.capacity {
                     self.ptr = 0;
                 }
-            } else if self.capacity > 0 {
-                self.samples[self.ptr] = sample.clone();
-                self.ptr = (self.ptr + 1) % self.capacity;
             }
+
+            self.entries.insert(
+                key,
+                DedupAccumulator {
+                    count: 1.0,
+                    sum_value: canonical.value,
+                    sum_policy: canonical.policy,
+                },
+            );
+            stats.added_unique += 1;
         }
+        stats
     }
 
     fn len(&self) -> usize {
-        self.samples.len()
+        self.entries.len()
     }
 
     fn is_ready(&self, batch_size: usize) -> bool {
         self.len() >= batch_size
     }
 
-    fn as_slice(&self) -> &[TrainingExample] {
-        &self.samples
+    fn total_weight(&self) -> f32 {
+        self.entries.values().map(|entry| entry.count).sum()
     }
+
+    fn to_weighted_examples(&self) -> Vec<WeightedTrainingExample> {
+        self.entries
+            .iter()
+            .map(|(key, acc)| {
+                let count_f = acc.count;
+                let mut policy: Vec<f32> = acc.sum_policy.iter().map(|p| p / count_f).collect();
+                let policy_sum: f32 = policy.iter().sum();
+                if policy_sum > 0.0 {
+                    for p in &mut policy {
+                        *p /= policy_sum;
+                    }
+                }
+
+                WeightedTrainingExample {
+                    example: TrainingExample {
+                        board: key.board.clone(),
+                        player: key.player,
+                        policy,
+                        value: acc.sum_value / count_f,
+                    },
+                    weight: count_f,
+                }
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct ReplayInsertStats {
+    added_unique: usize,
+    merged_existing: usize,
+    evicted: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -201,7 +272,7 @@ struct WeightedTrainingExample {
     weight: f32,
 }
 
-#[derive(Hash, Eq, PartialEq, Debug)]
+#[derive(Hash, Eq, PartialEq, Debug, Clone)]
 struct ExampleKey {
     board: Vec<Option<u8>>,
     player: u8,
@@ -209,7 +280,7 @@ struct ExampleKey {
 
 #[derive(Debug)]
 struct DedupAccumulator {
-    count: u32,
+    count: f32,
     sum_value: f32,
     sum_policy: Vec<f32>,
 }
@@ -252,52 +323,6 @@ fn canonicalize_example(example: &TrainingExample) -> TrainingExample {
     }
 
     best_example.expect("at least one symmetry candidate")
-}
-
-fn deduplicate_examples(examples: &[TrainingExample]) -> Vec<WeightedTrainingExample> {
-    let mut map: HashMap<ExampleKey, DedupAccumulator> = HashMap::new();
-
-    for example in examples {
-        let canonical = canonicalize_example(example);
-        let key = ExampleKey {
-            board: canonical.board.clone(),
-            player: canonical.player,
-        };
-        let entry = map.entry(key).or_insert_with(|| DedupAccumulator {
-            count: 0,
-            sum_value: 0.0,
-            sum_policy: vec![0.0; canonical.policy.len()],
-        });
-
-        entry.count += 1;
-        entry.sum_value += canonical.value;
-        for (acc, p) in entry.sum_policy.iter_mut().zip(canonical.policy.iter()) {
-            *acc += *p;
-        }
-    }
-
-    map.into_iter()
-        .map(|(key, acc)| {
-            let count_f = acc.count as f32;
-            let mut policy: Vec<f32> = acc.sum_policy.into_iter().map(|p| p / count_f).collect();
-            let policy_sum: f32 = policy.iter().sum();
-            if policy_sum > 0.0 {
-                for p in &mut policy {
-                    *p /= policy_sum;
-                }
-            }
-
-            WeightedTrainingExample {
-                example: TrainingExample {
-                    board: key.board,
-                    player: key.player,
-                    policy,
-                    value: acc.sum_value / count_f,
-                },
-                weight: count_f,
-            }
-        })
-        .collect()
 }
 
 fn run_lightweight_fixed_suite_eval<B, N>(
@@ -395,7 +420,7 @@ struct Args {
     #[arg(long)]
     csv_log: Option<String>,
 
-    /// Replay buffer capacity (samples after symmetry augmentation)
+    /// Replay buffer capacity (weighted unique samples after symmetry-aug dedup)
     #[arg(long, default_value = "20000")]
     replay_buffer_size: usize,
 
@@ -575,11 +600,11 @@ fn main() {
 
         let original_count = iter_examples.len();
 
-        // Apply 8x symmetry augmentation and push into rolling replay buffer.
-        // This mirrors the standard AlphaZero-style "augment on insert" pattern.
+        // Apply 8x symmetry augmentation, then let replay buffer merge canonical duplicates globally.
         let augmented_examples = apply_symmetry_augmentation(&iter_examples);
-        replay_buffer.push(&augmented_examples);
-        let replay_count = replay_buffer.len();
+        let insert_stats = replay_buffer.push(&augmented_examples);
+        let replay_unique_count = replay_buffer.len();
+        let replay_total_weight = replay_buffer.total_weight();
 
         println!(
             "Iteration {}: {} → {} examples ({}x symmetry)",
@@ -589,29 +614,20 @@ fn main() {
             augmented_examples.len() as f32 / original_count as f32
         );
         println!(
-            "  Replay buffer: {}/{} samples",
-            replay_count, replay_buffer_size
+            "  Replay ingest: merged={}, new_unique={}, evicted={}",
+            insert_stats.merged_existing, insert_stats.added_unique, insert_stats.evicted
         );
-
-        // Deduplicate replay positions (symmetry-canonical) and keep sample weights.
-        let mut deduped_examples = deduplicate_examples(replay_buffer.as_slice());
-        let dedup_count = deduped_examples.len();
-        let total_weight: f32 = deduped_examples.iter().map(|ex| ex.weight).sum();
-        let compression = if dedup_count > 0 {
-            replay_count as f32 / dedup_count as f32
-        } else {
-            0.0
-        };
         println!(
-            "  Deduped replay: {} unique ({:.2}x compression, total weight {:.0})",
-            dedup_count, compression, total_weight
+            "  Replay buffer: {}/{} unique (total weight {:.0})",
+            replay_unique_count, replay_buffer_size, replay_total_weight
         );
 
-        if !replay_buffer.is_ready(batch_size) || deduped_examples.len() < batch_size {
+        let mut replay_examples = replay_buffer.to_weighted_examples();
+        if !replay_buffer.is_ready(batch_size) || replay_examples.len() < batch_size {
             println!(
                 "  Replay warm-up: need at least {} unique samples, have {} (skipping training this iter)",
                 batch_size,
-                deduped_examples.len()
+                replay_examples.len()
             );
             continue;
         }
@@ -623,18 +639,18 @@ fn main() {
 
         for epoch in 0..epochs {
             use rand::seq::SliceRandom;
-            deduped_examples.shuffle(&mut rand::thread_rng());
+            replay_examples.shuffle(&mut rand::thread_rng());
 
             let mut epoch_value_loss = 0.0f32;
             let mut epoch_policy_loss = 0.0f32;
             let mut num_batches = 0;
 
-            for batch_start in (0..deduped_examples.len()).step_by(batch_size) {
+            for batch_start in (0..replay_examples.len()).step_by(batch_size) {
                 let batch_end = batch_start + batch_size;
-                if batch_end > deduped_examples.len() {
+                if batch_end > replay_examples.len() {
                     break; // Skip incomplete last batch to keep tensor sizes constant (avoids CubeCL VRAM leak)
                 }
-                let batch = &deduped_examples[batch_start..batch_end];
+                let batch = &replay_examples[batch_start..batch_end];
 
                 // Prepare batch data
                 let mut board_data: Vec<f32> = Vec::new();
