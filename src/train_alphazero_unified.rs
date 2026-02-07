@@ -9,8 +9,11 @@ use burn::tensor::activation;
 use burn::tensor::backend::AutodiffBackend;
 use clap::Parser;
 use mnk::alphazero::evaluate_vs_random;
+use mnk::fixed_suite_eval::{evaluate_fixed_suite_inprocess, FixedSuiteConfig, FixedSuiteMetrics};
 use mnk::network::{Network, NetworkType};
+use mnk::unified_mcts::NetworkInference;
 use mnk::unified_mcts::TrainingExample;
+use std::collections::HashMap;
 
 /// Query GPU VRAM usage via nvidia-smi. Returns (used_mb, total_mb) or None.
 fn gpu_vram_mb() -> Option<(u64, u64)> {
@@ -149,6 +152,185 @@ fn transform_position(pos: usize, board_width: usize, transform: Transform) -> u
     new_row * board_width + new_col
 }
 
+#[derive(Debug, Clone)]
+struct ReplayBuffer {
+    samples: Vec<TrainingExample>,
+    capacity: usize,
+    ptr: usize,
+}
+
+impl ReplayBuffer {
+    fn new(capacity: usize) -> Self {
+        Self {
+            samples: Vec::with_capacity(capacity),
+            capacity,
+            ptr: 0,
+        }
+    }
+
+    fn push(&mut self, new_samples: &[TrainingExample]) {
+        for sample in new_samples {
+            if self.samples.len() < self.capacity {
+                self.samples.push(sample.clone());
+                if self.samples.len() == self.capacity {
+                    self.ptr = 0;
+                }
+            } else if self.capacity > 0 {
+                self.samples[self.ptr] = sample.clone();
+                self.ptr = (self.ptr + 1) % self.capacity;
+            }
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.samples.len()
+    }
+
+    fn is_ready(&self, batch_size: usize) -> bool {
+        self.len() >= batch_size
+    }
+
+    fn as_slice(&self) -> &[TrainingExample] {
+        &self.samples
+    }
+}
+
+#[derive(Debug, Clone)]
+struct WeightedTrainingExample {
+    example: TrainingExample,
+    weight: f32,
+}
+
+#[derive(Hash, Eq, PartialEq, Debug)]
+struct ExampleKey {
+    board: Vec<Option<u8>>,
+    player: u8,
+}
+
+#[derive(Debug)]
+struct DedupAccumulator {
+    count: u32,
+    sum_value: f32,
+    sum_policy: Vec<f32>,
+}
+
+fn board_player_key(board: &[Option<u8>], player: u8) -> Vec<u8> {
+    let mut key = Vec::with_capacity(board.len() + 1);
+    for cell in board {
+        key.push(match cell {
+            Some(0) => 1,
+            Some(1) => 2,
+            _ => 0,
+        });
+    }
+    key.push(player.saturating_add(3));
+    key
+}
+
+fn canonicalize_example(example: &TrainingExample) -> TrainingExample {
+    let transforms = [
+        Transform::Identity,
+        Transform::Rotate90,
+        Transform::Rotate180,
+        Transform::Rotate270,
+        Transform::FlipHorizontal,
+        Transform::FlipVertical,
+        Transform::FlipDiag1,
+        Transform::FlipDiag2,
+    ];
+
+    let mut best_key: Option<Vec<u8>> = None;
+    let mut best_example: Option<TrainingExample> = None;
+
+    for transform in transforms {
+        let candidate = apply_transform(example, transform);
+        let key = board_player_key(&candidate.board, candidate.player);
+        if best_key.as_ref().map_or(true, |k| key < *k) {
+            best_key = Some(key);
+            best_example = Some(candidate);
+        }
+    }
+
+    best_example.expect("at least one symmetry candidate")
+}
+
+fn deduplicate_examples(examples: &[TrainingExample]) -> Vec<WeightedTrainingExample> {
+    let mut map: HashMap<ExampleKey, DedupAccumulator> = HashMap::new();
+
+    for example in examples {
+        let canonical = canonicalize_example(example);
+        let key = ExampleKey {
+            board: canonical.board.clone(),
+            player: canonical.player,
+        };
+        let entry = map.entry(key).or_insert_with(|| DedupAccumulator {
+            count: 0,
+            sum_value: 0.0,
+            sum_policy: vec![0.0; canonical.policy.len()],
+        });
+
+        entry.count += 1;
+        entry.sum_value += canonical.value;
+        for (acc, p) in entry.sum_policy.iter_mut().zip(canonical.policy.iter()) {
+            *acc += *p;
+        }
+    }
+
+    map.into_iter()
+        .map(|(key, acc)| {
+            let count_f = acc.count as f32;
+            let mut policy: Vec<f32> = acc.sum_policy.into_iter().map(|p| p / count_f).collect();
+            let policy_sum: f32 = policy.iter().sum();
+            if policy_sum > 0.0 {
+                for p in &mut policy {
+                    *p /= policy_sum;
+                }
+            }
+
+            WeightedTrainingExample {
+                example: TrainingExample {
+                    board: key.board,
+                    player: key.player,
+                    policy,
+                    value: acc.sum_value / count_f,
+                },
+                weight: count_f,
+            }
+        })
+        .collect()
+}
+
+fn run_lightweight_fixed_suite_eval<B, N>(
+    net: &N,
+    args: &Args,
+    iteration: usize,
+) -> Option<FixedSuiteMetrics>
+where
+    B: Backend<FloatElem = f32>,
+    N: NetworkInference<B>,
+{
+    if args.light_eval_every == 0 || iteration % args.light_eval_every != 0 {
+        return None;
+    }
+
+    let cfg = FixedSuiteConfig {
+        openings: args.light_eval_openings,
+        sides: args.light_eval_sides,
+        sims: args.light_eval_sims,
+        cpuct: args.light_eval_cpuct,
+        max_plies: args.light_eval_max_plies,
+        seed: args.light_eval_seed,
+        csv_path: None,
+    };
+    match evaluate_fixed_suite_inprocess::<B, N>(net, &cfg) {
+        Ok(eval) => Some(eval.metrics()),
+        Err(e) => {
+            eprintln!("Light fixed-suite eval skipped: {}", e);
+            None
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "train_alphazero")]
 #[command(about = "Train AlphaZero neural network with configurable hyperparameters")]
@@ -212,6 +394,38 @@ struct Args {
     /// Path for CSV training log (iteration metrics with wall-clock time)
     #[arg(long)]
     csv_log: Option<String>,
+
+    /// Replay buffer capacity (samples after symmetry augmentation)
+    #[arg(long, default_value = "20000")]
+    replay_buffer_size: usize,
+
+    /// Run lightweight fixed-suite check every N iterations (0 disables)
+    #[arg(long, default_value = "5")]
+    light_eval_every: usize,
+
+    /// Lightweight fixed-suite openings
+    #[arg(long, default_value = "8")]
+    light_eval_openings: usize,
+
+    /// Lightweight fixed-suite sides per opening
+    #[arg(long, default_value = "2")]
+    light_eval_sides: usize,
+
+    /// Lightweight fixed-suite MCTS sims
+    #[arg(long, default_value = "50")]
+    light_eval_sims: usize,
+
+    /// Lightweight fixed-suite PUCT
+    #[arg(long, default_value = "0.75")]
+    light_eval_cpuct: f32,
+
+    /// Lightweight fixed-suite max opening plies
+    #[arg(long, default_value = "2")]
+    light_eval_max_plies: usize,
+
+    /// Lightweight fixed-suite deterministic random seed
+    #[arg(long, default_value = "20260207")]
+    light_eval_seed: u64,
 }
 
 fn main() {
@@ -285,8 +499,26 @@ fn main() {
     println!("  MCTS simulations: {}", args.mcts_simulations);
     println!("  CPUCT: {}", args.cpuct);
     println!("  Temperature: {}", args.temperature);
-    println!("  Temperature cutoff moves: {}", args.temperature_cutoff_moves);
+    println!(
+        "  Temperature cutoff moves: {}",
+        args.temperature_cutoff_moves
+    );
     println!("  Dirichlet alpha: {}", args.dirichlet_alpha);
+    println!("  Replay buffer size: {}", args.replay_buffer_size);
+    if args.light_eval_every > 0 {
+        println!(
+            "  Light fixed-suite eval: every {} iters (openings={}, sides={}, sims={}, cpuct={}, max_plies={}, seed={})",
+            args.light_eval_every,
+            args.light_eval_openings,
+            args.light_eval_sides,
+            args.light_eval_sims,
+            args.light_eval_cpuct,
+            args.light_eval_max_plies,
+            args.light_eval_seed
+        );
+    } else {
+        println!("  Light fixed-suite eval: disabled");
+    }
     println!();
 
     // CSV training log
@@ -294,9 +526,12 @@ fn main() {
         let file = std::fs::File::create(path).expect("Failed to create CSV log file");
         let mut w = std::io::BufWriter::new(file);
         use std::io::Write;
-        writeln!(w, "iteration,wall_clock_s,selfplay_s,training_s,games_per_sec,value_loss,policy_loss,vs_random,vram_used_mb").unwrap();
+        writeln!(w, "iteration,wall_clock_s,selfplay_s,training_s,games_per_sec,value_loss,policy_loss,vs_random,vs_deep_light,vs_medium_light,vs_random_light,vram_used_mb").unwrap();
         w
     });
+
+    let replay_buffer_size = args.replay_buffer_size.max(batch_size).max(1);
+    let mut replay_buffer = ReplayBuffer::new(replay_buffer_size);
 
     let start_time = std::time::Instant::now();
 
@@ -305,7 +540,7 @@ fn main() {
 
         // Generate training data through self-play with batch optimization
         let selfplay_start = std::time::Instant::now();
-        let mut all_examples = Vec::new();
+        let mut iter_examples = Vec::new();
 
         // IMPORTANT: Run inference-heavy self-play on the non-autodiff model.
         // Using Autodiff backend here builds graphs that are never backpropagated.
@@ -327,7 +562,7 @@ fn main() {
         let iter_games_per_sec = games_per_iter as f32 / selfplay_time.as_secs_f32();
 
         for game_examples in game_training_examples {
-            all_examples.extend(game_examples);
+            iter_examples.extend(game_examples);
         }
 
         println!(
@@ -338,10 +573,13 @@ fn main() {
             args.mcts_simulations
         );
 
-        let original_count = all_examples.len();
+        let original_count = iter_examples.len();
 
-        // Apply 8x symmetry augmentation for data efficiency
-        let augmented_examples = apply_symmetry_augmentation(&all_examples);
+        // Apply 8x symmetry augmentation and push into rolling replay buffer.
+        // This mirrors the standard AlphaZero-style "augment on insert" pattern.
+        let augmented_examples = apply_symmetry_augmentation(&iter_examples);
+        replay_buffer.push(&augmented_examples);
+        let replay_count = replay_buffer.len();
 
         println!(
             "Iteration {}: {} → {} examples ({}x symmetry)",
@@ -350,9 +588,33 @@ fn main() {
             augmented_examples.len(),
             augmented_examples.len() as f32 / original_count as f32
         );
+        println!(
+            "  Replay buffer: {}/{} samples",
+            replay_count, replay_buffer_size
+        );
 
-        // Use augmented examples for training
-        let mut all_examples = augmented_examples;
+        // Deduplicate replay positions (symmetry-canonical) and keep sample weights.
+        let mut deduped_examples = deduplicate_examples(replay_buffer.as_slice());
+        let dedup_count = deduped_examples.len();
+        let total_weight: f32 = deduped_examples.iter().map(|ex| ex.weight).sum();
+        let compression = if dedup_count > 0 {
+            replay_count as f32 / dedup_count as f32
+        } else {
+            0.0
+        };
+        println!(
+            "  Deduped replay: {} unique ({:.2}x compression, total weight {:.0})",
+            dedup_count, compression, total_weight
+        );
+
+        if !replay_buffer.is_ready(batch_size) || deduped_examples.len() < batch_size {
+            println!(
+                "  Replay warm-up: need at least {} unique samples, have {} (skipping training this iter)",
+                batch_size,
+                deduped_examples.len()
+            );
+            continue;
+        }
 
         // Training loop
         let training_start = std::time::Instant::now();
@@ -361,25 +623,27 @@ fn main() {
 
         for epoch in 0..epochs {
             use rand::seq::SliceRandom;
-            all_examples.shuffle(&mut rand::thread_rng());
+            deduped_examples.shuffle(&mut rand::thread_rng());
 
             let mut epoch_value_loss = 0.0f32;
             let mut epoch_policy_loss = 0.0f32;
             let mut num_batches = 0;
 
-            for batch_start in (0..all_examples.len()).step_by(batch_size) {
+            for batch_start in (0..deduped_examples.len()).step_by(batch_size) {
                 let batch_end = batch_start + batch_size;
-                if batch_end > all_examples.len() {
+                if batch_end > deduped_examples.len() {
                     break; // Skip incomplete last batch to keep tensor sizes constant (avoids CubeCL VRAM leak)
                 }
-                let batch = &all_examples[batch_start..batch_end];
+                let batch = &deduped_examples[batch_start..batch_end];
 
                 // Prepare batch data
                 let mut board_data: Vec<f32> = Vec::new();
                 let mut value_targets: Vec<f32> = Vec::new();
                 let mut policy_targets: Vec<f32> = Vec::new();
+                let mut sample_weights: Vec<f32> = Vec::new();
 
-                for ex in batch {
+                for weighted in batch {
+                    let ex = &weighted.example;
                     assert_eq!(
                         ex.board.len(),
                         board_size,
@@ -405,6 +669,7 @@ fn main() {
                     board_data.extend(input);
                     value_targets.push(ex.value);
                     policy_targets.extend(&ex.policy);
+                    sample_weights.push(weighted.weight);
                 }
 
                 // Create tensors
@@ -418,12 +683,18 @@ fn main() {
                 let target_policies =
                     Tensor::<MyBackend, 1>::from_floats(policy_targets.as_slice(), &device)
                         .reshape([batch.len(), board_size]);
+                let sample_weights =
+                    Tensor::<MyBackend, 1>::from_floats(sample_weights.as_slice(), &device);
 
                 // Forward pass
                 let (pred_values, pred_logits) = net.forward(boards);
 
-                // Value loss: MSE
-                let value_loss = (pred_values - target_values).powf_scalar(2.0).mean();
+                // Weighted value loss: MSE
+                let value_weights = sample_weights.clone().reshape([batch.len(), 1]);
+                let weight_sum = sample_weights.clone().sum();
+                let value_loss = ((pred_values - target_values).powf_scalar(2.0) * value_weights)
+                    .sum()
+                    / weight_sum.clone();
 
                 // Policy loss: cross-entropy via log_softmax
                 // Clamp logits to prevent unbounded growth — gradient is zero at boundary,
@@ -434,8 +705,9 @@ fn main() {
                 let safe_target_policies = target_policies.clone() + epsilon;
                 let safe_target_policies =
                     safe_target_policies.clone() / safe_target_policies.sum_dim(1).unsqueeze();
-                let policy_loss =
-                    -(safe_target_policies * log_probs).sum() / target_policies.dims()[0] as f32;
+                let ce_per_sample = -(safe_target_policies * log_probs).sum_dim(1);
+                let policy_weights = sample_weights.clone().reshape([batch.len(), 1]);
+                let policy_loss = (ce_per_sample * policy_weights).sum() / weight_sum;
 
                 // Track per-component losses (single GPU sync for both)
                 let vl = value_loss.clone().into_scalar();
@@ -492,6 +764,16 @@ fn main() {
             evaluate_vs_random::<<MyBackend as AutodiffBackend>::InnerBackend, _>(&net_valid);
         println!("  vs Random: {:.1}%", win_rate * 100.0);
         let vs_random = Some(win_rate);
+        let light_metrics = run_lightweight_fixed_suite_eval::<
+            <MyBackend as AutodiffBackend>::InnerBackend,
+            _,
+        >(&net_valid, &args, iteration);
+        if let Some(metrics) = light_metrics {
+            println!(
+                "  Light fixed-suite: vs_Deep={:.1}% vs_Medium={:.1}% vs_Random={:.1}%",
+                metrics.vs_deep, metrics.vs_medium, metrics.vs_random
+            );
+        }
 
         // Report VRAM
         let vram_used = gpu_vram_mb().map(|(used, _)| used);
@@ -504,10 +786,16 @@ fn main() {
             use std::io::Write;
             let wall_clock = start_time.elapsed().as_secs_f32();
             let vs_random_str = vs_random.map_or(String::new(), |v| format!("{:.4}", v));
+            let vs_deep_light_str =
+                light_metrics.map_or(String::new(), |m| format!("{:.1}", m.vs_deep));
+            let vs_medium_light_str =
+                light_metrics.map_or(String::new(), |m| format!("{:.1}", m.vs_medium));
+            let vs_random_light_str =
+                light_metrics.map_or(String::new(), |m| format!("{:.1}", m.vs_random));
             let vram_str = vram_used.map_or(String::new(), |v| format!("{}", v));
             writeln!(
                 w,
-                "{},{:.2},{:.3},{:.3},{:.1},{:.4},{:.4},{},{}",
+                "{},{:.2},{:.3},{:.3},{:.1},{:.4},{:.4},{},{},{},{},{}",
                 iteration,
                 wall_clock,
                 selfplay_time.as_secs_f32(),
@@ -516,6 +804,9 @@ fn main() {
                 final_value_loss,
                 final_policy_loss,
                 vs_random_str,
+                vs_deep_light_str,
+                vs_medium_light_str,
+                vs_random_light_str,
                 vram_str
             )
             .unwrap();
