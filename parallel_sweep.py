@@ -801,6 +801,8 @@ Examples:
     param_group.add_argument('--lr-decay-gamma', help='Step LR decay gamma')
     param_group.add_argument('--lr-decay-step', help='Step LR decay step (iterations)')
     param_group.add_argument('--lr-min-ratio', help='Cosine LR min ratio (fraction of base LR)')
+    param_group.add_argument('--promote-on-vs-deep-improvement', action='store_true',
+                             help='Only promote the newly trained net when fixed-suite vs_Deep improves')
     param_group.add_argument('--value-weight', '-vw', help='Value loss weight')
     param_group.add_argument('--mcts', '-m', help='MCTS simulations per move')
     param_group.add_argument('--net-type', help='Network architecture: cnn, transformer')
@@ -838,6 +840,13 @@ Examples:
 
     # Generate experiments
     experiments = generate_experiments(sweep_config)
+    if args.promote_on_vs_deep_improvement:
+        for exp in experiments:
+            exp.args = f"{exp.args} --promote-on-vs-deep-improvement".strip()
+            if exp.name == "defaults":
+                exp.name = "defaults_promotevsdeep"
+            else:
+                exp.name = f"{exp.name}_promotevsdeep"
 
     print(f"Generated {len(experiments)} experiments from parameter combinations")
 
@@ -870,6 +879,10 @@ Examples:
         print(f"\nFixed parameter overrides:")
         for display_name, values in fixed:
             print(f"   {display_name}: {values[0]}")
+    if args.promote_on_vs_deep_improvement:
+        if not fixed:
+            print(f"\nFixed parameter overrides:")
+        print("   Promotion gate: enabled (require vs_Deep improvement)")
 
     if args.dry_run:
         print(f"\nWould run {len(experiments)} experiments:")

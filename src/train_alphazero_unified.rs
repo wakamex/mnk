@@ -482,6 +482,10 @@ struct Args {
     /// Fixed-suite deterministic random seed
     #[arg(long, default_value = "20260207")]
     fixed_suite_seed: u64,
+
+    /// Only promote the newly trained net for next-iteration self-play when fixed-suite vs_Deep improves
+    #[arg(long, default_value_t = false)]
+    promote_on_vs_deep_improvement: bool,
 }
 
 fn main() {
@@ -506,6 +510,13 @@ fn main() {
         "lr-min-ratio must be in [0, 1], got {}",
         args.lr_min_ratio
     );
+    if args.promote_on_vs_deep_improvement {
+        assert!(
+            args.fixed_suite_every == 1,
+            "--promote-on-vs-deep-improvement requires --fixed-suite-every 1 (got {})",
+            args.fixed_suite_every
+        );
+    }
     println!("Testing AlphaZero with Burn Framework");
     println!("=====================================");
 
@@ -546,28 +557,30 @@ fn main() {
     );
 
     let mut net = Network::<MyBackend>::new(net_type, &device, board_width);
+    let init_sgd_optimizer = || {
+        SgdConfig::new()
+            .with_momentum(Some(MomentumConfig {
+                momentum: 0.9,
+                dampening: 0.0,
+                nesterov: false,
+            }))
+            .with_weight_decay(Some(WeightDecayConfig::new(1e-4)))
+            .with_gradient_clipping(Some(GradientClippingConfig::Norm(1.0)))
+            .init()
+    };
+    let init_adamw_optimizer = || {
+        AdamWConfig::new()
+            .with_weight_decay(1e-4)
+            .with_grad_clipping(Some(GradientClippingConfig::Norm(1.0)))
+            .init()
+    };
     let mut sgd_optimizer = if matches!(args.optimizer, OptimizerChoice::Sgd) {
-        Some(
-            SgdConfig::new()
-                .with_momentum(Some(MomentumConfig {
-                    momentum: 0.9,
-                    dampening: 0.0,
-                    nesterov: false,
-                }))
-                .with_weight_decay(Some(WeightDecayConfig::new(1e-4)))
-                .with_gradient_clipping(Some(GradientClippingConfig::Norm(1.0)))
-                .init(),
-        )
+        Some(init_sgd_optimizer())
     } else {
         None
     };
     let mut adamw_optimizer = if matches!(args.optimizer, OptimizerChoice::Adamw) {
-        Some(
-            AdamWConfig::new()
-                .with_weight_decay(1e-4)
-                .with_grad_clipping(Some(GradientClippingConfig::Norm(1.0)))
-                .init(),
-        )
+        Some(init_adamw_optimizer())
     } else {
         None
     };
@@ -596,6 +609,10 @@ fn main() {
     if matches!(args.lr_schedule, LrScheduleChoice::Cosine) {
         println!("  LR cosine min ratio: {}", args.lr_min_ratio);
     }
+    println!(
+        "  Promotion gate (vs_Deep improvement only): {}",
+        args.promote_on_vs_deep_improvement
+    );
     println!("  Value weight: {}", args.value_weight);
     println!("  MCTS simulations: {}", args.mcts_simulations);
     println!("  CPUCT: {}", args.cpuct);
@@ -629,7 +646,7 @@ fn main() {
         use std::io::Write;
         writeln!(
             w,
-            "iteration,wall_clock_s,selfplay_s,training_s,games_per_sec,learning_rate,value_loss,policy_loss,fixed_suite_vs_deep,vram_used_mb"
+            "iteration,wall_clock_s,selfplay_s,training_s,games_per_sec,learning_rate,value_loss,policy_loss,fixed_suite_vs_deep,promoted,vram_used_mb"
         )
         .unwrap();
         w
@@ -637,11 +654,17 @@ fn main() {
 
     let replay_buffer_size = args.replay_buffer_size.max(1);
     let mut replay_buffer = ReplayBuffer::new(replay_buffer_size);
+    let mut best_promoted_vs_deep: Option<f32> = None;
 
     let start_time = std::time::Instant::now();
 
     for iteration in 1..=iterations {
         let iter_start = std::time::Instant::now();
+        let net_before_training = if args.promote_on_vs_deep_improvement {
+            Some(net.clone())
+        } else {
+            None
+        };
 
         // Generate training data through self-play with batch optimization
         let selfplay_start = std::time::Instant::now();
@@ -868,13 +891,60 @@ fn main() {
             <MyBackend as AutodiffBackend>::InnerBackend,
             _,
         >(&net_valid, &args, iteration);
-        if let Some(eval) = fixed_suite_eval {
+        let mut promoted = true;
+        if let Some(eval) = fixed_suite_eval.as_ref() {
             println!(
                 "  Fixed-suite: vs_Deep={:.1}% (Deep {:.2}s, Total {:.2}s)",
                 eval.score_percent(),
                 eval.timing.deep_s,
                 eval.timing.total_s
             );
+        }
+        if args.promote_on_vs_deep_improvement {
+            match fixed_suite_eval.as_ref() {
+                Some(eval) => {
+                    let current_vs_deep = eval.score_percent();
+                    let previous_best = best_promoted_vs_deep.unwrap_or(f32::NEG_INFINITY);
+                    if best_promoted_vs_deep
+                        .map(|best| current_vs_deep > best)
+                        .unwrap_or(true)
+                    {
+                        best_promoted_vs_deep = Some(current_vs_deep);
+                        println!(
+                            "  Promotion: accepted (vs_Deep improved to {:.1}%)",
+                            current_vs_deep
+                        );
+                    } else {
+                        promoted = false;
+                        net = net_before_training
+                            .expect("net snapshot must exist when promotion gating is enabled");
+                        if matches!(args.optimizer, OptimizerChoice::Sgd) {
+                            sgd_optimizer = Some(init_sgd_optimizer());
+                        }
+                        if matches!(args.optimizer, OptimizerChoice::Adamw) {
+                            adamw_optimizer = Some(init_adamw_optimizer());
+                        }
+                        println!(
+                            "  Promotion: rejected (vs_Deep {:.1}% <= best {:.1}%), keeping previous self-play net",
+                            current_vs_deep, previous_best
+                        );
+                    }
+                }
+                None => {
+                    promoted = false;
+                    net = net_before_training
+                        .expect("net snapshot must exist when promotion gating is enabled");
+                    if matches!(args.optimizer, OptimizerChoice::Sgd) {
+                        sgd_optimizer = Some(init_sgd_optimizer());
+                    }
+                    if matches!(args.optimizer, OptimizerChoice::Adamw) {
+                        adamw_optimizer = Some(init_adamw_optimizer());
+                    }
+                    println!(
+                        "  Promotion: rejected (vs_Deep unavailable), keeping previous self-play net"
+                    );
+                }
+            }
         }
 
         // Report VRAM
@@ -893,7 +963,7 @@ fn main() {
             let vram_str = vram_used.map_or(String::new(), |v| format!("{}", v));
             writeln!(
                 w,
-                "{},{:.2},{:.3},{:.3},{:.1},{:.6},{:.4},{:.4},{},{}",
+                "{},{:.2},{:.3},{:.3},{:.1},{:.6},{:.4},{:.4},{},{},{}",
                 iteration,
                 wall_clock,
                 selfplay_time.as_secs_f32(),
@@ -903,6 +973,7 @@ fn main() {
                 final_value_loss,
                 final_policy_loss,
                 fixed_suite_vs_deep,
+                if promoted { "1" } else { "0" },
                 vram_str
             )
             .unwrap();
