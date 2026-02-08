@@ -87,6 +87,7 @@ Results (mean `vs_Deep_Max` over 3 runs):
 - `gamma=0.75`: `47.33%` (min `45%`, max `49%`)
 
 Decision:
+- Set `--lr-schedule step` as the default schedule (best peaks and less late-run collapse).
 - Set `--lr-decay-gamma 0.65` as the default (when using `--lr-schedule step`).
 - Set `--lr-decay-step 25` as the default for `--lr-schedule step` (matches our best-performing schedule).
 

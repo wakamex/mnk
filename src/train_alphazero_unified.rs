@@ -396,7 +396,7 @@ struct Args {
     optimizer: OptimizerChoice,
 
     /// Learning-rate schedule over training iterations
-    #[arg(long, value_enum, default_value_t = LrScheduleChoice::Constant)]
+    #[arg(long, value_enum, default_value_t = LrScheduleChoice::Step)]
     lr_schedule: LrScheduleChoice,
 
     /// Step schedule decay factor (used when --lr-schedule step)
