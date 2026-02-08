@@ -655,6 +655,9 @@ fn main() {
     let replay_buffer_size = args.replay_buffer_size.max(1);
     let mut replay_buffer = ReplayBuffer::new(replay_buffer_size);
     let mut best_promoted_vs_deep: Option<f32> = None;
+    let mut best_vs_deep_score: Option<f32> = None;
+    let mut best_vs_deep_iteration: Option<usize> = None;
+    let mut best_vs_deep_net: Option<Network<MyBackend>> = None;
 
     let start_time = std::time::Instant::now();
 
@@ -891,6 +894,7 @@ fn main() {
             <MyBackend as AutodiffBackend>::InnerBackend,
             _,
         >(&net_valid, &args, iteration);
+        let current_vs_deep_score = fixed_suite_eval.as_ref().map(|eval| eval.score_percent());
         let mut promoted = true;
         if let Some(eval) = fixed_suite_eval.as_ref() {
             println!(
@@ -947,6 +951,22 @@ fn main() {
             }
         }
 
+        // Track the best-vs_Deep checkpoint for final export without affecting training flow.
+        if let Some(vs_deep_score) = current_vs_deep_score {
+            if best_vs_deep_score
+                .map(|best| vs_deep_score > best)
+                .unwrap_or(true)
+            {
+                best_vs_deep_score = Some(vs_deep_score);
+                best_vs_deep_iteration = Some(iteration);
+                best_vs_deep_net = Some(net.clone());
+                println!(
+                    "  Best checkpoint: iter {} (vs_Deep {:.1}%)",
+                    iteration, vs_deep_score
+                );
+            }
+        }
+
         // Report VRAM
         let vram_used = gpu_vram_mb().map(|(used, _)| used);
         if let Some(used) = vram_used {
@@ -983,6 +1003,20 @@ fn main() {
 
     let total_time = start_time.elapsed();
     println!("\nTraining completed in {:.2}s", total_time.as_secs_f32());
+
+    if let (Some(best_net), Some(best_iter), Some(best_score)) = (
+        best_vs_deep_net.take(),
+        best_vs_deep_iteration,
+        best_vs_deep_score,
+    ) {
+        println!(
+            "Selecting best checkpoint from iteration {} (vs_Deep {:.1}%) for final export",
+            best_iter, best_score
+        );
+        net = best_net;
+    } else {
+        println!("No fixed-suite vs_Deep checkpoint recorded; exporting latest net");
+    }
 
     // Test the trained model immediately with some positions
     println!("Testing trained model with sample positions...");

@@ -50,6 +50,24 @@ Decision:
 - No gain from cosine schedule in this sweep.
 - AdamW is clearly weaker than SGD under current setup.
 
+## LR drop @ iter 25 (100 iters) (2026-02-07)
+
+Goal: reduce late-run drift/collapse by lowering LR after the mid-run peak (~iter 25).
+
+Run:
+- `python parallel_sweep.py --iterations 100 --optimizer sgd --learning-rate 0.02 --lr-schedule step --lr-decay-step 25 --lr-decay-gamma 0.5,0.7,0.85 --sweep-name lr_drop_iter25`
+
+Important: as of 2026-02-07, sweeps are ranked by `vs_Deep_Max` (peak over iterations), not `vs_Deep` at the final iteration, since the trainer exports the best checkpoint by `vs_Deep`.
+
+3-run snapshot (max `vs_Deep` over 100 iters):
+- `gamma=0.5`: max `49-50%`
+- `gamma=0.7`: max `48-52%` (highest peaks, higher variance)
+- `gamma=0.85`: max `48-49%` (worst)
+
+Conclusion (tentative):
+- Step LR drop at iter 25 helps produce >50% peaks against Deep more often than constant LR.
+- Prefer `gamma=0.5` for stability or `gamma=0.7` when optimizing for peak strength.
+
 ## MCTS-only scaling sweep (2026-02-07)
 
 Run:

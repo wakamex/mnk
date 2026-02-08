@@ -43,7 +43,9 @@ class ExperimentResult:
     empty_board_value: float
     training_games_per_sec: float  # Training performance
     vs_random: str
-    vs_deep: str
+    vs_deep_final: str
+    vs_deep_max: str
+    vs_deep_max_iter: str
     vs_medium: str
     tournament_success: bool
     tournament_games_per_sec: float  # Tournament performance
@@ -166,7 +168,7 @@ class AlphaZeroSweep:
 
         return training_timeout, tournament_timeout
 
-    def run_training_only(self, config: ExperimentConfig) -> Tuple[bool, float, float, float, str, str, str]:
+    def run_training_only(self, config: ExperimentConfig) -> Tuple[bool, float, float, float, str, str, str, str, str]:
         """Run only the training phase of an experiment"""
         work_dir = self.results_dir / config.name
         work_dir.mkdir(exist_ok=True)
@@ -199,7 +201,9 @@ class AlphaZeroSweep:
 
                 # Read metrics from CSV log (more reliable than regex on stdout)
                 training_games_per_sec = 0.0
-                vs_deep = "N/A"
+                vs_deep_final = "N/A"
+                vs_deep_max = "N/A"
+                vs_deep_max_iter = "N/A"
                 if Path(csv_log).exists():
                     try:
                         log_df = pd.read_csv(csv_log)
@@ -208,7 +212,13 @@ class AlphaZeroSweep:
                             if 'fixed_suite_vs_deep' in log_df.columns:
                                 deep_series = pd.to_numeric(log_df['fixed_suite_vs_deep'], errors='coerce').dropna()
                                 if not deep_series.empty:
-                                    vs_deep = f"{deep_series.iloc[-1]:.1f}%"
+                                    vs_deep_final = f"{deep_series.iloc[-1]:.1f}%"
+                                    vs_deep_max = f"{deep_series.max():.1f}%"
+                                    try:
+                                        idx_max = int(deep_series.idxmax())
+                                        vs_deep_max_iter = str(int(log_df.loc[idx_max, 'iteration']))
+                                    except Exception:
+                                        vs_deep_max_iter = "?"
                     except Exception:
                         pass
 
@@ -218,18 +228,18 @@ class AlphaZeroSweep:
                     with open(work_dir / 'training.log', 'w') as f:
                         f.write(output)
 
-                    return True, training_time, empty_board_value, training_games_per_sec, vs_deep, "", unique_model
+                    return True, training_time, empty_board_value, training_games_per_sec, vs_deep_final, vs_deep_max, vs_deep_max_iter, "", unique_model
                 else:
                     with open(work_dir / 'training.log', 'w') as f:
                         f.write("STDOUT:\n" + result.stdout + "\n\nSTDERR:\n" + result.stderr)
-                    return False, training_time, 0.0, 0.0, "N/A", f"Training failed - no model produced. Check {work_dir}/training.log", ""
+                    return False, training_time, 0.0, 0.0, "N/A", "N/A", "N/A", f"Training failed - no model produced. Check {work_dir}/training.log", ""
             else:
                 with open(work_dir / 'training.log', 'w') as f:
                     f.write("STDOUT:\n" + result.stdout + "\n\nSTDERR:\n" + result.stderr)
-                return False, training_time, 0.0, 0.0, "N/A", f"Training failed with code {result.returncode}. Check {work_dir}/training.log", ""
+                return False, training_time, 0.0, 0.0, "N/A", "N/A", "N/A", f"Training failed with code {result.returncode}. Check {work_dir}/training.log", ""
 
         except Exception as e:
-            return False, 0.0, 0.0, 0.0, "N/A", str(e), ""
+            return False, 0.0, 0.0, 0.0, "N/A", "N/A", "N/A", str(e), ""
 
     def run_tournament_only(self, config: ExperimentConfig, model_file: str = "alphazero_model.bin") -> Tuple[bool, float, str, str, str]:
         """Run only the tournament phase of an experiment with isolated model file"""
@@ -390,7 +400,7 @@ class AlphaZeroSweep:
                 training_status = f"{r.training_time:.1f}s" if r.training_success else "❌"
                 tournament_status = "✅" if r.tournament_success else "❌"
                 vs_random = r.vs_random if r.tournament_success else "N/A"
-                vs_deep = r.vs_deep if r.tournament_success else "N/A"
+                vs_deep = r.vs_deep_max if r.tournament_success else "N/A"
                 vs_medium = r.vs_medium if r.tournament_success else "N/A"
             elif exp.name in running_training:
                 # Currently training
@@ -476,14 +486,14 @@ class AlphaZeroSweep:
                     del running_training[exp.name]
 
                 try:
-                    success, train_time, empty_value, training_games_per_sec, vs_deep, error, _ = future.result()
+                    success, train_time, empty_value, training_games_per_sec, vs_deep_final, vs_deep_max, vs_deep_max_iter, error, _ = future.result()
                     completed_training += 1
 
                     if success:
                         print(
                             f"  ✅ Training {completed_training}/{len(experiments)}: "
                             f"{exp.name} - {train_time:.1f}s, value={empty_value:.3f}, "
-                            f"vs_Deep={vs_deep}, {training_games_per_sec:.1f} games/sec"
+                            f"vs_Deep(final={vs_deep_final}, max={vs_deep_max}@{vs_deep_max_iter}), {training_games_per_sec:.1f} games/sec"
                         )
                     else:
                         print(f"  ❌ Training {completed_training}/{len(experiments)}: {exp.name} - {error}")
@@ -496,7 +506,9 @@ class AlphaZeroSweep:
                         empty_board_value=empty_value,
                         training_games_per_sec=training_games_per_sec,
                         vs_random="N/A",
-                        vs_deep=vs_deep if success else "N/A",
+                        vs_deep_final=vs_deep_final if success else "N/A",
+                        vs_deep_max=vs_deep_max if success else "N/A",
+                        vs_deep_max_iter=vs_deep_max_iter if success else "N/A",
                         vs_medium="N/A",
                         tournament_success=success,
                         tournament_games_per_sec=0.0,
@@ -518,7 +530,9 @@ class AlphaZeroSweep:
                         empty_board_value=0.0,
                         training_games_per_sec=0.0,
                         vs_random="N/A",
-                        vs_deep="N/A",
+                        vs_deep_final="N/A",
+                        vs_deep_max="N/A",
+                        vs_deep_max_iter="N/A",
                         vs_medium="N/A",
                         tournament_success=False,
                         tournament_games_per_sec=0.0,
@@ -538,7 +552,9 @@ class AlphaZeroSweep:
                 'Training_Time': f"{r.training_time:.1f}s",
                 'Empty_Board_Value': f"{r.empty_board_value:.3f}" if r.training_success else "N/A",
                 'vs_Random': r.vs_random,
-                'vs_Deep': r.vs_deep,
+                'vs_Deep': r.vs_deep_final,
+                'vs_Deep_Max': r.vs_deep_max,
+                'vs_Deep_Max_Iter': r.vs_deep_max_iter,
                 'vs_Medium': r.vs_medium,
                 'Status': 'SUCCESS' if r.training_success else 'FAILED',
                 'Total_Time': f"{r.total_time:.1f}s"
@@ -588,13 +604,16 @@ class AlphaZeroSweep:
 
             if not successful_experiments.empty:
                 successful_experiments = successful_experiments.copy()
-                successful_experiments['Deep_Score'] = successful_experiments['vs_Deep'].apply(extract_score)
-                successful_experiments['Total_Score'] = successful_experiments['Deep_Score']
+                successful_experiments['Deep_Final_Score'] = successful_experiments['vs_Deep'].apply(extract_score)
+                successful_experiments['Deep_Max_Score'] = successful_experiments['vs_Deep_Max'].apply(extract_score)
 
-                # Top 5 by in-training fixed-suite vs_Deep
-                top_performers = successful_experiments.nlargest(5, 'Total_Score')
+                # Top 5 by in-training peak fixed-suite vs_Deep; tie-break by final vs_Deep.
+                top_performers = successful_experiments.nlargest(5, ['Deep_Max_Score', 'Deep_Final_Score'])
                 for idx, row in top_performers.iterrows():
-                    print(f"   {row['Experiment']}: vs_Deep={row['vs_Deep']}")
+                    print(
+                        f"   {row['Experiment']}: "
+                        f"vs_Deep_max={row['vs_Deep_Max']}@{row.get('vs_Deep_Max_Iter', '?')} (final={row['vs_Deep']})"
+                    )
 
         # Display full results table
         print(f"\n📋 DETAILED RESULTS")
