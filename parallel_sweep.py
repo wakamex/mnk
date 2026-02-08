@@ -618,6 +618,11 @@ class SweepConfig:
 
     # Optimization parameters
     learning_rate: List[float] = None
+    optimizer: List[str] = None
+    lr_schedule: List[str] = None
+    lr_decay_gamma: List[float] = None
+    lr_decay_step: List[int] = None
+    lr_min_ratio: List[float] = None
     value_weight: List[float] = None
 
     # MCTS parameters
@@ -707,6 +712,11 @@ PARAM_TABLE = [
     ("epochs",          "epochs",        "--epochs",             "e",    "Epochs",              "int"),
     ("batch_size",      "batch_size",    "--batch-size",         "b",    "Batch size",          "int"),
     ("learning_rate",   "learning_rate", "--learning-rate",      "lr",   "Learning rate",       "float"),
+    ("optimizer",       "optimizer",     "--optimizer",          "opt",  "Optimizer",           "str"),
+    ("lr_schedule",     "lr_schedule",   "--lr-schedule",        "lrs",  "LR schedule",         "str"),
+    ("lr_decay_gamma",  "lr_decay_gamma","--lr-decay-gamma",     "lrg",  "LR decay gamma",      "float"),
+    ("lr_decay_step",   "lr_decay_step", "--lr-decay-step",      "lrsz", "LR decay step",       "int"),
+    ("lr_min_ratio",    "lr_min_ratio",  "--lr-min-ratio",       "lrmin","LR min ratio",        "float"),
     ("value_weight",    "value_weight",  "--value-weight",       "vw",   "Value weight",        "float"),
     ("mcts_simulations","mcts",          "--mcts-simulations",   "mcts", "MCTS simulations",    "int"),
     ("net_type",        "net_type",      "--net-type",           "net",  "Network type",        "str"),
@@ -737,7 +747,7 @@ def query_binary_defaults() -> Dict[str, str]:
         defaults = {}
         current_flag = None
         for line in result.stdout.splitlines():
-            flag_match = re.search(r'--([a-zA-Z0-9-]+)\b', line)
+            flag_match = re.match(r'^\s*(?:-[^,\s]+,\s*)?--([a-zA-Z0-9-]+)\b', line)
             if flag_match:
                 current_flag = flag_match.group(1)
 
@@ -758,6 +768,9 @@ def main():
 Examples:
   # Basic sweep with learning rate variations
   python parallel_sweep.py --learning-rate 0.001,0.01,0.1
+
+  # Optimizer + LR schedule comparison
+  python parallel_sweep.py --optimizer sgd,adamw --lr-schedule constant,cosine --learning-rate 0.01,0.02
 
   # Range-based parameter sweep
   python parallel_sweep.py --iterations 5:20:5 --games 5,10,15
@@ -783,6 +796,11 @@ Examples:
     param_group.add_argument('--epochs', '-e', help='Training epochs')
     param_group.add_argument('--batch-size', '-b', help='Batch size')
     param_group.add_argument('--learning-rate', '-lr', help='Learning rate')
+    param_group.add_argument('--optimizer', help='Optimizer: sgd, adamw')
+    param_group.add_argument('--lr-schedule', help='LR schedule: constant, step, cosine')
+    param_group.add_argument('--lr-decay-gamma', help='Step LR decay gamma')
+    param_group.add_argument('--lr-decay-step', help='Step LR decay step (iterations)')
+    param_group.add_argument('--lr-min-ratio', help='Cosine LR min ratio (fraction of base LR)')
     param_group.add_argument('--value-weight', '-vw', help='Value loss weight')
     param_group.add_argument('--mcts', '-m', help='MCTS simulations per move')
     param_group.add_argument('--net-type', help='Network architecture: cnn, transformer')

@@ -30,6 +30,25 @@ Critical finding:
 - `--temperature-cutoff-moves`: `1`
 - `--dirichlet-alpha`: `0.1`
 - `--cpuct`: `0.75`
+- `--optimizer`: `sgd`
+- `--lr-schedule`: `constant`
+
+## Optimizer + LR-schedule sweep (2026-02-07)
+
+Run:
+- `python parallel_sweep.py --optimizer sgd,adamw --lr-schedule constant,cosine --learning-rate 0.01,0.02 --sweep-name optimizer_lr_schedule_v1`
+
+Summary from `sweep_results/optimizer_lr_schedule_v1_20260207_184552.csv`:
+- `lr0.02_optsgd_lrsconstant`: `vs_Deep=43.0%` (best)
+- `lr0.02_optsgd_lrscosine`: `39.0%`
+- `lr0.01_optsgd_lrsconstant`: `38.0%`
+- `lr0.01_optsgd_lrscosine`: `33.0%`
+- AdamW variants: `21.0%` to `27.0%`
+
+Decision:
+- Keep `optimizer=sgd`, `lr_schedule=constant`, `learning_rate=0.02`.
+- No gain from cosine schedule in this sweep.
+- AdamW is clearly weaker than SGD under current setup.
 
 ## MCTS-only scaling sweep (2026-02-07)
 

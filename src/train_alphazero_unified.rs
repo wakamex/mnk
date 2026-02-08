@@ -3,11 +3,11 @@ use burn::grad_clipping::GradientClippingConfig;
 use burn::module::AutodiffModule;
 use burn::optim::decay::WeightDecayConfig;
 use burn::optim::momentum::MomentumConfig;
-use burn::optim::{GradientsParams, Optimizer, SgdConfig};
+use burn::optim::{AdamWConfig, GradientsParams, Optimizer, SgdConfig};
 use burn::prelude::*;
 use burn::tensor::activation;
 use burn::tensor::backend::AutodiffBackend;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use mnk::fixed_suite_eval::{
     evaluate_fixed_suite_vs_deep_inprocess, FixedSuiteConfig, FixedSuiteDeepEvaluation,
 };
@@ -332,6 +332,41 @@ where
     }
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum OptimizerChoice {
+    Sgd,
+    Adamw,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum LrScheduleChoice {
+    Constant,
+    Step,
+    Cosine,
+}
+
+fn learning_rate_for_iteration(args: &Args, iteration: usize) -> f64 {
+    match args.lr_schedule {
+        LrScheduleChoice::Constant => args.learning_rate,
+        LrScheduleChoice::Step => {
+            let step_size = args.lr_decay_step.max(1);
+            let exponent = ((iteration.saturating_sub(1)) / step_size) as i32;
+            args.learning_rate * args.lr_decay_gamma.powi(exponent)
+        }
+        LrScheduleChoice::Cosine => {
+            if args.iterations <= 1 {
+                return args.learning_rate;
+            }
+            let min_lr = args.learning_rate * args.lr_min_ratio;
+            let progress = (iteration.saturating_sub(1)) as f64 / (args.iterations - 1) as f64;
+            min_lr
+                + 0.5
+                    * (args.learning_rate - min_lr)
+                    * (1.0 + (std::f64::consts::PI * progress).cos())
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "train_alphazero")]
 #[command(about = "Train AlphaZero neural network with configurable hyperparameters")]
@@ -355,6 +390,26 @@ struct Args {
     /// Learning rate for optimizer (SGD default: 0.02)
     #[arg(long, default_value = "0.02")]
     learning_rate: f64,
+
+    /// Optimizer type
+    #[arg(long, value_enum, default_value_t = OptimizerChoice::Sgd)]
+    optimizer: OptimizerChoice,
+
+    /// Learning-rate schedule over training iterations
+    #[arg(long, value_enum, default_value_t = LrScheduleChoice::Constant)]
+    lr_schedule: LrScheduleChoice,
+
+    /// Step schedule decay factor (used when --lr-schedule step)
+    #[arg(long, default_value = "0.5")]
+    lr_decay_gamma: f64,
+
+    /// Step schedule interval in iterations (used when --lr-schedule step)
+    #[arg(long, default_value = "10")]
+    lr_decay_step: usize,
+
+    /// Cosine schedule min learning-rate ratio of base LR (used when --lr-schedule cosine)
+    #[arg(long, default_value = "0.1")]
+    lr_min_ratio: f64,
 
     /// Value loss weight (vs policy loss weight of 1.0)
     #[arg(long, default_value = "2.0")]
@@ -431,6 +486,26 @@ struct Args {
 
 fn main() {
     let args = Args::parse();
+    assert!(
+        args.learning_rate > 0.0,
+        "learning-rate must be > 0, got {}",
+        args.learning_rate
+    );
+    assert!(
+        args.lr_decay_gamma > 0.0,
+        "lr-decay-gamma must be > 0, got {}",
+        args.lr_decay_gamma
+    );
+    assert!(
+        args.lr_decay_step > 0,
+        "lr-decay-step must be > 0, got {}",
+        args.lr_decay_step
+    );
+    assert!(
+        (0.0..=1.0).contains(&args.lr_min_ratio),
+        "lr-min-ratio must be in [0, 1], got {}",
+        args.lr_min_ratio
+    );
     println!("Testing AlphaZero with Burn Framework");
     println!("=====================================");
 
@@ -471,17 +546,31 @@ fn main() {
     );
 
     let mut net = Network::<MyBackend>::new(net_type, &device, board_width);
-
-    // SGD with momentum (matches AlphaZero paper)
-    let mut optimizer = SgdConfig::new()
-        .with_momentum(Some(MomentumConfig {
-            momentum: 0.9,
-            dampening: 0.0,
-            nesterov: false,
-        }))
-        .with_weight_decay(Some(WeightDecayConfig::new(1e-4)))
-        .with_gradient_clipping(Some(GradientClippingConfig::Norm(1.0)))
-        .init();
+    let mut sgd_optimizer = if matches!(args.optimizer, OptimizerChoice::Sgd) {
+        Some(
+            SgdConfig::new()
+                .with_momentum(Some(MomentumConfig {
+                    momentum: 0.9,
+                    dampening: 0.0,
+                    nesterov: false,
+                }))
+                .with_weight_decay(Some(WeightDecayConfig::new(1e-4)))
+                .with_gradient_clipping(Some(GradientClippingConfig::Norm(1.0)))
+                .init(),
+        )
+    } else {
+        None
+    };
+    let mut adamw_optimizer = if matches!(args.optimizer, OptimizerChoice::Adamw) {
+        Some(
+            AdamWConfig::new()
+                .with_weight_decay(1e-4)
+                .with_grad_clipping(Some(GradientClippingConfig::Norm(1.0)))
+                .init(),
+        )
+    } else {
+        None
+    };
 
     // Training hyperparameters from CLI arguments
     let iterations = args.iterations;
@@ -496,6 +585,17 @@ fn main() {
     println!("  Epochs: {}", epochs);
     println!("  Batch size: {}", batch_size);
     println!("  Learning rate: {}", learning_rate);
+    println!("  Optimizer: {:?}", args.optimizer);
+    println!("  LR schedule: {:?}", args.lr_schedule);
+    if matches!(args.lr_schedule, LrScheduleChoice::Step) {
+        println!(
+            "  LR step decay: gamma={}, every {} iters",
+            args.lr_decay_gamma, args.lr_decay_step
+        );
+    }
+    if matches!(args.lr_schedule, LrScheduleChoice::Cosine) {
+        println!("  LR cosine min ratio: {}", args.lr_min_ratio);
+    }
     println!("  Value weight: {}", args.value_weight);
     println!("  MCTS simulations: {}", args.mcts_simulations);
     println!("  CPUCT: {}", args.cpuct);
@@ -529,7 +629,7 @@ fn main() {
         use std::io::Write;
         writeln!(
             w,
-            "iteration,wall_clock_s,selfplay_s,training_s,games_per_sec,value_loss,policy_loss,fixed_suite_vs_deep,vram_used_mb"
+            "iteration,wall_clock_s,selfplay_s,training_s,games_per_sec,learning_rate,value_loss,policy_loss,fixed_suite_vs_deep,vram_used_mb"
         )
         .unwrap();
         w
@@ -600,6 +700,8 @@ fn main() {
             );
             continue;
         }
+        let iter_learning_rate = learning_rate_for_iteration(&args, iteration);
+        println!("  Iteration LR: {:.6}", iter_learning_rate);
         let effective_batch_size = batch_size.min(replay_examples.len());
         if effective_batch_size < batch_size {
             println!(
@@ -721,7 +823,16 @@ fn main() {
                 // Backward pass and optimizer step
                 let gradients = total_batch_loss.backward();
                 let gradients = GradientsParams::from_grads(gradients, &net);
-                net = optimizer.step(learning_rate, net, gradients);
+                net = match args.optimizer {
+                    OptimizerChoice::Sgd => sgd_optimizer
+                        .as_mut()
+                        .expect("SGD optimizer must be initialized")
+                        .step(iter_learning_rate, net, gradients),
+                    OptimizerChoice::Adamw => adamw_optimizer
+                        .as_mut()
+                        .expect("AdamW optimizer must be initialized")
+                        .step(iter_learning_rate, net, gradients),
+                };
 
                 epoch_value_loss += vl;
                 epoch_policy_loss += pl;
@@ -782,12 +893,13 @@ fn main() {
             let vram_str = vram_used.map_or(String::new(), |v| format!("{}", v));
             writeln!(
                 w,
-                "{},{:.2},{:.3},{:.3},{:.1},{:.4},{:.4},{},{}",
+                "{},{:.2},{:.3},{:.3},{:.1},{:.6},{:.4},{:.4},{},{}",
                 iteration,
                 wall_clock,
                 selfplay_time.as_secs_f32(),
                 training_time.as_secs_f32(),
                 iter_games_per_sec,
+                iter_learning_rate,
                 final_value_loss,
                 final_policy_loss,
                 fixed_suite_vs_deep,
