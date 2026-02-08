@@ -237,6 +237,15 @@ The `vw=2.0, temp=1.0` result from the 4x4 grid (50%/50% vsD/vsM) did not reprod
 
 CNN weights are now transfer-compatible across board sizes, but self-play search still assumes 3x3 in `src/unified_mcts.rs` (fixed `9`-cell arrays/loops and 3x3 win detection). Next step is to parameterize MCTS with board width (and win condition) so we can actually train/evaluate transferred CNN checkpoints on 5x5+ boards.
 
+### MaxRL (not a priority for our current approach)
+
+Reference: https://zanette-labs.github.io/MaxRL/
+
+Rationale:
+- MaxRL targets sparse/binary “success” signals (pass/fail) and reframes RL as approximating maximum-likelihood on `p(success)` by sampling multiple rollouts per input.
+- Our current loop is AlphaZero-style policy iteration: we already train on strong supervised targets (MCTS visit distribution for policy + outcome/value for value). This is typically far more sample-efficient than pure policy-gradient from win/loss for games.
+- Implementing MaxRL here would mean adding a new on-policy trajectory-sampling trainer mode with success-only updates (and variance reduction/baselines), and it’s not obvious it would beat the existing MCTS-target training for MNK.
+
 ### Reproducibility check (priority)
 
 All sweep results are n=1 per config. The `vw=2.0, temp=1.0` non-reproduction shows this is a problem. Run the best config 5 times to get confidence intervals:
