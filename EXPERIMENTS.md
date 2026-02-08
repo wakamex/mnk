@@ -90,6 +90,17 @@ Decision:
 - Set `--lr-decay-gamma 0.65` as the default (when using `--lr-schedule step`).
 - Set `--lr-decay-step 25` as the default for `--lr-schedule step` (matches our best-performing schedule).
 
+### Correlated step-size check (2026-02-08)
+
+We tried smaller step sizes with correspondingly higher gammas (to keep total decay roughly comparable) and then ran 5 repeats for the most promising pair.
+
+Result:
+- `step=20, gamma=0.70` (n=5): mean `vs_Deep_Max=48.8%` (min `46%`, max `50%`)
+- `step=25, gamma=0.65` (n=3, from `lr_gamma_step25_v1..v3`): mean `vs_Deep_Max=50.3%` (min `49%`, max `52%`)
+
+Conclusion:
+- Do not switch to smaller steps; keep `--lr-decay-step 25` and `--lr-decay-gamma ~0.65` as the step-schedule default.
+
 ## MCTS-only scaling sweep (2026-02-07)
 
 Run:
