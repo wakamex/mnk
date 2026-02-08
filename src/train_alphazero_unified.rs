@@ -400,11 +400,11 @@ struct Args {
     lr_schedule: LrScheduleChoice,
 
     /// Step schedule decay factor (used when --lr-schedule step)
-    #[arg(long, default_value = "0.5")]
+    #[arg(long, default_value = "0.65")]
     lr_decay_gamma: f64,
 
     /// Step schedule interval in iterations (used when --lr-schedule step)
-    #[arg(long, default_value = "10")]
+    #[arg(long, default_value = "25")]
     lr_decay_step: usize,
 
     /// Cosine schedule min learning-rate ratio of base LR (used when --lr-schedule cosine)

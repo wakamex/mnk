@@ -68,6 +68,28 @@ Conclusion (tentative):
 - Step LR drop at iter 25 helps produce >50% peaks against Deep more often than constant LR.
 - Prefer `gamma=0.5` for stability or `gamma=0.7` when optimizing for peak strength.
 
+## Step LR gamma sweep (step=25) (2026-02-08)
+
+Goal: pick a default `--lr-decay-gamma` for `--lr-schedule step` (keeping `--lr-decay-step 25` fixed).
+
+Runs (3 repeats):
+- `python parallel_sweep.py --iterations 100 --optimizer sgd --learning-rate 0.02 --lr-schedule step --lr-decay-step 25 --lr-decay-gamma 0.45,0.5,0.55,0.6,0.65,0.7,0.75 --sweep-name lr_gamma_step25_v{1,2,3}`
+
+Aggregate metric: `vs_Deep_Max` (peak `vs_Deep` over iterations; trainer exports the best checkpoint by `vs_Deep`).
+
+Results (mean `vs_Deep_Max` over 3 runs):
+- `gamma=0.65`: `50.33%` (min `49%`, max `52%`)
+- `gamma=0.60`: `49.67%` (min `48%`, max `52%`)
+- `gamma=0.50`: `49.67%` (min `47%`, max `52%`)
+- `gamma=0.70`: `49.33%` (min `49%`, max `50%`, lowest variance)
+- `gamma=0.55`: `47.67%` (min `46%`, max `50%`)
+- `gamma=0.45`: `47.67%` (min `47%`, max `49%`)
+- `gamma=0.75`: `47.33%` (min `45%`, max `49%`)
+
+Decision:
+- Set `--lr-decay-gamma 0.65` as the default (when using `--lr-schedule step`).
+- Set `--lr-decay-step 25` as the default for `--lr-schedule step` (matches our best-performing schedule).
+
 ## MCTS-only scaling sweep (2026-02-07)
 
 Run:
