@@ -101,6 +101,22 @@ Result:
 Conclusion:
 - Do not switch to smaller steps; keep `--lr-decay-step 25` and `--lr-decay-gamma ~0.65` as the step-schedule default.
 
+### Base LR sweep (step=25, gamma=0.65) (2026-02-08)
+
+Run:
+- `python parallel_sweep.py --iterations 100 --optimizer sgd --lr-schedule step --lr-decay-step 25 --lr-decay-gamma 0.65 --learning-rate 0.01,0.015,0.02,0.025,0.03 --sweep-name lr_base_step25_g0.65_v1`
+
+Summary from `sweep_results/lr_base_step25_g0.65_v1_20260208_155001.csv` (ranked by `vs_Deep_Max`):
+- `lr=0.02`: `vs_Deep_max=50%` @iter 42 (final `36%`)
+- `lr=0.025`: `49%` @iter 29 (final `32%`)
+- `lr=0.01`: `48%` @iter 29 (final `43%` best final, but lower peak)
+- `lr=0.015`: `48%` @iter 49 (final `30%`)
+- `lr=0.03`: `43%` @iter 2 (final `27%`)
+
+Conclusion:
+- Keep `lr=0.02` as the base LR default (best peak in this run).
+- `lr=0.01` looks more stable (better final score), but did not beat the peak; consider repeating `lr=0.01` vs `lr=0.02` if we want a stability/throughput tradeoff.
+
 ## MCTS-only scaling sweep (2026-02-07)
 
 Run:
