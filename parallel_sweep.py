@@ -827,7 +827,7 @@ def _find_baseline_training_log(net_type: Optional[str]) -> Optional[Path]:
     return filtered[0]
 
 
-def estimate_sweep_wall_clock_s(
+def estimate_sweep_serial_equiv_s(
     experiments: List[ExperimentConfig],
     sweep_config: "SweepConfig",
     binary_defaults: Dict[str, str],
@@ -836,8 +836,8 @@ def estimate_sweep_wall_clock_s(
     """Estimate sweep wall-clock seconds.
 
     IMPORTANT: With a single GPU, 'parallel jobs' does not linearly reduce time;
-    it often increases due to contention. We therefore estimate using a
-    serial-equivalent model based on observed runtime from a baseline log.
+    it often increases due to contention. We therefore estimate a *serial-equivalent*
+    wall clock based on observed runtime from a baseline log.
     """
     net_type = _infer_effective_net_type(sweep_config, binary_defaults)
     baseline = _find_baseline_training_log(net_type)
@@ -874,7 +874,7 @@ def estimate_sweep_wall_clock_s(
 
     per_exp_s = avg_iter_s * target_iters
 
-    # Serial-equivalent estimate: don't claim parallel scaling on a single GPU.
+    # Serial-equivalent estimate: do not claim parallel scaling on a single GPU.
     return per_exp_s * len(experiments)
 
 
@@ -1024,19 +1024,23 @@ Examples:
     )
 
     # Estimate runtime (best-effort, based on prior observed logs).
-    total_estimated_time = estimate_sweep_wall_clock_s(
+    serial_equiv_s = estimate_sweep_serial_equiv_s(
         experiments=experiments,
         sweep_config=sweep_config,
         binary_defaults=binary_defaults,
         max_parallel_jobs=sweep.max_parallel_jobs,
     )
-    if total_estimated_time is None:
+    if serial_equiv_s is None:
         print("⏱️  Estimated total time: (unavailable; no baseline training_log.csv found)")
     else:
-        # This is intentionally "serial-equivalent" (see estimate_sweep_wall_clock_s docstring).
+        # Show a range: ideal perfect scaling (rare) vs no scaling (serial-equivalent).
+        ideal_s = serial_equiv_s / max(1, sweep.max_parallel_jobs)
+        low_min = ideal_s / 60.0
+        high_min = serial_equiv_s / 60.0
         print(
-            f"⏱️  Estimated total time: ~{total_estimated_time/60:.1f} minutes "
-            f"({total_estimated_time/3600:.1f} hours) (serial-equivalent; GPU contention can increase this)"
+            f"⏱️  Estimated total time: ~{low_min:.1f}–{high_min:.1f} minutes "
+            f"(ideal ÷jobs .. no-scaling serial-equivalent). "
+            f"On a single GPU, expect near the upper bound or worse due to contention."
         )
 
     # Run advanced sweep
