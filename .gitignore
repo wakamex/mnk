@@ -8,3 +8,4 @@ scripts/__pycache__/
 *.bin
 *.csv
 test_*.rs
+.sweep_eta_history.jsonl

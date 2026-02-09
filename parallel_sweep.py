@@ -21,6 +21,7 @@ import pandas as pd
 import itertools
 import argparse
 import fcntl
+import math
 
 
 @dataclass
@@ -878,6 +879,87 @@ def estimate_sweep_serial_equiv_s(
     return per_exp_s * len(experiments)
 
 
+ETA_HISTORY_PATH = Path(".sweep_eta_history.jsonl")
+
+
+def _load_eta_history() -> List[dict]:
+    if not ETA_HISTORY_PATH.exists():
+        return []
+    records: List[dict] = []
+    try:
+        for line in ETA_HISTORY_PATH.read_text().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except Exception:
+                continue
+    except Exception:
+        return []
+    return records
+
+
+def _append_eta_history(record: dict) -> None:
+    # Best-effort local logging; never fail the sweep if this breaks.
+    try:
+        with open(ETA_HISTORY_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, sort_keys=True) + "\n")
+    except Exception:
+        return
+
+
+def estimate_parallel_fraction_posterior(
+    history: List[dict],
+    net_type: Optional[str],
+    jobs: int,
+    iterations: Optional[int],
+) -> Tuple[float, int]:
+    """Return (f_hat, n_used) where f_hat approximates wall_clock / serial_equiv.
+
+    We update a log-normal mean with a simple pseudo-count prior (Bayesian-ish shrinkage).
+    """
+    # Prior: fairly conservative for single-GPU contention.
+    # Interpretable as "k pseudo-observations" at f0.
+    f0 = 0.60
+    k = 3
+    m0 = math.log(f0)
+
+    samples: List[float] = []
+    want_net = (net_type or "").strip().lower()
+    for r in history:
+        try:
+            f = float(r.get("fraction_of_serial"))
+        except Exception:
+            continue
+        if not (0.0 < f < 10.0):
+            continue
+        r_net = str(r.get("net_type", "")).strip().lower()
+        if want_net and r_net and want_net != r_net:
+            continue
+        try:
+            r_jobs = int(r.get("jobs", 0))
+        except Exception:
+            r_jobs = 0
+        if r_jobs != jobs:
+            continue
+        if iterations is not None:
+            try:
+                r_it = int(r.get("iterations", 0))
+            except Exception:
+                r_it = 0
+            if r_it and (r_it < iterations // 2 or r_it > iterations * 2):
+                continue
+        samples.append(math.log(f))
+
+    if not samples:
+        return f0, 0
+
+    m_obs = sum(samples) / len(samples)
+    m_post = (k * m0 + len(samples) * m_obs) / (k + len(samples))
+    return float(math.exp(m_post)), len(samples)
+
+
 def main():
     """Main entry point with advanced parameter specification and intelligent defaults"""
     parser = argparse.ArgumentParser(
@@ -1033,18 +1115,54 @@ Examples:
     if serial_equiv_s is None:
         print("⏱️  Estimated total time: (unavailable; no baseline training_log.csv found)")
     else:
-        # Show a range: ideal perfect scaling (rare) vs no scaling (serial-equivalent).
+        # Show a range: ideal perfect scaling (rare) vs no scaling (serial-equivalent),
+        # plus a data-driven point estimate from prior sweeps (local-only history).
         ideal_s = serial_equiv_s / max(1, sweep.max_parallel_jobs)
         low_min = ideal_s / 60.0
         high_min = serial_equiv_s / 60.0
+        effective_net_type = _infer_effective_net_type(sweep_config, binary_defaults)
+        try:
+            iters = int((sweep_config.iterations or [int(binary_defaults.get("iterations", "0"))])[0])
+        except Exception:
+            iters = None
+
+        history = _load_eta_history()
+        f_hat, n_used = estimate_parallel_fraction_posterior(
+            history=history,
+            net_type=effective_net_type,
+            jobs=sweep.max_parallel_jobs,
+            iterations=iters,
+        )
+        point_min = (f_hat * serial_equiv_s) / 60.0
         print(
             f"⏱️  Estimated total time: ~{low_min:.1f}–{high_min:.1f} minutes "
             f"(ideal ÷jobs .. no-scaling serial-equivalent). "
-            f"On a single GPU, expect near the upper bound or worse due to contention."
+            f"Bayes-ish point estimate: ~{point_min:.1f} minutes (n={n_used} matching prior runs)."
         )
 
     # Run advanced sweep
+    sweep_start = time.time()
     results_df = sweep.run_sweep(experiments, args.sweep_name)
+    sweep_wall_clock_s = time.time() - sweep_start
+
+    # Persist ETA observation for future sweeps (local-only).
+    if serial_equiv_s is not None and serial_equiv_s > 0:
+        effective_net_type = _infer_effective_net_type(sweep_config, binary_defaults)
+        try:
+            iters = int((sweep_config.iterations or [int(binary_defaults.get("iterations", "0"))])[0])
+        except Exception:
+            iters = None
+        _append_eta_history({
+            "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "sweep_name": args.sweep_name,
+            "net_type": effective_net_type,
+            "jobs": sweep.max_parallel_jobs,
+            "iterations": iters,
+            "n_experiments": len(experiments),
+            "serial_equiv_s": float(serial_equiv_s),
+            "wall_clock_s": float(sweep_wall_clock_s),
+            "fraction_of_serial": float(sweep_wall_clock_s / serial_equiv_s),
+        })
 
     print(f"\n🎯 Advanced sweep completed successfully!")
     print(f"   Results saved with timestamp")
