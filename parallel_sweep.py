@@ -824,7 +824,7 @@ Examples:
                              help='Only promote the newly trained net when fixed-suite vs_Deep improves')
     param_group.add_argument('--value-weight', '-vw', help='Value loss weight')
     param_group.add_argument('--mcts', '-m', help='MCTS simulations per move')
-    param_group.add_argument('--net-type', help='Network architecture: cnn, transformer')
+    param_group.add_argument('--net-type', help='Network architecture: cnn, minibt4/transformer')
     param_group.add_argument('--tournament-games', '-tg', help='Games per tournament matchup (default: 100)')
 
     # Advanced parameter group

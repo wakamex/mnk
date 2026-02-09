@@ -28,14 +28,11 @@ bash build.sh
 ## Training
 
 ```bash
-podman exec cuda-dev bash -c "cd /workspace/mnk && \
-  LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/lib64:/usr/local/nccl/lib:/usr/local/cuda-12/lib64:/usr/local/lib \
-  ./target/release/train_alphazero \
-    --iterations 20 --games-per-iter 500 --mcts-simulations 50"
+./target/release/train_alphazero
 ```
 
 Key flags:
-- `--iterations N` — self-play/train cycles (default: 30)
+- `--iterations N` — self-play/train cycles (default: 100)
 - `--games-per-iter N` — games per self-play phase (default: 1000)
 - `--mcts-simulations N` — MCTS sims per move (default: 50)
 - `--epochs N` — training epochs per iteration (default: 8)
@@ -49,7 +46,18 @@ Key flags:
 - `--temperature-cutoff-moves N` — opening moves with non-zero temperature (default: 1)
 - `--dirichlet-alpha F` — self-play root-noise alpha (default: 0.1)
 - `--cpuct F` — PUCT exploration constant (default: 0.75)
-- `--net-type cnn|transformer` — network architecture (default: cnn)
+- `--net-type cnn|minibt4|transformer` — network architecture (default: cnn)
+
+MiniBT4 baseline run (recommended starting point):
+
+```bash
+./target/release/train_alphazero \
+  --net-type minibt4 \
+  --optimizer adamw \
+  --learning-rate 0.001 \
+  --lr-schedule cosine \
+  --model-path minibt4_i100.bin
+```
 
 ## Sweep Status
 

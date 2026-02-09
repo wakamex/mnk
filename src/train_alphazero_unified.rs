@@ -372,7 +372,7 @@ fn learning_rate_for_iteration(args: &Args, iteration: usize) -> f64 {
 #[command(about = "Train AlphaZero neural network with configurable hyperparameters")]
 struct Args {
     /// Number of training iterations
-    #[arg(short, long, default_value = "30")]
+    #[arg(short, long, default_value = "100")]
     iterations: usize,
 
     /// Number of games per iteration
@@ -427,7 +427,7 @@ struct Args {
     #[arg(long, default_value = "alphazero_model.bin")]
     model_path: String,
 
-    /// Network architecture type: 'cnn' (AlphaZero-style) or 'transformer' (MiniBT4)
+    /// Network architecture type: 'cnn' (AlphaZero-style) or 'minibt4'/'transformer' (MiniBT4)
     #[arg(long, default_value = "cnn")]
     net_type: String,
 
@@ -547,7 +547,7 @@ fn main() {
     let net_type: NetworkType = args
         .net_type
         .parse()
-        .expect("Invalid network type. Use 'cnn' or 'transformer'");
+        .expect("Invalid network type. Use 'cnn' or 'minibt4'/'transformer'");
     let board_width = args.board_width;
     let board_size = board_width * board_width;
 

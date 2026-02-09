@@ -21,8 +21,9 @@ Key additions in code:
 Critical finding:
 - Many legacy checkpoints are not loadable with the current recorder path (`Utf8` record error). Earlier sweeps that allowed fallback-to-untrained were partly invalid for model ranking.
 
-## Current defaults (as of 2026-02-07)
+## Current defaults (as of 2026-02-08)
 
+- `--iterations`: `100`
 - `--learning-rate`: `0.02`
 - `--mcts-simulations`: `50`
 - `--value-weight`: `2.0`
@@ -31,7 +32,9 @@ Critical finding:
 - `--dirichlet-alpha`: `0.1`
 - `--cpuct`: `0.75`
 - `--optimizer`: `sgd`
-- `--lr-schedule`: `constant`
+- `--lr-schedule`: `step`
+- `--lr-decay-step`: `25`
+- `--lr-decay-gamma`: `0.65`
 
 ## Optimizer + LR-schedule sweep (2026-02-07)
 
@@ -45,10 +48,9 @@ Summary from `sweep_results/optimizer_lr_schedule_v1_20260207_184552.csv`:
 - `lr0.01_optsgd_lrscosine`: `33.0%`
 - AdamW variants: `21.0%` to `27.0%`
 
-Decision:
-- Keep `optimizer=sgd`, `lr_schedule=constant`, `learning_rate=0.02`.
-- No gain from cosine schedule in this sweep.
-- AdamW is clearly weaker than SGD under current setup.
+Decision (superseded by step-schedule sweeps below):
+- Under the 30-iteration regime, `optimizer=sgd`, `lr_schedule=constant`, `learning_rate=0.02` looked best.
+- Under the newer 100-iteration regime, step schedules dominate constant for peak `vs_Deep` and are now default.
 
 ## LR drop @ iter 25 (100 iters) (2026-02-07)
 
