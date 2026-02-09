@@ -53,9 +53,9 @@ MiniBT4 baseline run (recommended starting point):
 ```bash
 ./target/release/train_alphazero \
   --net-type minibt4 \
-  --optimizer adamw \
+  --optimizer sgd \
   --learning-rate 0.001 \
-  --lr-schedule cosine \
+  --lr-schedule step \
   --model-path minibt4_i100.bin
 ```
 

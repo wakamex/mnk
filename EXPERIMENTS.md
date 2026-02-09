@@ -120,6 +120,34 @@ Conclusion:
 - Keep `lr=0.02` as the base LR default (best peak in this run).
 - `lr=0.01` looks more stable (better final score), but did not beat the peak; consider repeating `lr=0.01` vs `lr=0.02` if we want a stability/throughput tradeoff.
 
+## MiniBT4 hyperparams (3x3) (2026-02-08)
+
+Goal: stabilize MiniBT4 training (avoid very-early peaks and late collapse) and find a good LR/optimizer/schedule combo under the same fixed-suite vs Deep metric (`vs_Deep_Max`).
+
+Wide sweep:
+- `python parallel_sweep.py --net-type minibt4 --optimizer sgd,adamw --learning-rate 0.0003,0.001,0.003 --lr-schedule cosine,step --sweep-name minibt4_opt_lr_sched_wide_v1`
+
+Summary from `sweep_results/minibt4_opt_lr_sched_wide_v1_20260208_205951.csv` (ranked by `vs_Deep_Max`):
+- Best: `optimizer=sgd`, `lr-schedule=step`, `lr=0.001` => `vs_Deep_max=48%` @iter 48 (final `41%`)
+- AdamW variants were generally worse; `lr=0.003` often peaked in the first few iterations then degraded.
+
+Follow-up LR local sweep (SGD + step):
+- `python parallel_sweep.py --net-type minibt4 --optimizer sgd --lr-schedule step --learning-rate 0.0006,0.0008,0.001,0.0012,0.0015 --sweep-name minibt4_lr_local_step_v1`
+
+Result: `lr=0.0008` and `lr=0.001` are the best region; higher LRs degrade more.
+
+Reproducibility check (`lr=0.0008` vs `lr=0.001`, 3 repeats):
+- `sweep_results/minibt4_lr_0p0008_vs_0p001_r1_20260208_224849.csv`
+- `sweep_results/minibt4_lr_0p0008_vs_0p001_r2_20260208_232239.csv`
+- `sweep_results/minibt4_lr_0p0008_vs_0p001_r3_20260208_235519.csv`
+
+Aggregate (metric `vs_Deep_Max`):
+- `lr=0.001`: mean `45.33%` (min `45%`, max `46%`)
+- `lr=0.0008`: mean `45.00%` (min `45%`, max `45%`)
+
+Decision (for now):
+- Default MiniBT4 recommendation: `--optimizer sgd --lr-schedule step --learning-rate 0.001`.
+
 ## MCTS-only scaling sweep (2026-02-07)
 
 Run:
