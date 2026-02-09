@@ -81,6 +81,11 @@ struct Args {
     #[arg(long, default_value_t = false)]
     eval_vs_random: bool,
 
+    /// Evaluate AlphaZero model vs "Shallow" minimax (depth=1) and exit.
+    /// Uses --board-width/--win-k and --az-sims/--az-cpuct.
+    #[arg(long, default_value_t = false)]
+    eval_vs_shallow: bool,
+
     /// Run deterministic fixed-opening evaluation suite and exit
     #[arg(long, default_value_t = false)]
     fixed_suite_eval: bool,
@@ -1644,18 +1649,20 @@ fn demo_head_to_head(
     Ok(())
 }
 
-fn eval_vs_deep(args: &Args) -> Result<(), String> {
+fn eval_vs_minimax(args: &Args, depth: usize, label: &str) -> Result<(), String> {
     let config = GameConfig::new(args.board_width, args.board_width, args.win_k);
 
-    println!("\n=== Eval: AlphaZero vs Deep Minimax ===");
+    println!("\n=== Eval: AlphaZero vs {} Minimax ===", label);
     println!(
-        "Board: {}x{} k={} | games={} | AZ sims={} cpuct={} | Deep depth=3",
+        "Board: {}x{} k={} | games={} | AZ sims={} cpuct={} | {} depth={}",
         args.board_width,
         args.board_width,
         args.win_k,
         args.tournament_games,
         args.az_sims,
-        args.az_cpuct
+        args.az_cpuct,
+        label,
+        depth
     );
     println!("{}", "-".repeat(60));
 
@@ -1666,10 +1673,10 @@ fn eval_vs_deep(args: &Args) -> Result<(), String> {
         args.board_width,
         args.cpu,
     )?;
-    let deep = MinimaxStrategy::new(3);
+    let opp = MinimaxStrategy::new(depth);
 
-    let result = play_tournament(&config, az, deep, args.tournament_games, false)?;
-    println!("{:8} vs {:8}: {}", "AZ", "Deep", result);
+    let result = play_tournament(&config, az, opp, args.tournament_games, false)?;
+    println!("{:8} vs {:8}: {}", "AZ", label, result);
     Ok(())
 }
 
@@ -1727,6 +1734,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if args.eval_vs_random {
             return Err("--eval-vs-deep cannot be used with --eval-vs-random".into());
         }
+        if args.eval_vs_shallow {
+            return Err("--eval-vs-deep cannot be used with --eval-vs-shallow".into());
+        }
         if args.board_width == 0 {
             return Err("board_width must be >= 1".into());
         }
@@ -1737,7 +1747,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .into());
         }
-        eval_vs_deep(&args).map_err(std::io::Error::other)?;
+        eval_vs_minimax(&args, 3, "Deep").map_err(std::io::Error::other)?;
+        print_gpu_memory("Tournament end");
+        println!("\nDone!");
+        return Ok(());
+    }
+
+    if args.eval_vs_shallow {
+        if args.model_path2.is_some() {
+            return Err("--eval-vs-shallow cannot be used with --model-path2".into());
+        }
+        if args.eval_vs_random {
+            return Err("--eval-vs-shallow cannot be used with --eval-vs-random".into());
+        }
+        if args.board_width == 0 {
+            return Err("board_width must be >= 1".into());
+        }
+        if args.win_k == 0 || args.win_k > args.board_width {
+            return Err(format!(
+                "win_k must be in [1, board_width], got win_k={} board_width={}",
+                args.win_k, args.board_width
+            )
+            .into());
+        }
+        eval_vs_minimax(&args, 1, "Shallow").map_err(std::io::Error::other)?;
         print_gpu_memory("Tournament end");
         println!("\nDone!");
         return Ok(());
