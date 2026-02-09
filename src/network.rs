@@ -16,7 +16,11 @@ pub trait PolicyValueNetwork<B: Backend<FloatElem = f32>>: Send + Sync {
     fn forward_inference(&self, board: &[Option<u8>], player: u8) -> (f32, Vec<f32>);
 
     /// Batched inference for MCTS - more efficient
-    fn forward_batch_inference(&self, boards: &[&[Option<u8>]], players: &[u8]) -> (Vec<f32>, Vec<Vec<f32>>);
+    fn forward_batch_inference(
+        &self,
+        boards: &[&[Option<u8>]],
+        players: &[u8],
+    ) -> (Vec<f32>, Vec<Vec<f32>>);
 
     /// Current board width (e.g., 3 for 3x3)
     fn board_width(&self) -> usize;
@@ -44,7 +48,10 @@ impl std::str::FromStr for NetworkType {
         match s.to_lowercase().as_str() {
             "cnn" | "alphazero" => Ok(NetworkType::Cnn),
             "transformer" | "bt4" | "minibt4" => Ok(NetworkType::Transformer),
-            _ => Err(format!("Unknown network type: {}. Use 'cnn' or 'transformer'", s)),
+            _ => Err(format!(
+                "Unknown network type: {}. Use 'cnn' or 'transformer'",
+                s
+            )),
         }
     }
 }
@@ -61,7 +68,9 @@ impl<B: Backend<FloatElem = f32>> Network<B> {
     pub fn new(net_type: NetworkType, device: &B::Device, board_width: usize) -> Self {
         match net_type {
             NetworkType::Cnn => Network::Cnn(AlphaZeroNet::new(device, board_width)),
-            NetworkType::Transformer => Network::Transformer(MiniBT4Net::new_for_board(device, board_width)),
+            NetworkType::Transformer => {
+                Network::Transformer(MiniBT4Net::new_for_board(device, board_width))
+            }
         }
     }
 
@@ -87,7 +96,11 @@ impl<B: Backend<FloatElem = f32>> Network<B> {
     }
 
     /// Batched inference
-    pub fn forward_batch_inference(&self, boards: &[&[Option<u8>]], players: &[u8]) -> (Vec<f32>, Vec<Vec<f32>>) {
+    pub fn forward_batch_inference(
+        &self,
+        boards: &[&[Option<u8>]],
+        players: &[u8],
+    ) -> (Vec<f32>, Vec<Vec<f32>>) {
         match self {
             Network::Cnn(net) => net.forward_batch_inference(boards, players),
             Network::Transformer(net) => net.forward_batch_inference(boards, players),
@@ -113,7 +126,11 @@ impl<B: Backend<FloatElem = f32>> Network<B> {
 
 // Implement NetworkInference trait for Network so it works with InterleavedGamesManager
 impl<B: Backend<FloatElem = f32>> NetworkInference<B> for Network<B> {
-    fn forward_batch_inference(&self, boards: &[&[Option<u8>]], players: &[u8]) -> (Vec<f32>, Vec<Vec<f32>>) {
+    fn forward_batch_inference(
+        &self,
+        boards: &[&[Option<u8>]],
+        players: &[u8],
+    ) -> (Vec<f32>, Vec<Vec<f32>>) {
         self.forward_batch_inference(boards, players)
     }
 

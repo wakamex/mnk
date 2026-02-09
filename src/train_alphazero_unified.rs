@@ -14,6 +14,7 @@ use mnk::fixed_suite_eval::{
 use mnk::network::{Network, NetworkType};
 use mnk::unified_mcts::{GameConfig as MctsGameConfig, NetworkInference, TrainingExample};
 use rand::Rng;
+use rand::SeedableRng;
 use std::collections::HashMap;
 
 /// Query GPU VRAM usage via nvidia-smi. Returns (used_mb, total_mb) or None.
@@ -85,7 +86,10 @@ fn random_transform<R: Rng + ?Sized>(rng: &mut R) -> Transform {
     ALL_TRANSFORMS[rng.gen_range(0..ALL_TRANSFORMS.len())]
 }
 
-fn apply_random_transform<R: Rng + ?Sized>(example: &TrainingExample, rng: &mut R) -> TrainingExample {
+fn apply_random_transform<R: Rng + ?Sized>(
+    example: &TrainingExample,
+    rng: &mut R,
+) -> TrainingExample {
     apply_transform(example, random_transform(rng))
 }
 
@@ -334,6 +338,11 @@ where
     }
 }
 
+fn derive_seed(base: u64, iteration: usize, tag: u64) -> u64 {
+    // Mix (base, iteration, tag) into a deterministic per-phase seed.
+    base ^ (iteration as u64).wrapping_mul(0x9E3779B97F4A7C15) ^ tag
+}
+
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum OptimizerChoice {
     Sgd,
@@ -456,6 +465,11 @@ struct Args {
     /// Dirichlet alpha for root-noise during self-play
     #[arg(long, default_value = "0.1")]
     dirichlet_alpha: f64,
+
+    /// Deterministic RNG seed (controls self-play noise + temperature sampling + training shuffle/augmentation).
+    /// Note: network weight initialization may still have nondeterminism depending on backend.
+    #[arg(long, default_value = "20260209")]
+    seed: u64,
 
     /// Path for CSV training log (iteration metrics with wall-clock time)
     #[arg(long)]
@@ -585,10 +599,9 @@ fn main() {
             init_path.as_str()
         };
         println!("Initializing weights from checkpoint: {}", init_path);
-        match recorder.load::<<Network<MyBackend> as Module<MyBackend>>::Record>(
-            model_name.into(),
-            &device,
-        ) {
+        match recorder
+            .load::<<Network<MyBackend> as Module<MyBackend>>::Record>(model_name.into(), &device)
+        {
             Ok(record) => {
                 use std::panic::{catch_unwind, AssertUnwindSafe};
                 match catch_unwind(AssertUnwindSafe(|| net.load_record(record))) {
@@ -679,6 +692,7 @@ fn main() {
         args.temperature_cutoff_moves
     );
     println!("  Dirichlet alpha: {}", args.dirichlet_alpha);
+    println!("  Seed: {}", args.seed);
     println!("  Replay buffer size: {}", args.replay_buffer_size);
     if args.fixed_suite_every > 0 && board_width == 3 && win_k == 3 {
         println!(
@@ -725,6 +739,10 @@ fn main() {
 
     for iteration in 1..=iterations {
         let iter_start = std::time::Instant::now();
+        let mut selfplay_rng =
+            rand::rngs::StdRng::seed_from_u64(derive_seed(args.seed, iteration, 0x53504C59)); // 'SPLY'
+        let mut train_rng =
+            rand::rngs::StdRng::seed_from_u64(derive_seed(args.seed, iteration, 0x54524149)); // 'TRAI'
         let net_before_training = if args.promote_on_vs_deep_improvement {
             Some(net.clone())
         } else {
@@ -750,6 +768,7 @@ fn main() {
             args.temperature_cutoff_moves,
             args.cpuct,
             args.dirichlet_alpha,
+            &mut selfplay_rng,
             64,
         );
         let selfplay_time = selfplay_start.elapsed();
@@ -784,9 +803,7 @@ fn main() {
 
         let mut replay_examples = replay_buffer.to_weighted_examples();
         if replay_examples.is_empty() {
-            println!(
-                "  Replay empty after ingest (skipping training this iter)"
-            );
+            println!("  Replay empty after ingest (skipping training this iter)");
             continue;
         }
         let iter_learning_rate = learning_rate_for_iteration(&args, iteration);
@@ -806,8 +823,7 @@ fn main() {
 
         for epoch in 0..epochs {
             use rand::seq::SliceRandom;
-            let mut rng = rand::thread_rng();
-            replay_examples.shuffle(&mut rng);
+            replay_examples.shuffle(&mut train_rng);
 
             let mut epoch_value_loss = 0.0f32;
             let mut epoch_policy_loss = 0.0f32;
@@ -827,7 +843,7 @@ fn main() {
                 let mut sample_weights: Vec<f32> = Vec::new();
 
                 for weighted in batch {
-                    let ex = apply_random_transform(&weighted.example, &mut rng);
+                    let ex = apply_random_transform(&weighted.example, &mut train_rng);
                     assert_eq!(
                         ex.board.len(),
                         board_size,

@@ -301,6 +301,23 @@ Status: unblocked.
 
 Note: the fixed-suite `vs_Deep` evaluation still targets `3x3 k=3` only, so larger-board runs should use `--fixed-suite-every 0` for now.
 
+### Transfer learning kickoff (next)
+
+Goal: verify the CNN can warm-start larger boards from a 3x3 checkpoint (board-agnostic heads).
+
+Approach:
+- Run scratch vs `--init-model-path` A/B for `5x5 k=3` (and later `7x7 k=4` once stable).
+- Since fixed-suite `vs_Deep` is 3x3-only, evaluate transfer runs via:
+  - early-iteration loss curves (`value_loss`, `policy_loss`)
+  - replay-buffer unique growth / saturation
+  - self-play throughput stability (games/sec)
+
+Helper script (writes artifacts under `research_runs/`, not committed):
+
+```bash
+SEED=20260209 BOARD=5 K=3 ./scripts/transfer_ab.sh
+```
+
 ### MaxRL (not a priority for our current approach)
 
 Reference: https://zanette-labs.github.io/MaxRL/

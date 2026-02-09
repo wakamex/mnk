@@ -1,9 +1,10 @@
+use burn::nn::transformer::{
+    TransformerEncoder, TransformerEncoderConfig, TransformerEncoderInput,
+};
+use burn::nn::{Embedding, EmbeddingConfig, Linear, LinearConfig};
 /// Mini-BT4: Transformer-based AlphaZero for variable board sizes
 /// Based on AI review recommendations for 15x15 Gomoku scaling
-
 use burn::prelude::*;
-use burn::nn::transformer::{TransformerEncoder, TransformerEncoderConfig, TransformerEncoderInput};
-use burn::nn::{Linear, LinearConfig, Embedding, EmbeddingConfig};
 use burn::tensor::activation;
 
 #[derive(Module, Debug)]
@@ -12,15 +13,15 @@ pub struct MiniBT4Net<B: Backend> {
     input_proj: Linear<B>,
 
     // 2. 2D Positional Encoding for spatial awareness
-    row_embedding: Embedding<B>,    // Row positions (0-14 for 15x15)
-    col_embedding: Embedding<B>,    // Column positions (0-14 for 15x15)
+    row_embedding: Embedding<B>, // Row positions (0-14 for 15x15)
+    col_embedding: Embedding<B>, // Column positions (0-14 for 15x15)
 
     // 3. Transformer Backbone: The core reasoning engine
     encoder: TransformerEncoder<B>,
 
     // 4. Dual Heads
-    value_head: Linear<B>,         // Global position evaluation
-    policy_head: Linear<B>,        // Per-square move probabilities
+    value_head: Linear<B>,  // Global position evaluation
+    policy_head: Linear<B>, // Per-square move probabilities
 
     // Configuration (not parameters, just config)
     d_model: usize,
@@ -36,13 +37,26 @@ impl<B: Backend> MiniBT4Net<B> {
     const DEFAULT_MAX_BOARD_SIZE: usize = 15;
 
     pub fn new(device: &B::Device, d_model: usize, n_layers: usize, max_board_size: usize) -> Self {
-        Self::new_with_board_width(device, d_model, n_layers, max_board_size, 3) // Default to 3x3
+        Self::new_with_board_width(device, d_model, n_layers, max_board_size, 3)
+        // Default to 3x3
     }
 
-    pub fn new_with_board_width(device: &B::Device, d_model: usize, n_layers: usize, max_board_size: usize, board_width: usize) -> Self {
-        assert!(d_model % 2 == 0, "d_model must be even for row/col positional split");
+    pub fn new_with_board_width(
+        device: &B::Device,
+        d_model: usize,
+        n_layers: usize,
+        max_board_size: usize,
+        board_width: usize,
+    ) -> Self {
+        assert!(
+            d_model % 2 == 0,
+            "d_model must be even for row/col positional split"
+        );
         let n_heads = Self::DEFAULT_N_HEADS;
-        assert!(d_model % n_heads == 0, "d_model must be divisible by n_heads");
+        assert!(
+            d_model % n_heads == 0,
+            "d_model must be divisible by n_heads"
+        );
 
         Self {
             // Project board state (empty/player0/player1) to d_model
@@ -53,7 +67,8 @@ impl<B: Backend> MiniBT4Net<B> {
             col_embedding: EmbeddingConfig::new(max_board_size, d_model / 2).init(device),
 
             // Transformer backbone
-            encoder: TransformerEncoderConfig::new(d_model, d_model * 4, n_heads, n_layers).init(device),
+            encoder: TransformerEncoderConfig::new(d_model, d_model * 4, n_heads, n_layers)
+                .init(device),
 
             // Output heads
             value_head: LinearConfig::new(d_model, 1).init(device),
@@ -80,7 +95,11 @@ impl<B: Backend> MiniBT4Net<B> {
     /// - FFN per layer: (d_model*d_ff + d_ff) + (d_ff*d_model + d_model), where d_ff = 4*d_model
     /// - LayerNorm per layer: 2 norms * (gamma+beta) = 4*d_model
     /// Plus: input projection, row/col embeddings, value head, policy head.
-    pub fn estimated_parameter_count(d_model: usize, n_layers: usize, max_board_size: usize) -> usize {
+    pub fn estimated_parameter_count(
+        d_model: usize,
+        n_layers: usize,
+        max_board_size: usize,
+    ) -> usize {
         let d_ff = d_model * 4;
 
         let input_proj = d_model + d_model; // Linear(1 -> d_model): weight + bias
@@ -123,8 +142,9 @@ impl<B: Backend> MiniBT4Net<B> {
         let x = self.encoder.forward(encoder_input);
 
         // 5. Value Head: Global Average Pooling across all squares
-        let value_features = x.clone().mean_dim(1);  // [batch, d_model]
-        let value = activation::tanh(self.value_head.forward(value_features)).reshape([batch_size, 1]);
+        let value_features = x.clone().mean_dim(1); // [batch, d_model]
+        let value =
+            activation::tanh(self.value_head.forward(value_features)).reshape([batch_size, 1]);
 
         // 6. Policy Head: Linear projection for each square
         // IMPORTANT: return raw logits for training parity with CNN. Softmax happens in inference/MCTS.
@@ -154,16 +174,20 @@ impl<B: Backend> MiniBT4Net<B> {
         // Convert to tensors
         // Create 2D tensors for embedding lookup [1, n_squares]
         let row_tensor = Tensor::<B, 2, burn::tensor::Int>::from_data(
-            burn::tensor::TensorData::new(row_indices, [1, n_squares]), &device);
+            burn::tensor::TensorData::new(row_indices, [1, n_squares]),
+            &device,
+        );
         let col_tensor = Tensor::<B, 2, burn::tensor::Int>::from_data(
-            burn::tensor::TensorData::new(col_indices, [1, n_squares]), &device);
+            burn::tensor::TensorData::new(col_indices, [1, n_squares]),
+            &device,
+        );
 
         // Get embeddings - output will be [1, n_squares, d_model/2]
-        let row_embeddings = self.row_embedding.forward(row_tensor).squeeze::<2>(0);  // [n_squares, d_model/2]
-        let col_embeddings = self.col_embedding.forward(col_tensor).squeeze::<2>(0);  // [n_squares, d_model/2]
+        let row_embeddings = self.row_embedding.forward(row_tensor).squeeze::<2>(0); // [n_squares, d_model/2]
+        let col_embeddings = self.col_embedding.forward(col_tensor).squeeze::<2>(0); // [n_squares, d_model/2]
 
         // Concatenate row and column embeddings
-        let pos_embeddings = Tensor::cat(vec![row_embeddings, col_embeddings], 1);  // [n_squares, d_model]
+        let pos_embeddings = Tensor::cat(vec![row_embeddings, col_embeddings], 1); // [n_squares, d_model]
 
         // Expand for batch dimension and add to input
         let pos_embeddings = pos_embeddings.unsqueeze::<3>().repeat(&[batch_size, 1, 1]);
@@ -175,7 +199,11 @@ impl<B: Backend> MiniBT4Net<B> {
 
 impl<B: Backend<FloatElem = f32>> MiniBT4Net<B> {
     /// Batch inference: single forward pass for multiple positions
-    pub fn forward_batch_inference(&self, boards: &[&[Option<u8>]], players: &[u8]) -> (Vec<f32>, Vec<Vec<f32>>) {
+    pub fn forward_batch_inference(
+        &self,
+        boards: &[&[Option<u8>]],
+        players: &[u8],
+    ) -> (Vec<f32>, Vec<Vec<f32>>) {
         assert_eq!(boards.len(), players.len());
 
         if boards.is_empty() {
@@ -202,11 +230,17 @@ impl<B: Backend<FloatElem = f32>> MiniBT4Net<B> {
             .reshape([batch_size, board_size]);
 
         // Single forward pass for entire batch
-        let (batch_values, batch_policy_logits) = self.forward(batch_input, self.current_board_width);
+        let (batch_values, batch_policy_logits) =
+            self.forward(batch_input, self.current_board_width);
 
         // Bulk GPU->CPU transfer
         let values_data = batch_values.to_data();
-        let values: Vec<f32> = values_data.as_slice::<f32>().unwrap().iter().copied().collect();
+        let values: Vec<f32> = values_data
+            .as_slice::<f32>()
+            .unwrap()
+            .iter()
+            .copied()
+            .collect();
 
         // Convert logits to probabilities for MCTS
         let batch_policies = activation::softmax(batch_policy_logits, 1);
@@ -239,15 +273,15 @@ pub fn evaluate_position<B: Backend<FloatElem = f32>>(
     for &pos in board {
         match pos {
             Some(p) if p == player => board_values.push(1.0),
-            Some(_) => board_values.push(-1.0),  // Opponent
-            None => board_values.push(0.0),      // Empty
+            Some(_) => board_values.push(-1.0), // Opponent
+            None => board_values.push(0.0),     // Empty
         }
     }
 
     // Create tensor [1, n_squares] - batch size 1
     let input_tensor = Tensor::<B, 2>::from_data(
         burn::tensor::TensorData::new(board_values, [1, board.len()]),
-        &device
+        &device,
     );
 
     // Forward pass
@@ -281,7 +315,10 @@ mod tests {
         let delta = alpha_zero_reference.abs_diff(minibt4_params);
 
         assert_eq!(minibt4_params, 101_186);
-        assert!(delta <= 3_000, "MiniBT4 params ({minibt4_params}) should stay close to CNN budget");
+        assert!(
+            delta <= 3_000,
+            "MiniBT4 params ({minibt4_params}) should stay close to CNN budget"
+        );
     }
 
     #[test]
@@ -321,7 +358,7 @@ mod tests {
     #[test]
     fn test_variable_board_sizes() {
         let device = Default::default();
-        let net = create_minibt4_net::<Backend>(&device, 15);  // Max size network
+        let net = create_minibt4_net::<Backend>(&device, 15); // Max size network
 
         // Test multiple board sizes with same network
         for &size in &[3, 5, 9, 15] {
@@ -329,11 +366,27 @@ mod tests {
             let board = vec![None; n_squares];
             let (value, policy) = evaluate_position(&net, &board, 0, size);
 
-            assert!(value >= -1.0 && value <= 1.0, "Value out of range for {}x{}", size, size);
-            assert_eq!(policy.len(), n_squares, "Wrong policy size for {}x{}", size, size);
+            assert!(
+                value >= -1.0 && value <= 1.0,
+                "Value out of range for {}x{}",
+                size,
+                size
+            );
+            assert_eq!(
+                policy.len(),
+                n_squares,
+                "Wrong policy size for {}x{}",
+                size,
+                size
+            );
 
             let policy_sum: f32 = policy.iter().sum();
-            assert!((policy_sum - 1.0).abs() < 0.01, "Policy doesn't sum to 1 for {}x{}", size, size);
+            assert!(
+                (policy_sum - 1.0).abs() < 0.01,
+                "Policy doesn't sum to 1 for {}x{}",
+                size,
+                size
+            );
         }
     }
 }

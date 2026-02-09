@@ -1,4 +1,5 @@
 use burn::prelude::Backend;
+use rand::Rng;
 
 // Training example for AlphaZero
 #[derive(Clone, Debug)]
@@ -11,7 +12,11 @@ pub struct TrainingExample {
 
 /// Trait for neural network inference to avoid circular dependencies
 pub trait NetworkInference<B: Backend<FloatElem = f32>> {
-    fn forward_batch_inference(&self, boards: &[&[Option<u8>]], players: &[u8]) -> (Vec<f32>, Vec<Vec<f32>>);
+    fn forward_batch_inference(
+        &self,
+        boards: &[&[Option<u8>]],
+        players: &[u8],
+    ) -> (Vec<f32>, Vec<Vec<f32>>);
     fn forward_inference(&self, board: &[Option<u8>], player: u8) -> (f32, Vec<f32>);
 }
 
@@ -177,12 +182,7 @@ fn expand_node<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
 }
 
 /// Expand a node using pre-computed policy priors and value (for batched inference).
-fn expand_node_with_policy(
-    node: &mut MctsNode,
-    board: &[Option<u8>],
-    policy: &[f32],
-    _value: f32,
-) {
+fn expand_node_with_policy(node: &mut MctsNode, board: &[Option<u8>], policy: &[f32], _value: f32) {
     // Mask illegal moves and renormalize
     let mut legal_sum = 0.0f32;
     let board_size = board.len();
@@ -216,9 +216,8 @@ fn expand_node_with_policy(
 }
 
 /// Add Dirichlet noise to root priors for exploration.
-fn add_dirichlet_noise(node: &mut MctsNode, dirichlet_alpha: f64) {
+fn add_dirichlet_noise(node: &mut MctsNode, dirichlet_alpha: f64, rng: &mut impl Rng) {
     // Sample Dirichlet noise using Gamma distribution
-    let mut rng = rand::thread_rng();
     let mut noise = Vec::new();
     let mut noise_sum = 0.0f64;
 
@@ -230,7 +229,7 @@ fn add_dirichlet_noise(node: &mut MctsNode, dirichlet_alpha: f64) {
     for child in &node.children {
         if child.is_some() {
             // Gamma(alpha, 1) samples — Dirichlet is normalized Gamma
-            let sample = gamma_sample(&mut rng, dirichlet_alpha);
+            let sample = gamma_sample(rng, dirichlet_alpha);
             noise.push(sample);
             noise_sum += sample;
         } else {
@@ -249,8 +248,8 @@ fn add_dirichlet_noise(node: &mut MctsNode, dirichlet_alpha: f64) {
     for (i, child) in node.children.iter_mut().enumerate() {
         if let Some(ref mut c) = child {
             let original_prior = c.prior;
-            c.prior = (1.0 - DIRICHLET_EPSILON) * original_prior
-                + DIRICHLET_EPSILON * noise[i] as f32;
+            c.prior =
+                (1.0 - DIRICHLET_EPSILON) * original_prior + DIRICHLET_EPSILON * noise[i] as f32;
         }
     }
 }
@@ -293,7 +292,7 @@ fn gamma_sample(rng: &mut impl rand::Rng, alpha: f64) -> f64 {
 /// Backpropagate a value up the path of nodes.
 /// `path` contains (node pointer as *mut, action taken) pairs.
 /// Value alternates sign at each level because players alternate.
-fn backpropagate(path: &[(* mut MctsNode, usize)], leaf_value: f32) {
+fn backpropagate(path: &[(*mut MctsNode, usize)], leaf_value: f32) {
     let mut value = leaf_value;
     for &(node_ptr, action) in path.iter().rev() {
         unsafe {
@@ -311,12 +310,11 @@ fn backpropagate(path: &[(* mut MctsNode, usize)], leaf_value: f32) {
 /// Sample an action from visit counts using temperature.
 /// pi_i = N_i^(1/tau) / sum(N_j^(1/tau))
 /// tau → 0: argmax, tau = 1: proportional to visit counts, tau > 1: more uniform.
-fn sample_with_temperature(visit_counts: &[f32], temperature: f32) -> usize {
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
-
+fn sample_with_temperature(visit_counts: &[f32], temperature: f32, rng: &mut impl Rng) -> usize {
     // Find legal moves (non-zero visit counts)
-    let nonzero: Vec<usize> = visit_counts.iter().enumerate()
+    let nonzero: Vec<usize> = visit_counts
+        .iter()
+        .enumerate()
         .filter(|(_, &v)| v > 0.0)
         .map(|(i, _)| i)
         .collect();
@@ -330,14 +328,16 @@ fn sample_with_temperature(visit_counts: &[f32], temperature: f32) -> usize {
 
     // tau very small → argmax
     if temperature < 1e-4 {
-        return *nonzero.iter()
+        return *nonzero
+            .iter()
             .max_by(|&&a, &&b| visit_counts[a].partial_cmp(&visit_counts[b]).unwrap())
             .unwrap();
     }
 
     // Apply temperature: pi_i = N_i^(1/tau)
     let inv_tau = 1.0 / temperature;
-    let weights: Vec<f32> = nonzero.iter()
+    let weights: Vec<f32> = nonzero
+        .iter()
         .map(|&i| visit_counts[i].powf(inv_tau))
         .collect();
 
@@ -360,7 +360,11 @@ fn sample_with_temperature(visit_counts: &[f32], temperature: f32) -> usize {
 
 /// AlphaZero-style temperature schedule:
 /// use high temperature for opening moves, then switch to deterministic play.
-fn scheduled_temperature(base_temperature: f32, move_number: usize, temperature_cutoff_moves: usize) -> f32 {
+fn scheduled_temperature(
+    base_temperature: f32,
+    move_number: usize,
+    temperature_cutoff_moves: usize,
+) -> f32 {
     if move_number < temperature_cutoff_moves {
         base_temperature
     } else {
@@ -385,9 +389,11 @@ fn mcts_search_configured<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
     c_puct: f32,
     dirichlet_alpha: f64,
 ) -> Vec<f32> {
+    let mut rng = rand::thread_rng();
     assert_square_board(board, cfg);
     let board_size = cfg.board_size();
-    let legal_moves: Vec<usize> = board.iter()
+    let legal_moves: Vec<usize> = board
+        .iter()
         .enumerate()
         .filter_map(|(i, &c)| if c.is_none() { Some(i) } else { None })
         .collect();
@@ -410,7 +416,7 @@ fn mcts_search_configured<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
 
     // Add Dirichlet noise to root for exploration during self-play.
     if root_noise {
-        add_dirichlet_noise(&mut root, dirichlet_alpha);
+        add_dirichlet_noise(&mut root, dirichlet_alpha, &mut rng);
     }
 
     // Run simulations
@@ -441,12 +447,17 @@ fn mcts_search_configured<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
                 if !has_children {
                     node.is_terminal = true;
                     // Determine terminal value
-                    node.terminal_value = if let Some(winner) = check_winner_square_k(&current_board, cfg) {
-                        // Winner exists — value from current player's perspective
-                        if winner == current_player { 1.0 } else { -1.0 }
-                    } else {
-                        0.0 // Draw (board full)
-                    };
+                    node.terminal_value =
+                        if let Some(winner) = check_winner_square_k(&current_board, cfg) {
+                            // Winner exists — value from current player's perspective
+                            if winner == current_player {
+                                1.0
+                            } else {
+                                -1.0
+                            }
+                        } else {
+                            0.0 // Draw (board full)
+                        };
                     backpropagate(&path, node.terminal_value);
                 } else {
                     // Backpropagate the NN value (negated because it's from the
@@ -482,7 +493,7 @@ fn mcts_search_configured<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
                 // Backpropagate the rest of the path (excluding the last step we just handled)
                 let leaf_val = -child.terminal_value; // flip for parent's perspective
                 if path.len() > 1 {
-                    backpropagate(&path[..path.len()-1], leaf_val);
+                    backpropagate(&path[..path.len() - 1], leaf_val);
                 }
                 break;
             }
@@ -499,7 +510,7 @@ fn mcts_search_configured<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
                 node.visit_count += 1;
 
                 if path.len() > 1 {
-                    backpropagate(&path[..path.len()-1], 0.0);
+                    backpropagate(&path[..path.len() - 1], 0.0);
                 }
                 break;
             }
@@ -591,13 +602,15 @@ pub fn self_play_game_mcts<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
     c_puct: f32,
     dirichlet_alpha: f64,
 ) -> Vec<TrainingExample> {
+    let mut rng = rand::thread_rng();
     let mut board = vec![None; cfg.board_size()];
     let mut player = 0u8;
     let mut examples: Vec<TrainingExample> = Vec::new();
     let mut move_number = 0;
 
     loop {
-        let legal_moves: Vec<usize> = board.iter()
+        let legal_moves: Vec<usize> = board
+            .iter()
             .enumerate()
             .filter_map(|(i, &c)| if c.is_none() { Some(i) } else { None })
             .collect();
@@ -634,6 +647,7 @@ pub fn self_play_game_mcts<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
         let selected = sample_with_temperature(
             &policy,
             scheduled_temperature(temperature, move_number, temperature_cutoff_moves),
+            &mut rng,
         );
 
         board[selected] = Some(player);
@@ -764,6 +778,7 @@ pub fn generate_training_data_batched<B: Backend<FloatElem = f32>, N: NetworkInf
     temperature_cutoff_moves: usize,
     c_puct: f32,
     dirichlet_alpha: f64,
+    rng: &mut impl Rng,
     batch_size: usize,
 ) -> Vec<Vec<TrainingExample>> {
     let mut games: Vec<GameInProgress> = (0..num_games)
@@ -793,7 +808,7 @@ pub fn generate_training_data_batched<B: Backend<FloatElem = f32>, N: NetworkInf
             // If this game has completed all simulations for the current position,
             // extract policy, make a move, and prepare next position
             if game.sim_count >= simulations && !game.root_needs_expansion {
-                handle_move_selection(game, temperature, temperature_cutoff_moves);
+                handle_move_selection(game, temperature, temperature_cutoff_moves, rng);
                 if game.completed {
                     continue;
                 }
@@ -802,7 +817,9 @@ pub fn generate_training_data_batched<B: Backend<FloatElem = f32>, N: NetworkInf
             }
 
             // Check if the game is in a terminal state (no legal moves or winner exists)
-            let legal_moves: Vec<usize> = game.board.iter()
+            let legal_moves: Vec<usize> = game
+                .board
+                .iter()
                 .enumerate()
                 .filter_map(|(i, &c)| if c.is_none() { Some(i) } else { None })
                 .collect();
@@ -844,13 +861,13 @@ pub fn generate_training_data_batched<B: Backend<FloatElem = f32>, N: NetworkInf
 
             // Flush batch if full
             if pending.len() >= batch_size {
-                flush_pending_batch(net, &mut games, &mut pending, dirichlet_alpha);
+                flush_pending_batch(net, &mut games, &mut pending, dirichlet_alpha, rng);
             }
         }
 
         // Flush any remaining pending leaves
         if !pending.is_empty() {
-            flush_pending_batch(net, &mut games, &mut pending, dirichlet_alpha);
+            flush_pending_batch(net, &mut games, &mut pending, dirichlet_alpha, rng);
         }
     }
 
@@ -948,6 +965,7 @@ fn flush_pending_batch<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
     games: &mut [GameInProgress],
     pending: &mut Vec<PendingLeaf>,
     dirichlet_alpha: f64,
+    rng: &mut impl Rng,
 ) {
     if pending.is_empty() {
         return;
@@ -974,8 +992,13 @@ fn flush_pending_batch<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
         if !has_children {
             leaf_node.is_terminal = true;
             let cfg = games[leaf.game_idx].cfg;
-            leaf_node.terminal_value = if let Some(winner) = check_winner_square_k(&leaf.board, cfg) {
-                if winner == leaf.player { 1.0 } else { -1.0 }
+            leaf_node.terminal_value = if let Some(winner) = check_winner_square_k(&leaf.board, cfg)
+            {
+                if winner == leaf.player {
+                    1.0
+                } else {
+                    -1.0
+                }
             } else {
                 0.0 // Draw
             };
@@ -988,7 +1011,7 @@ fn flush_pending_batch<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
         if leaf.is_root_expansion {
             // Root was just expanded — add Dirichlet noise and set virtual visit
             leaf_node.visit_count = 1;
-            add_dirichlet_noise(leaf_node, dirichlet_alpha);
+            add_dirichlet_noise(leaf_node, dirichlet_alpha, rng);
             games[leaf.game_idx].root_needs_expansion = false;
         } else {
             // Normal simulation completed
@@ -999,7 +1022,12 @@ fn flush_pending_batch<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
 
 /// After all simulations for a position are done, extract policy, select move,
 /// store training example, and advance the game.
-fn handle_move_selection(game: &mut GameInProgress, temperature: f32, temperature_cutoff_moves: usize) {
+fn handle_move_selection(
+    game: &mut GameInProgress,
+    temperature: f32,
+    temperature_cutoff_moves: usize,
+    rng: &mut impl Rng,
+) {
     let root = game.root.as_ref().unwrap();
 
     // Extract visit counts from root children
@@ -1031,6 +1059,7 @@ fn handle_move_selection(game: &mut GameInProgress, temperature: f32, temperatur
     let selected = sample_with_temperature(
         &visit_counts,
         scheduled_temperature(temperature, game.move_number, temperature_cutoff_moves),
+        rng,
     );
 
     // Make the move

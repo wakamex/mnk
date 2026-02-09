@@ -1,8 +1,8 @@
 // Inference-specific backend configuration for AlphaZero
 // This file provides a clean separation between training and inference
 
-use burn::prelude::*;
 use crate::alphazero::AlphaZeroNet;
+use burn::prelude::*;
 use burn::record::{BinFileRecorder, FullPrecisionSettings, Recorder};
 
 // GPU backends (native burn-cuda via CubeCL)
@@ -32,12 +32,9 @@ pub fn load_model_for_inference(
 
     match recorder.load(model_path.into(), device) {
         Ok(record) => {
-            let model = AlphaZeroNet::<InferenceBackend>::new(device, 3)
-                .load_record(record);
+            let model = AlphaZeroNet::<InferenceBackend>::new(device, 3).load_record(record);
             Ok(model)
         }
-        Err(e) => {
-            Err(format!("Failed to load model: {:?}", e).into())
-        }
+        Err(e) => Err(format!("Failed to load model: {:?}", e).into()),
     }
 }

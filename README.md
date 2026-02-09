@@ -59,6 +59,9 @@ MiniBT4 baseline run (recommended starting point):
   --optimizer sgd \
   --learning-rate 0.001 \
   --lr-schedule step \
+  --lr-decay-step 25 \
+  --lr-decay-gamma 0.65 \
+  --iterations 100 \
   --model-path minibt4_i100.bin
 ```
 
@@ -86,6 +89,12 @@ Scratch vs transfer example (5x5, still k=3 to keep the win condition comparable
   --fixed-suite-every 0 \
   --init-model-path cnn_3x3_best.bin \
   --model-path cnn_5x5k3_from3x3.bin
+```
+
+Reproducible scratch vs transfer (writes artifacts under `research_runs/`, not committed):
+
+```bash
+SEED=20260209 BOARD=5 K=3 ./scripts/transfer_ab.sh
 ```
 
 ## Sweep Status
