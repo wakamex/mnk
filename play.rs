@@ -63,6 +63,11 @@ struct Args {
     #[arg(long, default_value_t = 3)]
     win_k: usize,
 
+    /// Restrict legal moves to be within this Manhattan distance of an existing stone.
+    /// 0 means "no restriction" (true MNK rules). Non-zero can speed up minimax/MCTS but changes the game.
+    #[arg(long, default_value_t = 0)]
+    move_restriction_radius: usize,
+
     /// AlphaZero MCTS simulations per move (used in head-to-head)
     #[arg(long, default_value_t = 25)]
     az_sims: usize,
@@ -1597,15 +1602,23 @@ fn demo_head_to_head(
     model2: &str,
     board_width: usize,
     win_k: usize,
+    move_restriction_radius: usize,
     sims: usize,
     cpuct: f32,
     tournament_games: usize,
     force_cpu: bool,
 ) -> Result<(), String> {
-    let config = GameConfig::new(board_width, board_width, win_k);
+    let config = GameConfig::new(board_width, board_width, win_k)
+        .with_move_restriction(move_restriction_radius);
 
     println!("\n=== Head-to-Head Tournament ===");
     println!("{} vs {}", model1, model2);
+    if move_restriction_radius != 0 {
+        println!(
+            "Move restriction: radius={} (NOTE: changes rules vs true MNK)",
+            move_restriction_radius
+        );
+    }
     println!("{}", "-".repeat(50));
 
     use std::io::Write;
@@ -1650,11 +1663,12 @@ fn demo_head_to_head(
 }
 
 fn eval_vs_minimax(args: &Args, depth: usize, label: &str) -> Result<(), String> {
-    let config = GameConfig::new(args.board_width, args.board_width, args.win_k);
+    let config = GameConfig::new(args.board_width, args.board_width, args.win_k)
+        .with_move_restriction(args.move_restriction_radius);
 
     println!("\n=== Eval: AlphaZero vs {} Minimax ===", label);
     println!(
-        "Board: {}x{} k={} | games={} | AZ sims={} cpuct={} | {} depth={}",
+        "Board: {}x{} k={} | games={} | AZ sims={} cpuct={} | {} depth={} | move_restriction_radius={}",
         args.board_width,
         args.board_width,
         args.win_k,
@@ -1662,7 +1676,8 @@ fn eval_vs_minimax(args: &Args, depth: usize, label: &str) -> Result<(), String>
         args.az_sims,
         args.az_cpuct,
         label,
-        depth
+        depth,
+        args.move_restriction_radius
     );
     println!("{}", "-".repeat(60));
 
@@ -1681,17 +1696,19 @@ fn eval_vs_minimax(args: &Args, depth: usize, label: &str) -> Result<(), String>
 }
 
 fn eval_vs_random(args: &Args) -> Result<(), String> {
-    let config = GameConfig::new(args.board_width, args.board_width, args.win_k);
+    let config = GameConfig::new(args.board_width, args.board_width, args.win_k)
+        .with_move_restriction(args.move_restriction_radius);
 
     println!("\n=== Eval: AlphaZero vs Random ===");
     println!(
-        "Board: {}x{} k={} | games={} | AZ sims={} cpuct={}",
+        "Board: {}x{} k={} | games={} | AZ sims={} cpuct={} | move_restriction_radius={}",
         args.board_width,
         args.board_width,
         args.win_k,
         args.tournament_games,
         args.az_sims,
-        args.az_cpuct
+        args.az_cpuct,
+        args.move_restriction_radius
     );
     println!("{}", "-".repeat(60));
 
@@ -1813,6 +1830,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             model2,
             args.board_width,
             args.win_k,
+            args.move_restriction_radius,
             args.az_sims,
             args.az_cpuct,
             args.tournament_games,
