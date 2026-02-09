@@ -778,6 +778,106 @@ def query_binary_defaults() -> Dict[str, str]:
         return {}
 
 
+def _infer_effective_net_type(sweep_config: "SweepConfig", binary_defaults: Dict[str, str]) -> Optional[str]:
+    """Infer the effective net-type for this sweep (single value only).
+
+    Returns lowercase net type string, or None if unknown / multiple values are swept.
+    """
+    if sweep_config.net_type is not None:
+        if len(sweep_config.net_type) == 1:
+            return str(sweep_config.net_type[0]).strip().lower()
+        return None
+    return str(binary_defaults.get("net-type", "")).strip().lower() or None
+
+
+def _find_baseline_training_log(net_type: Optional[str]) -> Optional[Path]:
+    """Pick a recent training_log.csv to baseline runtime estimates.
+
+    This is intentionally heuristic: if we don't have a baseline, we should not
+    print misleading time estimates.
+    """
+    candidates: List[Path] = []
+
+    sweep_root = Path("sweep_results")
+    if sweep_root.exists():
+        candidates.extend(sweep_root.glob("**/training_log.csv"))
+
+    # Also consider local one-off logs (untracked) like minibt4_i100.csv.
+    candidates.extend(Path(".").glob("*_i*.csv"))
+    candidates.extend(Path(".").glob("training_log*.csv"))
+
+    if not candidates:
+        return None
+
+    def matches_net(p: Path) -> bool:
+        if not net_type:
+            return True
+        s = str(p).lower()
+        if net_type in ("minibt4", "bt4", "transformer"):
+            return ("minibt4" in s) or ("transformer" in s)
+        if net_type in ("cnn", "alphazero"):
+            return ("netcnn" in s) or ("cnn" in s)
+        return net_type in s
+
+    filtered = [p for p in candidates if matches_net(p)]
+    if not filtered:
+        return None
+
+    filtered.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return filtered[0]
+
+
+def estimate_sweep_wall_clock_s(
+    experiments: List[ExperimentConfig],
+    sweep_config: "SweepConfig",
+    binary_defaults: Dict[str, str],
+    max_parallel_jobs: int,
+) -> Optional[float]:
+    """Estimate sweep wall-clock seconds.
+
+    IMPORTANT: With a single GPU, 'parallel jobs' does not linearly reduce time;
+    it often increases due to contention. We therefore estimate using a
+    serial-equivalent model based on observed runtime from a baseline log.
+    """
+    net_type = _infer_effective_net_type(sweep_config, binary_defaults)
+    baseline = _find_baseline_training_log(net_type)
+    if baseline is None:
+        return None
+
+    try:
+        df = pd.read_csv(baseline)
+        if df.empty:
+            return None
+        if "iteration" not in df.columns or "wall_clock_s" not in df.columns:
+            return None
+        last = df.iloc[-1]
+        baseline_iters = float(last["iteration"])
+        baseline_wall = float(last["wall_clock_s"])
+        if baseline_iters <= 0 or baseline_wall <= 0:
+            return None
+        avg_iter_s = baseline_wall / baseline_iters
+    except Exception:
+        return None
+
+    # Infer the target iteration count (single value or binary default).
+    target_iters: Optional[int] = None
+    if sweep_config.iterations is not None:
+        if len(sweep_config.iterations) == 1:
+            target_iters = int(sweep_config.iterations[0])
+    if target_iters is None:
+        try:
+            target_iters = int(binary_defaults.get("iterations", "0"))
+        except ValueError:
+            target_iters = None
+    if not target_iters or target_iters <= 0:
+        return None
+
+    per_exp_s = avg_iter_s * target_iters
+
+    # Serial-equivalent estimate: don't claim parallel scaling on a single GPU.
+    return per_exp_s * len(experiments)
+
+
 def main():
     """Main entry point with advanced parameter specification and intelligent defaults"""
     parser = argparse.ArgumentParser(
@@ -923,15 +1023,21 @@ Examples:
         tournament_jobs=args.tournament_jobs
     )
 
-    # Estimate runtime
-    estimated_time_per_exp = 8 * 60  # 8 minutes per experiment (training + tournament)
-    if sweep.gpu_memory >= 20000:
-        estimated_time_per_exp = 5 * 60  # 5 minutes on high-end GPU
-    elif sweep.gpu_memory >= 10000:
-        estimated_time_per_exp = 6 * 60  # 6 minutes on mid-range GPU
-
-    total_estimated_time = (len(experiments) * estimated_time_per_exp) / sweep.max_parallel_jobs
-    print(f"⏱️  Estimated total time: {total_estimated_time/60:.1f} minutes ({total_estimated_time/3600:.1f} hours)")
+    # Estimate runtime (best-effort, based on prior observed logs).
+    total_estimated_time = estimate_sweep_wall_clock_s(
+        experiments=experiments,
+        sweep_config=sweep_config,
+        binary_defaults=binary_defaults,
+        max_parallel_jobs=sweep.max_parallel_jobs,
+    )
+    if total_estimated_time is None:
+        print("⏱️  Estimated total time: (unavailable; no baseline training_log.csv found)")
+    else:
+        # This is intentionally "serial-equivalent" (see estimate_sweep_wall_clock_s docstring).
+        print(
+            f"⏱️  Estimated total time: ~{total_estimated_time/60:.1f} minutes "
+            f"({total_estimated_time/3600:.1f} hours) (serial-equivalent; GPU contention can increase this)"
+        )
 
     # Run advanced sweep
     results_df = sweep.run_sweep(experiments, args.sweep_name)
