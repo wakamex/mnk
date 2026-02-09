@@ -76,6 +76,11 @@ struct Args {
     #[arg(long, default_value_t = false)]
     eval_vs_deep: bool,
 
+    /// Evaluate AlphaZero model vs Random move selection and exit.
+    /// Uses --board-width/--win-k and --az-sims/--az-cpuct.
+    #[arg(long, default_value_t = false)]
+    eval_vs_random: bool,
+
     /// Run deterministic fixed-opening evaluation suite and exit
     #[arg(long, default_value_t = false)]
     fixed_suite_eval: bool,
@@ -1655,6 +1660,35 @@ fn eval_vs_deep(args: &Args) -> Result<(), String> {
     Ok(())
 }
 
+fn eval_vs_random(args: &Args) -> Result<(), String> {
+    let config = GameConfig::new(args.board_width, args.board_width, args.win_k);
+
+    println!("\n=== Eval: AlphaZero vs Random ===");
+    println!(
+        "Board: {}x{} k={} | games={} | AZ sims={} cpuct={}",
+        args.board_width,
+        args.board_width,
+        args.win_k,
+        args.tournament_games,
+        args.az_sims,
+        args.az_cpuct
+    );
+    println!("{}", "-".repeat(60));
+
+    let az = AlphaZeroStrategy::new_with_model_path_and_cpuct_runtime_on_board(
+        args.az_sims,
+        &args.model_path,
+        args.az_cpuct,
+        args.board_width,
+        args.cpu,
+    )?;
+    let random = RandomStrategy::new();
+
+    let result = play_tournament(&config, az, random, args.tournament_games, false)?;
+    println!("{:8} vs {:8}: {}", "AZ", "Random", result);
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let inference_mode = select_inference_mode(args.cpu);
@@ -1677,6 +1711,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if args.model_path2.is_some() {
             return Err("--eval-vs-deep cannot be used with --model-path2".into());
         }
+        if args.eval_vs_random {
+            return Err("--eval-vs-deep cannot be used with --eval-vs-random".into());
+        }
         if args.board_width == 0 {
             return Err("board_width must be >= 1".into());
         }
@@ -1688,6 +1725,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .into());
         }
         eval_vs_deep(&args).map_err(std::io::Error::other)?;
+        print_gpu_memory("Tournament end");
+        println!("\nDone!");
+        return Ok(());
+    }
+
+    if args.eval_vs_random {
+        if args.model_path2.is_some() {
+            return Err("--eval-vs-random cannot be used with --model-path2".into());
+        }
+        if args.board_width == 0 {
+            return Err("board_width must be >= 1".into());
+        }
+        if args.win_k == 0 || args.win_k > args.board_width {
+            return Err(format!(
+                "win_k must be in [1, board_width], got win_k={} board_width={}",
+                args.win_k, args.board_width
+            )
+            .into());
+        }
+        eval_vs_random(&args).map_err(std::io::Error::other)?;
         print_gpu_memory("Tournament end");
         println!("\nDone!");
         return Ok(());
