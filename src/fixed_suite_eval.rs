@@ -6,7 +6,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use crate::unified_mcts::{mcts_search_with_hyperparams, NetworkInference};
+use crate::unified_mcts::{mcts_search_with_hyperparams, GameConfig, NetworkInference};
 
 const BOARD_LEN: usize = 9;
 const WIN_LINES: [[usize; 3]; 8] = [
@@ -374,9 +374,14 @@ fn az_move<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
     sims: usize,
     cpuct: f32,
 ) -> usize {
+    let cfg_game = GameConfig {
+        board_width: 3,
+        win_k: 3,
+    };
     let board_vec = state.board.to_vec();
     let policy = mcts_search_with_hyperparams(
         net,
+        cfg_game,
         &board_vec,
         state.current_player,
         sims,

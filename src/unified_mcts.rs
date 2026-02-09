@@ -15,21 +15,76 @@ pub trait NetworkInference<B: Backend<FloatElem = f32>> {
     fn forward_inference(&self, board: &[Option<u8>], player: u8) -> (f32, Vec<f32>);
 }
 
-/// Check for winner in tic-tac-toe game - copied here to avoid circular dependencies
-fn check_winner_internal(board: &[Option<u8>]) -> Option<u8> {
-    let lines = [
-        [0, 1, 2], [3, 4, 5], [6, 7, 8], // rows
-        [0, 3, 6], [1, 4, 7], [2, 5, 8], // columns
-        [0, 4, 8], [2, 4, 6]             // diagonals
-    ];
+#[derive(Clone, Copy, Debug)]
+pub struct GameConfig {
+    pub board_width: usize,
+    pub win_k: usize,
+}
 
-    for line in lines.iter() {
-        if let (Some(a), Some(b), Some(c)) = (board[line[0]], board[line[1]], board[line[2]]) {
-            if a == b && b == c {
-                return Some(a);
+impl GameConfig {
+    pub fn board_size(&self) -> usize {
+        self.board_width * self.board_width
+    }
+}
+
+fn assert_square_board(board: &[Option<u8>], cfg: GameConfig) {
+    assert!(cfg.board_width > 0, "board_width must be > 0");
+    assert!(cfg.win_k > 0, "win_k must be > 0");
+    assert!(
+        cfg.win_k <= cfg.board_width,
+        "win_k {} must be <= board_width {}",
+        cfg.win_k,
+        cfg.board_width
+    );
+    assert_eq!(
+        board.len(),
+        cfg.board_size(),
+        "board length {} does not match cfg {}x{} (size {})",
+        board.len(),
+        cfg.board_width,
+        cfg.board_width,
+        cfg.board_size()
+    );
+}
+
+/// Check for a winner on a square board with a K-in-a-row win condition.
+fn check_winner_square_k(board: &[Option<u8>], cfg: GameConfig) -> Option<u8> {
+    assert_square_board(board, cfg);
+    let w = cfg.board_width as isize;
+    let k = cfg.win_k as isize;
+
+    // Directions: right, down, down-right, down-left.
+    let dirs: [(isize, isize); 4] = [(1, 0), (0, 1), (1, 1), (-1, 1)];
+
+    for y in 0..w {
+        for x in 0..w {
+            let idx = (y * w + x) as usize;
+            let Some(p) = board[idx] else { continue };
+
+            for (dx, dy) in dirs {
+                let end_x = x + (k - 1) * dx;
+                let end_y = y + (k - 1) * dy;
+                if end_x < 0 || end_x >= w || end_y < 0 || end_y >= w {
+                    continue;
+                }
+
+                let mut ok = true;
+                for step in 1..k {
+                    let nx = x + step * dx;
+                    let ny = y + step * dy;
+                    let nidx = (ny * w + nx) as usize;
+                    if board[nidx] != Some(p) {
+                        ok = false;
+                        break;
+                    }
+                }
+                if ok {
+                    return Some(p);
+                }
             }
         }
     }
+
     None
 }
 
@@ -46,19 +101,19 @@ struct MctsNode {
     visit_count: u32,
     total_value: f32,
     prior: f32,
-    children: Vec<Option<Box<MctsNode>>>, // size 9 for tic-tac-toe
+    children: Vec<Option<Box<MctsNode>>>, // one per board action
     is_terminal: bool,
     terminal_value: f32,
     is_expanded: bool,
 }
 
 impl MctsNode {
-    fn new(prior: f32) -> Self {
+    fn new(prior: f32, board_size: usize) -> Self {
         Self {
             visit_count: 0,
             total_value: 0.0,
             prior,
-            children: (0..9).map(|_| None).collect(),
+            children: (0..board_size).map(|_| None).collect(),
             is_terminal: false,
             terminal_value: 0.0,
             is_expanded: false,
@@ -82,7 +137,8 @@ fn select_action_puct(node: &MctsNode, board: &[Option<u8>], c_puct: f32) -> usi
     let mut best_action = 0;
     let mut best_score = f32::NEG_INFINITY;
 
-    for action in 0..9 {
+    let board_size = board.len();
+    for action in 0..board_size {
         if board[action].is_some() {
             continue; // illegal move
         }
@@ -129,13 +185,21 @@ fn expand_node_with_policy(
 ) {
     // Mask illegal moves and renormalize
     let mut legal_sum = 0.0f32;
-    for i in 0..9 {
+    let board_size = board.len();
+    assert_eq!(
+        policy.len(),
+        board_size,
+        "policy length {} must equal board size {}",
+        policy.len(),
+        board_size
+    );
+    for i in 0..board_size {
         if board[i].is_none() {
             legal_sum += policy[i];
         }
     }
 
-    for i in 0..9 {
+    for i in 0..board_size {
         if board[i].is_none() {
             let prior = if legal_sum > 0.0 {
                 policy[i] / legal_sum
@@ -143,7 +207,7 @@ fn expand_node_with_policy(
                 // Uniform over legal moves if NN gives all zeros
                 1.0 / board.iter().filter(|c| c.is_none()).count() as f32
             };
-            node.children[i] = Some(Box::new(MctsNode::new(prior)));
+            node.children[i] = Some(Box::new(MctsNode::new(prior, board_size)));
         }
         // Illegal moves remain None
     }
@@ -313,6 +377,7 @@ fn scheduled_temperature(base_temperature: f32, move_number: usize, temperature_
 /// - Value backpropagation through the tree
 fn mcts_search_configured<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
     net: &N,
+    cfg: GameConfig,
     board: &[Option<u8>],
     player: u8,
     simulations: usize,
@@ -320,24 +385,26 @@ fn mcts_search_configured<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
     c_puct: f32,
     dirichlet_alpha: f64,
 ) -> Vec<f32> {
+    assert_square_board(board, cfg);
+    let board_size = cfg.board_size();
     let legal_moves: Vec<usize> = board.iter()
         .enumerate()
         .filter_map(|(i, &c)| if c.is_none() { Some(i) } else { None })
         .collect();
 
     if legal_moves.is_empty() {
-        return vec![0.0; 9];
+        return vec![0.0; board_size];
     }
 
     // If only one legal move, return it immediately
     if legal_moves.len() == 1 {
-        let mut policy = vec![0.0; 9];
+        let mut policy = vec![0.0; board_size];
         policy[legal_moves[0]] = 1.0;
         return policy;
     }
 
     // Create root node and expand it
-    let mut root = MctsNode::new(0.0);
+    let mut root = MctsNode::new(0.0, board_size);
     let _root_value = expand_node(&mut root, net, board, player);
     root.visit_count = 1; // Virtual visit for root
 
@@ -374,7 +441,7 @@ fn mcts_search_configured<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
                 if !has_children {
                     node.is_terminal = true;
                     // Determine terminal value
-                    node.terminal_value = if let Some(winner) = check_winner_internal(&current_board) {
+                    node.terminal_value = if let Some(winner) = check_winner_square_k(&current_board, cfg) {
                         // Winner exists — value from current player's perspective
                         if winner == current_player { 1.0 } else { -1.0 }
                     } else {
@@ -398,7 +465,7 @@ fn mcts_search_configured<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
             current_player = 1 - current_player;
 
             // Check for terminal state after the move
-            if let Some(winner) = check_winner_internal(&current_board) {
+            if let Some(winner) = check_winner_square_k(&current_board, cfg) {
                 // The move resulted in a win for the player who just moved
                 let child = node.children[action].as_mut().unwrap();
                 child.is_terminal = true;
@@ -443,8 +510,8 @@ fn mcts_search_configured<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
     }
 
     // Extract visit counts from root children
-    let mut visit_counts = vec![0.0f32; 9];
-    for i in 0..9 {
+    let mut visit_counts = vec![0.0f32; board_size];
+    for i in 0..board_size {
         if let Some(ref child) = root.children[i] {
             visit_counts[i] = child.visit_count as f32;
         }
@@ -463,6 +530,7 @@ fn mcts_search_configured<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
 
 pub fn mcts_search_with_options<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
     net: &N,
+    cfg: GameConfig,
     board: &[Option<u8>],
     player: u8,
     simulations: usize,
@@ -470,6 +538,7 @@ pub fn mcts_search_with_options<B: Backend<FloatElem = f32>, N: NetworkInference
 ) -> Vec<f32> {
     mcts_search_with_hyperparams(
         net,
+        cfg,
         board,
         player,
         simulations,
@@ -481,6 +550,7 @@ pub fn mcts_search_with_options<B: Backend<FloatElem = f32>, N: NetworkInference
 
 pub fn mcts_search_with_hyperparams<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
     net: &N,
+    cfg: GameConfig,
     board: &[Option<u8>],
     player: u8,
     simulations: usize,
@@ -490,6 +560,7 @@ pub fn mcts_search_with_hyperparams<B: Backend<FloatElem = f32>, N: NetworkInfer
 ) -> Vec<f32> {
     mcts_search_configured(
         net,
+        cfg,
         board,
         player,
         simulations,
@@ -502,23 +573,25 @@ pub fn mcts_search_with_hyperparams<B: Backend<FloatElem = f32>, N: NetworkInfer
 /// Default AlphaZero search behavior used in self-play: root noise enabled.
 pub fn mcts_search<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
     net: &N,
+    cfg: GameConfig,
     board: &[Option<u8>],
     player: u8,
     simulations: usize,
 ) -> Vec<f32> {
-    mcts_search_with_options(net, board, player, simulations, true)
+    mcts_search_with_options(net, cfg, board, player, simulations, true)
 }
 
 /// Play a complete self-play game using proper MCTS and return training examples.
 pub fn self_play_game_mcts<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
     net: &N,
+    cfg: GameConfig,
     simulations: usize,
     temperature: f32,
     temperature_cutoff_moves: usize,
     c_puct: f32,
     dirichlet_alpha: f64,
 ) -> Vec<TrainingExample> {
-    let mut board = vec![None; 9];
+    let mut board = vec![None; cfg.board_size()];
     let mut player = 0u8;
     let mut examples: Vec<TrainingExample> = Vec::new();
     let mut move_number = 0;
@@ -533,13 +606,14 @@ pub fn self_play_game_mcts<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
             break;
         }
 
-        if check_winner_internal(&board).is_some() {
+        if check_winner_square_k(&board, cfg).is_some() {
             break;
         }
 
         // Run MCTS to get policy
         let policy = mcts_search_configured(
             net,
+            cfg,
             &board,
             player,
             simulations,
@@ -568,7 +642,7 @@ pub fn self_play_game_mcts<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
     }
 
     // Fill in values from game outcome
-    let winner = check_winner_internal(&board);
+    let winner = check_winner_square_k(&board, cfg);
     for example in &mut examples {
         example.value = match winner {
             Some(w) if w == example.player => 1.0,
@@ -583,6 +657,7 @@ pub fn self_play_game_mcts<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
 /// Generate training data from multiple self-play games.
 pub fn generate_training_data<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
     net: &N,
+    cfg: GameConfig,
     num_games: usize,
     simulations: usize,
     temperature: f32,
@@ -595,6 +670,7 @@ pub fn generate_training_data<B: Backend<FloatElem = f32>, N: NetworkInference<B
     for _ in 0..num_games {
         let examples = self_play_game_mcts(
             net,
+            cfg,
             simulations,
             temperature,
             temperature_cutoff_moves,
@@ -613,6 +689,7 @@ pub fn generate_training_data<B: Backend<FloatElem = f32>, N: NetworkInference<B
 
 /// A game in progress during batched self-play.
 struct GameInProgress {
+    cfg: GameConfig,
     board: Vec<Option<u8>>,
     player: u8,
     move_number: usize,
@@ -628,9 +705,10 @@ struct GameInProgress {
 }
 
 impl GameInProgress {
-    fn new() -> Self {
+    fn new(cfg: GameConfig) -> Self {
         Self {
-            board: vec![None; 9],
+            cfg,
+            board: vec![None; cfg.board_size()],
             player: 0,
             move_number: 0,
             examples: Vec::new(),
@@ -643,7 +721,7 @@ impl GameInProgress {
 
     /// Start MCTS for the current position by creating a fresh root.
     fn init_root(&mut self) {
-        self.root = Some(MctsNode::new(0.0));
+        self.root = Some(MctsNode::new(0.0, self.cfg.board_size()));
         self.sim_count = 0;
         self.root_needs_expansion = true;
     }
@@ -679,6 +757,7 @@ unsafe impl Send for PendingLeaf {}
 /// evaluates them in one GPU call, then distributes results back.
 pub fn generate_training_data_batched<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
     net: &N,
+    cfg: GameConfig,
     num_games: usize,
     simulations: usize,
     temperature: f32,
@@ -689,7 +768,7 @@ pub fn generate_training_data_batched<B: Backend<FloatElem = f32>, N: NetworkInf
 ) -> Vec<Vec<TrainingExample>> {
     let mut games: Vec<GameInProgress> = (0..num_games)
         .map(|_| {
-            let mut g = GameInProgress::new();
+            let mut g = GameInProgress::new(cfg);
             g.init_root();
             g
         })
@@ -727,7 +806,7 @@ pub fn generate_training_data_batched<B: Backend<FloatElem = f32>, N: NetworkInf
                 .enumerate()
                 .filter_map(|(i, &c)| if c.is_none() { Some(i) } else { None })
                 .collect();
-            if legal_moves.is_empty() || check_winner_internal(&game.board).is_some() {
+            if legal_moves.is_empty() || check_winner_square_k(&game.board, game.cfg).is_some() {
                 finish_game(game);
                 continue;
             }
@@ -751,6 +830,7 @@ pub fn generate_training_data_batched<B: Backend<FloatElem = f32>, N: NetworkInf
                 if let Some(leaf) = run_simulation_to_leaf(
                     game_idx,
                     root,
+                    game.cfg,
                     &game.board,
                     game.player,
                     c_puct,
@@ -784,6 +864,7 @@ pub fn generate_training_data_batched<B: Backend<FloatElem = f32>, N: NetworkInf
 fn run_simulation_to_leaf(
     game_idx: usize,
     root: &mut MctsNode,
+    cfg: GameConfig,
     board: &[Option<u8>],
     player: u8,
     c_puct: f32,
@@ -823,7 +904,7 @@ fn run_simulation_to_leaf(
         current_player = 1 - current_player;
 
         // Check for terminal state after the move
-        if let Some(winner) = check_winner_internal(&current_board) {
+        if let Some(winner) = check_winner_square_k(&current_board, cfg) {
             let child = node.children[action].as_mut().unwrap();
             child.is_terminal = true;
             child.terminal_value = if winner == current_player { 1.0 } else { -1.0 };
@@ -892,7 +973,8 @@ fn flush_pending_batch<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
         let has_children = leaf_node.children.iter().any(|c| c.is_some());
         if !has_children {
             leaf_node.is_terminal = true;
-            leaf_node.terminal_value = if let Some(winner) = check_winner_internal(&leaf.board) {
+            let cfg = games[leaf.game_idx].cfg;
+            leaf_node.terminal_value = if let Some(winner) = check_winner_square_k(&leaf.board, cfg) {
                 if winner == leaf.player { 1.0 } else { -1.0 }
             } else {
                 0.0 // Draw
@@ -921,8 +1003,9 @@ fn handle_move_selection(game: &mut GameInProgress, temperature: f32, temperatur
     let root = game.root.as_ref().unwrap();
 
     // Extract visit counts from root children
-    let mut visit_counts = vec![0.0f32; 9];
-    for i in 0..9 {
+    let board_size = game.board.len();
+    let mut visit_counts = vec![0.0f32; board_size];
+    for i in 0..board_size {
         if let Some(ref child) = root.children[i] {
             visit_counts[i] = child.visit_count as f32;
         }
@@ -956,7 +1039,7 @@ fn handle_move_selection(game: &mut GameInProgress, temperature: f32, temperatur
     game.move_number += 1;
 
     // Check for game end
-    if check_winner_internal(&game.board).is_some()
+    if check_winner_square_k(&game.board, game.cfg).is_some()
         || game.board.iter().all(|c| c.is_some())
     {
         finish_game(game);
@@ -965,7 +1048,7 @@ fn handle_move_selection(game: &mut GameInProgress, temperature: f32, temperatur
 
 /// Fill in game outcome values for all training examples and mark game complete.
 fn finish_game(game: &mut GameInProgress) {
-    let winner = check_winner_internal(&game.board);
+    let winner = check_winner_square_k(&game.board, game.cfg);
     for example in &mut game.examples {
         example.value = match winner {
             Some(w) if w == example.player => 1.0,

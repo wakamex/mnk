@@ -12,8 +12,7 @@ use mnk::fixed_suite_eval::{
     evaluate_fixed_suite_vs_deep_inprocess, FixedSuiteConfig, FixedSuiteDeepEvaluation,
 };
 use mnk::network::{Network, NetworkType};
-use mnk::unified_mcts::NetworkInference;
-use mnk::unified_mcts::TrainingExample;
+use mnk::unified_mcts::{GameConfig as MctsGameConfig, NetworkInference, TrainingExample};
 use rand::Rng;
 use std::collections::HashMap;
 
@@ -310,6 +309,9 @@ where
     B: Backend<FloatElem = f32>,
     N: NetworkInference<B>,
 {
+    if args.board_width != 3 || args.win_k != 3 {
+        return None;
+    }
     if args.fixed_suite_every == 0 || iteration % args.fixed_suite_every != 0 {
         return None;
     }
@@ -427,6 +429,10 @@ struct Args {
     #[arg(long, default_value = "alphazero_model.bin")]
     model_path: String,
 
+    /// Optional initialization checkpoint for warm-start / transfer learning.
+    #[arg(long)]
+    init_model_path: Option<String>,
+
     /// Network architecture type: 'cnn' (AlphaZero-style) or 'minibt4'/'transformer' (MiniBT4)
     #[arg(long, default_value = "cnn")]
     net_type: String,
@@ -434,6 +440,10 @@ struct Args {
     /// Board width used to initialize the network
     #[arg(long, default_value = "3")]
     board_width: usize,
+
+    /// Win condition: K in a row (must be <= board width)
+    #[arg(long, default_value = "3")]
+    win_k: usize,
 
     /// MCTS temperature for move selection (0=argmax, 1=proportional to visits, >1=more exploratory)
     #[arg(long, default_value = "1.25")]
@@ -510,6 +520,12 @@ fn main() {
         "lr-min-ratio must be in [0, 1], got {}",
         args.lr_min_ratio
     );
+    assert!(
+        args.win_k > 0 && args.win_k <= args.board_width,
+        "--win-k must be in [1, board_width], got win_k={} board_width={}",
+        args.win_k,
+        args.board_width
+    );
     if args.promote_on_vs_deep_improvement {
         assert!(
             args.fixed_suite_every == 1,
@@ -549,14 +565,55 @@ fn main() {
         .parse()
         .expect("Invalid network type. Use 'cnn' or 'minibt4'/'transformer'");
     let board_width = args.board_width;
+    let win_k = args.win_k;
     let board_size = board_width * board_width;
+    let mcts_cfg = MctsGameConfig { board_width, win_k };
 
     println!(
-        "Network: {:?} (board: {}x{})",
-        net_type, board_width, board_width
+        "Network: {:?} (board: {}x{}, k={})",
+        net_type, board_width, board_width, win_k
     );
 
+    use burn::module::Module;
     let mut net = Network::<MyBackend>::new(net_type, &device, board_width);
+    if let Some(ref init_path) = args.init_model_path {
+        use burn::record::{BinFileRecorder, FullPrecisionSettings, Recorder};
+        let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
+        let model_name = if init_path.ends_with(".bin") {
+            &init_path[..init_path.len() - 4]
+        } else {
+            init_path.as_str()
+        };
+        println!("Initializing weights from checkpoint: {}", init_path);
+        match recorder.load::<<Network<MyBackend> as Module<MyBackend>>::Record>(
+            model_name.into(),
+            &device,
+        ) {
+            Ok(record) => {
+                use std::panic::{catch_unwind, AssertUnwindSafe};
+                match catch_unwind(AssertUnwindSafe(|| net.load_record(record))) {
+                    Ok(loaded) => {
+                        net = loaded;
+                        println!("✅ Loaded init checkpoint successfully");
+                    }
+                    Err(_) => {
+                        eprintln!(
+                            "❌ Init checkpoint '{}' appears incompatible with --net-type {:?} (variant mismatch)",
+                            init_path, net_type
+                        );
+                        eprintln!(
+                            "   Hint: ensure you're initializing from a checkpoint saved with the same architecture."
+                        );
+                        std::process::exit(1);
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("❌ Failed to load init checkpoint '{}': {:?}", init_path, e);
+                std::process::exit(1);
+            }
+        }
+    }
     let init_sgd_optimizer = || {
         SgdConfig::new()
             .with_momentum(Some(MomentumConfig {
@@ -623,7 +680,7 @@ fn main() {
     );
     println!("  Dirichlet alpha: {}", args.dirichlet_alpha);
     println!("  Replay buffer size: {}", args.replay_buffer_size);
-    if args.fixed_suite_every > 0 {
+    if args.fixed_suite_every > 0 && board_width == 3 && win_k == 3 {
         println!(
             "  Fixed-suite eval (Deep): every {} iters (openings={}, sides={}, sims={}, cpuct={}, max_plies={}, seed={})",
             args.fixed_suite_every,
@@ -634,8 +691,13 @@ fn main() {
             args.fixed_suite_max_plies,
             args.fixed_suite_seed
         );
-    } else {
+    } else if args.fixed_suite_every == 0 {
         println!("  Fixed-suite eval: disabled");
+    } else {
+        println!(
+            "  Fixed-suite eval: disabled for {}x{} k={} (suite currently targets 3x3 k=3)",
+            board_width, board_width, win_k
+        );
     }
     println!();
 
@@ -681,6 +743,7 @@ fn main() {
             _,
         >(
             &net_valid,
+            mcts_cfg,
             games_per_iter,
             args.mcts_simulations,
             args.temperature,

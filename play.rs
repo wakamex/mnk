@@ -975,10 +975,19 @@ impl AlphaZeroStrategy {
         }
     }
 
-    fn mcts_policy(&self, board: &[Option<u8>], player: u8) -> Vec<f32> {
+    fn mcts_policy(&self, board: &[Option<u8>], player: u8, config: &GameConfig) -> Vec<f32> {
+        assert_eq!(
+            config.board_width, config.board_height,
+            "AlphaZero MCTS currently supports square boards only"
+        );
+        let cfg = mnk::unified_mcts::GameConfig {
+            board_width: config.board_width,
+            win_k: config.winning_size,
+        };
         match &self.net {
             StrategyNet::Cpu(net) => mnk::unified_mcts::mcts_search_with_hyperparams(
                 net,
+                cfg,
                 board,
                 player,
                 self.simulations,
@@ -989,6 +998,7 @@ impl AlphaZeroStrategy {
             #[cfg(feature = "cuda")]
             StrategyNet::Gpu(net) => mnk::unified_mcts::mcts_search_with_hyperparams(
                 net,
+                cfg,
                 board,
                 player,
                 self.simulations,
@@ -1010,7 +1020,7 @@ impl Strategy for AlphaZeroStrategy {
         let (raw_value, raw_policy) = self.forward_inference(&alphazero_board, current_player);
 
         // Run MCTS
-        let policy = self.mcts_policy(&alphazero_board, current_player);
+        let policy = self.mcts_policy(&alphazero_board, current_player, config);
 
         // Convert policy to move by finding the best legal move
         let valid_moves = generate_valid_moves(state, config);

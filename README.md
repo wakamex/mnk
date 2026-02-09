@@ -47,6 +47,9 @@ Key flags:
 - `--dirichlet-alpha F` — self-play root-noise alpha (default: 0.1)
 - `--cpuct F` — PUCT exploration constant (default: 0.75)
 - `--net-type cnn|minibt4|transformer` — network architecture (default: cnn)
+- `--board-width N` — square board width (default: 3)
+- `--win-k N` — K in a row to win (default: 3)
+- `--init-model-path PATH` — warm-start from an existing checkpoint (useful for transfer learning)
 
 MiniBT4 baseline run (recommended starting point):
 
@@ -57,6 +60,32 @@ MiniBT4 baseline run (recommended starting point):
   --learning-rate 0.001 \
   --lr-schedule step \
   --model-path minibt4_i100.bin
+```
+
+## Transfer Learning (Kickoff)
+
+The CNN architecture has board-agnostic heads, so you can initialize a larger-board CNN from a 3x3 checkpoint.
+
+Notes:
+- The fixed-suite `vs_Deep` evaluation currently targets `3x3 k=3` only. For other boards, run with `--fixed-suite-every 0`.
+
+Scratch vs transfer example (5x5, still k=3 to keep the win condition comparable):
+
+```bash
+# Scratch
+./target/release/train_alphazero \
+  --net-type cnn \
+  --board-width 5 --win-k 3 \
+  --fixed-suite-every 0 \
+  --model-path cnn_5x5k3_scratch.bin
+
+# Transfer-init from a 3x3 CNN checkpoint
+./target/release/train_alphazero \
+  --net-type cnn \
+  --board-width 5 --win-k 3 \
+  --fixed-suite-every 0 \
+  --init-model-path cnn_3x3_best.bin \
+  --model-path cnn_5x5k3_from3x3.bin
 ```
 
 ## Sweep Status

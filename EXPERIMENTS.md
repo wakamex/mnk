@@ -293,7 +293,13 @@ The `vw=2.0, temp=1.0` result from the 4x4 grid (50%/50% vsD/vsM) did not reprod
 
 ### Board-size self-play unblocker (priority)
 
-CNN weights are now transfer-compatible across board sizes, but self-play search still assumes 3x3 in `src/unified_mcts.rs` (fixed `9`-cell arrays/loops and 3x3 win detection). Next step is to parameterize MCTS with board width (and win condition) so we can actually train/evaluate transferred CNN checkpoints on 5x5+ boards.
+Status: unblocked.
+
+- `src/unified_mcts.rs` no longer assumes 3x3; MCTS/self-play is parameterized by `board_width` and `win_k` via `GameConfig`.
+- Trainer now exposes `--board-width` and `--win-k` for larger-board training.
+- Trainer also supports warm-start via `--init-model-path` (useful for transfer learning).
+
+Note: the fixed-suite `vs_Deep` evaluation still targets `3x3 k=3` only, so larger-board runs should use `--fixed-suite-every 0` for now.
 
 ### MaxRL (not a priority for our current approach)
 
