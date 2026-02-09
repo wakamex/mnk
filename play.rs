@@ -1149,11 +1149,19 @@ impl Strategy for AlphaZeroStrategy {
         // Get raw neural net evaluation (before MCTS)
         let (raw_value, raw_policy) = self.forward_inference(&alphazero_board, current_player);
 
-        // Run MCTS
-        let policy = self.mcts_policy(&alphazero_board, current_player, config);
-
         // Convert policy to move by finding the best legal move
         let valid_moves = generate_valid_moves(state, config);
+        if valid_moves.is_empty() {
+            return Err("No valid moves available".to_string());
+        }
+
+        // sims=0 means "no MCTS": play argmax under raw network prior over legal moves.
+        // This is useful for quick baselines and avoids returning an all-zeros policy from MCTS.
+        let policy = if self.simulations == 0 {
+            raw_policy.clone()
+        } else {
+            self.mcts_policy(&alphazero_board, current_player, config)
+        };
 
         // Find the move with highest policy value among valid moves
         let mut best_move = valid_moves[0];
@@ -1170,19 +1178,24 @@ impl Strategy for AlphaZeroStrategy {
         if std::env::var("AZ_DEBUG").is_ok() {
             println!("  NN value={:.3} player={}", raw_value, current_player);
             print!("  NN policy: ");
-            for i in 0..9 {
+            let n = alphazero_board.len();
+            for i in 0..n {
                 if alphazero_board[i].is_none() {
                     print!("[{}]={:.3} ", i, raw_policy[i]);
                 }
             }
             println!();
-            print!("  MCTS policy:");
-            for i in 0..9 {
-                if alphazero_board[i].is_none() {
-                    print!("[{}]={:.3} ", i, policy[i]);
+            if self.simulations > 0 {
+                print!("  MCTS policy:");
+                for i in 0..n {
+                    if alphazero_board[i].is_none() {
+                        print!("[{}]={:.3} ", i, policy[i]);
+                    }
                 }
+                println!("→ move {}", best_move);
+            } else {
+                println!("  Raw argmax → move {}", best_move);
             }
-            println!("→ move {}", best_move);
         }
 
         Ok(best_move)
