@@ -3,11 +3,13 @@ use std::path::PathBuf;
 use burn::module::Module;
 use burn::prelude::Backend;
 use burn::record::{BinFileRecorder, FullPrecisionSettings, Recorder};
-use burn_ndarray::{NdArray, NdArrayDevice};
 #[cfg(feature = "cuda")]
 use burn_cuda::{Cuda, CudaDevice};
+use burn_ndarray::{NdArray, NdArrayDevice};
 
-use mnk::fixed_suite_eval::{evaluate_fixed_suite_inprocess, FixedSuiteConfig, FixedSuiteEvaluation};
+use mnk::fixed_suite_eval::{
+    evaluate_fixed_suite_inprocess, FixedSuiteConfig, FixedSuiteEvaluation,
+};
 use mnk::network::Network;
 
 use crate::{infer_network_type, Args};
@@ -70,6 +72,12 @@ fn evaluate_and_print<B: Backend<FloatElem = f32>>(
 }
 
 pub(crate) fn run_fixed_suite_eval(args: &Args) -> Result<(), String> {
+    if args.board_width != 3 || args.win_k != 3 {
+        return Err(format!(
+            "fixed-suite eval currently targets 3x3 k=3 only (got {}x{} k={})",
+            args.board_width, args.board_width, args.win_k
+        ));
+    }
     if args.fixed_suite_openings == 0 {
         return Err("fixed_suite_openings must be >= 1".to_string());
     }
@@ -107,7 +115,12 @@ pub(crate) fn run_fixed_suite_eval(args: &Args) -> Result<(), String> {
         let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
         let record = recorder
             .load(args.model_path.as_str().into(), &device)
-            .map_err(|e| format!("Failed to load trained model '{}': {:?}", args.model_path, e))?;
+            .map_err(|e| {
+                format!(
+                    "Failed to load trained model '{}': {:?}",
+                    args.model_path, e
+                )
+            })?;
         let net = Network::<Cuda>::new(net_type, &device, 3).load_record(record);
         println!(
             "Loaded trained {:?} model on GPU from '{}'",
@@ -121,7 +134,12 @@ pub(crate) fn run_fixed_suite_eval(args: &Args) -> Result<(), String> {
     let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
     let record = recorder
         .load(args.model_path.as_str().into(), &device)
-        .map_err(|e| format!("Failed to load trained model '{}': {:?}", args.model_path, e))?;
+        .map_err(|e| {
+            format!(
+                "Failed to load trained model '{}': {:?}",
+                args.model_path, e
+            )
+        })?;
     let net = Network::<NdArray>::new(net_type, &device, 3).load_record(record);
     println!(
         "Loaded trained {:?} model on CPU from '{}'",

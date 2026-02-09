@@ -1,14 +1,14 @@
+use clap::Parser;
 use std::collections::HashMap;
 use std::fmt;
 use std::time::Instant;
-use clap::Parser;
 
 // Import the actual AlphaZero implementation from the shared library
-use mnk::network::{Network, NetworkType};
 use burn::prelude::*;
-use burn_ndarray::NdArrayDevice;
 #[cfg(feature = "cuda")]
 use burn_cuda::{Cuda, CudaDevice};
+use burn_ndarray::NdArrayDevice;
+use mnk::network::{Network, NetworkType};
 
 mod fixed_suite;
 
@@ -54,6 +54,22 @@ struct Args {
     /// Number of games per tournament matchup
     #[arg(long, default_value = "10")]
     tournament_games: usize,
+
+    /// Square board width for head-to-head / tournaments (AlphaZero MCTS currently requires square boards)
+    #[arg(long, default_value_t = 3)]
+    board_width: usize,
+
+    /// Win condition: K in a row (must be <= board width)
+    #[arg(long, default_value_t = 3)]
+    win_k: usize,
+
+    /// AlphaZero MCTS simulations per move (used in head-to-head)
+    #[arg(long, default_value_t = 25)]
+    az_sims: usize,
+
+    /// AlphaZero PUCT constant (used in head-to-head)
+    #[arg(long, default_value_t = 0.75)]
+    az_cpuct: f32,
 
     /// Run deterministic fixed-opening evaluation suite and exit
     #[arg(long, default_value_t = false)]
@@ -196,8 +212,8 @@ impl Position {
     }
 
     pub fn manhattan_distance(self, other: Position) -> usize {
-        ((self.x as isize - other.x as isize).abs() + 
-         (self.y as isize - other.y as isize).abs()) as usize
+        ((self.x as isize - other.x as isize).abs() + (self.y as isize - other.y as isize).abs())
+            as usize
     }
 }
 
@@ -220,12 +236,8 @@ impl Direction {
     pub const DOWN_RIGHT: Self = Self { dx: 1, dy: 1 };
     pub const UP_RIGHT: Self = Self { dx: 1, dy: -1 };
 
-    pub const ALL_DIRECTIONS: [Self; 4] = [
-        Self::RIGHT,
-        Self::DOWN,
-        Self::DOWN_RIGHT,
-        Self::UP_RIGHT,
-    ];
+    pub const ALL_DIRECTIONS: [Self; 4] =
+        [Self::RIGHT, Self::DOWN, Self::DOWN_RIGHT, Self::UP_RIGHT];
 }
 
 // Board represents the game board state (immutable)
@@ -314,13 +326,15 @@ impl Board {
         self.cells
             .iter()
             .enumerate()
-            .filter_map(|(i, &cell)| {
-                if cell == Cell::Empty {
-                    Some(i)
-                } else {
-                    None
-                }
-            })
+            .filter_map(
+                |(i, &cell)| {
+                    if cell == Cell::Empty {
+                        Some(i)
+                    } else {
+                        None
+                    }
+                },
+            )
             .collect()
     }
 
@@ -345,40 +359,47 @@ impl Board {
     }
 
     // Get line indices starting from position in given direction
-    pub fn get_line_indices(&self, start: Position, direction: Direction, length: usize) -> Option<Vec<usize>> {
+    pub fn get_line_indices(
+        &self,
+        start: Position,
+        direction: Direction,
+        length: usize,
+    ) -> Option<Vec<usize>> {
         let mut indices = Vec::with_capacity(length);
-        
+
         for i in 0..length {
             let x = start.x as isize + i as isize * direction.dx;
             let y = start.y as isize + i as isize * direction.dy;
-            
+
             if x < 0 || y < 0 || x >= self.width as isize || y >= self.height as isize {
                 return None;
             }
-            
+
             let pos = Position::new(x as usize, y as usize);
             indices.push(self.position_to_index(pos));
         }
-        
+
         Some(indices)
     }
 
     // Get all possible winning lines
     pub fn get_all_lines(&self, winning_size: usize) -> Vec<Vec<usize>> {
         let mut lines = Vec::new();
-        
+
         for y in 0..self.height {
             for x in 0..self.width {
                 let start_pos = Position::new(x, y);
-                
+
                 for &direction in &Direction::ALL_DIRECTIONS {
-                    if let Some(line_indices) = self.get_line_indices(start_pos, direction, winning_size) {
+                    if let Some(line_indices) =
+                        self.get_line_indices(start_pos, direction, winning_size)
+                    {
                         lines.push(line_indices);
                     }
                 }
             }
         }
-        
+
         lines
     }
 }
@@ -386,20 +407,20 @@ impl Board {
 impl fmt::Display for Board {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         writeln!(f, "{}", "-".repeat(self.width * 2 + 1))?;
-        
+
         for y in 0..self.height {
             for x in 0..self.width {
                 let pos = Position::new(x, y);
                 let cell = self.get_cell_at(pos).unwrap_or(Cell::Empty);
                 write!(f, "{}", cell)?;
-                
+
                 if x < self.width - 1 {
                     write!(f, " ")?;
                 }
             }
             writeln!(f)?;
         }
-        
+
         write!(f, "{}", "-".repeat(self.width * 2 + 1))
     }
 }
@@ -462,7 +483,10 @@ impl GameState {
             return Err(format!("Move {} is not valid - cell not empty", move_index));
         }
 
-        let new_board = self.board.clone().set_cell(move_index, self.current_player)?;
+        let new_board = self
+            .board
+            .clone()
+            .set_cell(move_index, self.current_player)?;
         let winner = check_winner(&new_board, config.winning_size);
         let is_terminal = winner != Winner::None || new_board.is_full();
 
@@ -474,7 +498,10 @@ impl GameState {
 
         Ok(Self {
             board: new_board,
-            current_player: self.current_player.opponent().unwrap_or(self.current_player),
+            current_player: self
+                .current_player
+                .opponent()
+                .unwrap_or(self.current_player),
             last_move: Some(move_index),
             is_terminal,
             winner: final_winner,
@@ -520,15 +547,16 @@ impl SequenceCounts {
 
 pub fn check_winner(board: &Board, winning_size: usize) -> Winner {
     let lines = board.get_all_lines(winning_size);
-    
+
     for line_indices in lines {
         if line_indices.len() == winning_size {
             if let Some(first_cell) = board.get_cell(line_indices[0]) {
                 if first_cell != Cell::Empty {
-                    let all_same = line_indices.iter()
+                    let all_same = line_indices
+                        .iter()
                         .skip(1)
                         .all(|&idx| board.get_cell(idx) == Some(first_cell));
-                    
+
                     if all_same {
                         return match first_cell {
                             Cell::Player0 => Winner::Player0,
@@ -540,12 +568,13 @@ pub fn check_winner(board: &Board, winning_size: usize) -> Winner {
             }
         }
     }
-    
+
     Winner::None
 }
 
 pub fn count_player_in_line(board: &Board, line_indices: &[usize], player: Cell) -> usize {
-    line_indices.iter()
+    line_indices
+        .iter()
         .filter_map(|&idx| board.get_cell(idx))
         .filter(|&cell| cell == player)
         .count()
@@ -553,7 +582,8 @@ pub fn count_player_in_line(board: &Board, line_indices: &[usize], player: Cell)
 
 pub fn has_opponent_in_line(board: &Board, line_indices: &[usize], player: Cell) -> bool {
     if let Some(opponent) = player.opponent() {
-        line_indices.iter()
+        line_indices
+            .iter()
             .filter_map(|&idx| board.get_cell(idx))
             .any(|cell| cell == opponent)
     } else {
@@ -564,10 +594,10 @@ pub fn has_opponent_in_line(board: &Board, line_indices: &[usize], player: Cell)
 pub fn count_sequences_for_player(board: &Board, player: Cell, winning_size: usize) -> Vec<usize> {
     let lines = board.get_all_lines(winning_size);
     let mut counts = vec![0; winning_size + 1];
-    
+
     // Count empty cells
     counts[0] = board.get_empty_positions().len();
-    
+
     // Count sequences in lines
     for line_indices in lines {
         if !has_opponent_in_line(board, &line_indices, player) {
@@ -577,7 +607,7 @@ pub fn count_sequences_for_player(board: &Board, player: Cell, winning_size: usi
             }
         }
     }
-    
+
     counts
 }
 
@@ -595,20 +625,22 @@ pub fn is_near_existing_piece(board: &Board, pos: Position, radius: usize) -> bo
     if board.get_empty_positions().len() == board.width() * board.height() {
         return true;
     }
-    
-    board.iter_positions()
+
+    board
+        .iter_positions()
         .filter(|(_, cell)| *cell != Cell::Empty)
         .any(|(existing_pos, _)| pos.manhattan_distance(existing_pos) <= radius)
 }
 
 pub fn generate_valid_moves(state: &GameState, config: &GameConfig) -> Vec<usize> {
     let empty_positions = state.board.get_empty_positions();
-    
+
     if config.move_restriction_radius == 0 {
         return empty_positions;
     }
-    
-    empty_positions.into_iter()
+
+    empty_positions
+        .into_iter()
         .filter(|&idx| {
             let pos = state.board.index_to_position(idx);
             is_near_existing_piece(&state.board, pos, config.move_restriction_radius)
@@ -628,14 +660,14 @@ pub fn evaluate_terminal_state(state: &GameState) -> f64 {
 
 pub fn evaluate_heuristic(state: &GameState, config: &GameConfig) -> f64 {
     let counts = count_all_sequences(&state.board, config.winning_size);
-    
+
     // Simple heuristic: difference in "threats" (sequences with 2 pieces)
     let threats_diff = if counts.player0_counts.len() > 2 && counts.player1_counts.len() > 2 {
         counts.player0_counts[2] as f64 - counts.player1_counts[2] as f64
     } else {
         0.0
     };
-    
+
     let score = threats_diff * 0.1;
     score.max(-0.9).min(0.9) // Clamp to avoid terminal values
 }
@@ -665,58 +697,54 @@ pub fn minimax(
             1,
         ));
     }
-    
+
     let valid_moves = generate_valid_moves(state, config);
     if valid_moves.is_empty() {
-        return Ok(MoveEvaluation::new(
-            0,
-            evaluate_state(state, config),
-            1,
-        ));
+        return Ok(MoveEvaluation::new(0, evaluate_state(state, config), 1));
     }
-    
+
     let mut states_evaluated = 1;
     let mut best_move = valid_moves[0];
-    
+
     if maximizing {
         let mut max_score = f64::NEG_INFINITY;
-        
+
         for &move_idx in &valid_moves {
             let new_state = state.make_move(move_idx, config)?;
             let result = minimax(&new_state, config, depth - 1, alpha, beta, false)?;
             states_evaluated += result.states_evaluated;
-            
+
             if result.score > max_score {
                 max_score = result.score;
                 best_move = move_idx;
             }
-            
+
             alpha = alpha.max(result.score);
             if beta <= alpha {
                 break; // Alpha-beta pruning
             }
         }
-        
+
         Ok(MoveEvaluation::new(best_move, max_score, states_evaluated))
     } else {
         let mut min_score = f64::INFINITY;
-        
+
         for &move_idx in &valid_moves {
             let new_state = state.make_move(move_idx, config)?;
             let result = minimax(&new_state, config, depth - 1, alpha, beta, true)?;
             states_evaluated += result.states_evaluated;
-            
+
             if result.score < min_score {
                 min_score = result.score;
                 best_move = move_idx;
             }
-            
+
             beta = beta.min(result.score);
             if beta <= alpha {
                 break; // Alpha-beta pruning
             }
         }
-        
+
         Ok(MoveEvaluation::new(best_move, min_score, states_evaluated))
     }
 }
@@ -726,11 +754,11 @@ pub fn find_best_move(state: &GameState, config: &GameConfig) -> Result<MoveEval
     if valid_moves.is_empty() {
         return Err("No valid moves available".to_string());
     }
-    
+
     if valid_moves.len() == 1 {
         return Ok(MoveEvaluation::new(valid_moves[0], 0.0, 0));
     }
-    
+
     // Call minimax with opponent's perspective (hence flipped maximizing)
     minimax(
         state,
@@ -770,7 +798,7 @@ impl Strategy for MinimaxStrategy {
         let evaluation = find_best_move(state, &custom_config)?;
         Ok(evaluation.move_index)
     }
-    
+
     fn name(&self) -> &str {
         &self.name
     }
@@ -793,16 +821,16 @@ impl Strategy for RandomStrategy {
     fn get_move(&self, state: &GameState, config: &GameConfig) -> Result<usize, String> {
         use rand::seq::SliceRandom;
         use rand::thread_rng;
-        
+
         let valid_moves = generate_valid_moves(state, config);
         if valid_moves.is_empty() {
             return Err("No valid moves available".to_string());
         }
-        
+
         let mut rng = thread_rng();
         Ok(*valid_moves.choose(&mut rng).unwrap())
     }
-    
+
     fn name(&self) -> &str {
         &self.name
     }
@@ -826,12 +854,22 @@ pub struct AlphaZeroStrategy {
 
 impl AlphaZeroStrategy {
     pub fn new(simulations: usize) -> Result<Self, String> {
-        Self::new_with_training_level(simulations, TrainingLevel::Trained, "alphazero_model", false)
+        Self::new_with_training_level(
+            simulations,
+            TrainingLevel::Trained,
+            "alphazero_model",
+            false,
+        )
     }
 
     pub fn new_untrained(simulations: usize) -> Self {
-        Self::new_with_training_level(simulations, TrainingLevel::Untrained, "alphazero_model", false)
-            .expect("untrained constructor should not fail")
+        Self::new_with_training_level(
+            simulations,
+            TrainingLevel::Untrained,
+            "alphazero_model",
+            false,
+        )
+        .expect("untrained constructor should not fail")
     }
 
     pub fn new_with_model_path(simulations: usize, model_path: &str) -> Result<Self, String> {
@@ -851,7 +889,13 @@ impl AlphaZeroStrategy {
         model_path: &str,
         cpuct: f32,
     ) -> Result<Self, String> {
-        Self::new_with_training_level_config(simulations, TrainingLevel::Trained, model_path, cpuct, false)
+        Self::new_with_training_level_config(
+            simulations,
+            TrainingLevel::Trained,
+            model_path,
+            cpuct,
+            false,
+        )
     }
 
     pub fn new_with_model_path_and_cpuct_runtime(
@@ -860,7 +904,30 @@ impl AlphaZeroStrategy {
         cpuct: f32,
         force_cpu: bool,
     ) -> Result<Self, String> {
-        Self::new_with_training_level_config(simulations, TrainingLevel::Trained, model_path, cpuct, force_cpu)
+        Self::new_with_training_level_config(
+            simulations,
+            TrainingLevel::Trained,
+            model_path,
+            cpuct,
+            force_cpu,
+        )
+    }
+
+    pub fn new_with_model_path_and_cpuct_runtime_on_board(
+        simulations: usize,
+        model_path: &str,
+        cpuct: f32,
+        board_width: usize,
+        force_cpu: bool,
+    ) -> Result<Self, String> {
+        Self::new_with_training_level_config_on_board(
+            simulations,
+            TrainingLevel::Trained,
+            model_path,
+            cpuct,
+            board_width,
+            force_cpu,
+        )
     }
 
     fn new_with_training_level(
@@ -879,7 +946,29 @@ impl AlphaZeroStrategy {
         cpuct: f32,
         force_cpu: bool,
     ) -> Result<Self, String> {
+        Self::new_with_training_level_config_on_board(
+            simulations,
+            training,
+            model_path,
+            cpuct,
+            3,
+            force_cpu,
+        )
+    }
+
+    fn new_with_training_level_config_on_board(
+        simulations: usize,
+        training: TrainingLevel,
+        model_path: &str,
+        cpuct: f32,
+        board_width: usize,
+        force_cpu: bool,
+    ) -> Result<Self, String> {
         use burn::record::{BinFileRecorder, FullPrecisionSettings, Recorder};
+
+        if board_width == 0 {
+            return Err("board_width must be >= 1".to_string());
+        }
 
         let mode = select_inference_mode(force_cpu);
         let net_type = infer_network_type(model_path);
@@ -892,15 +981,24 @@ impl AlphaZeroStrategy {
                     let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
                     match recorder.load(model_path.into(), &device) {
                         Ok(record) => {
-                            let trained_net = Network::<burn_ndarray::NdArray>::new(net_type, &device, 3)
-                                .load_record(record);
-                            println!("Loaded trained {:?} model on CPU from '{}'", net_type, model_path);
+                            let trained_net = Network::<burn_ndarray::NdArray>::new(
+                                net_type,
+                                &device,
+                                board_width,
+                            )
+                            .load_record(record);
+                            println!(
+                                "Loaded trained {:?} model on CPU from '{}'",
+                                net_type, model_path
+                            );
                             StrategyNet::Cpu(trained_net)
                         }
-                        Err(e) => return Err(format!(
-                            "Failed to load trained model '{}': {:?}",
-                            model_path, e
-                        )),
+                        Err(e) => {
+                            return Err(format!(
+                                "Failed to load trained model '{}': {:?}",
+                                model_path, e
+                            ))
+                        }
                     }
                 }
                 #[cfg(feature = "cuda")]
@@ -909,14 +1007,20 @@ impl AlphaZeroStrategy {
                     let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
                     match recorder.load(model_path.into(), &device) {
                         Ok(record) => {
-                            let trained_net = Network::<Cuda>::new(net_type, &device, 3).load_record(record);
-                            println!("Loaded trained {:?} model on GPU from '{}'", net_type, model_path);
+                            let trained_net = Network::<Cuda>::new(net_type, &device, board_width)
+                                .load_record(record);
+                            println!(
+                                "Loaded trained {:?} model on GPU from '{}'",
+                                net_type, model_path
+                            );
                             StrategyNet::Gpu(trained_net)
                         }
-                        Err(e) => return Err(format!(
-                            "Failed to load trained model '{}': {:?}",
-                            model_path, e
-                        )),
+                        Err(e) => {
+                            return Err(format!(
+                                "Failed to load trained model '{}': {:?}",
+                                model_path, e
+                            ))
+                        }
                     }
                 }
             },
@@ -924,13 +1028,17 @@ impl AlphaZeroStrategy {
                 InferenceMode::Cpu => {
                     println!("Creating new untrained network on CPU");
                     let device = NdArrayDevice::default();
-                    StrategyNet::Cpu(Network::<burn_ndarray::NdArray>::new(NetworkType::Cnn, &device, 3))
+                    StrategyNet::Cpu(Network::<burn_ndarray::NdArray>::new(
+                        net_type,
+                        &device,
+                        board_width,
+                    ))
                 }
                 #[cfg(feature = "cuda")]
                 InferenceMode::Gpu => {
                     println!("Creating new untrained network on GPU");
                     let device = CudaDevice::new(0);
-                    StrategyNet::Gpu(Network::<Cuda>::new(NetworkType::Cnn, &device, 3))
+                    StrategyNet::Gpu(Network::<Cuda>::new(net_type, &device, board_width))
                 }
             },
         };
@@ -939,12 +1047,24 @@ impl AlphaZeroStrategy {
             net,
             simulations,
             cpuct,
-            name: format!("AlphaZero-{}{}", simulations, if matches!(training, TrainingLevel::Trained) { "-Trained" } else { "" }),
+            name: format!(
+                "AlphaZero-{}{}",
+                simulations,
+                if matches!(training, TrainingLevel::Trained) {
+                    "-Trained"
+                } else {
+                    ""
+                }
+            ),
         })
     }
 
     // Convert tournament GameState to AlphaZero board representation
-    fn game_state_to_alphazero_board(&self, state: &GameState, config: &GameConfig) -> Vec<Option<u8>> {
+    fn game_state_to_alphazero_board(
+        &self,
+        state: &GameState,
+        config: &GameConfig,
+    ) -> Vec<Option<u8>> {
         let mut board = vec![None; config.board_width * config.board_height];
 
         for (i, &cell) in state.board.cells.iter().enumerate() {
@@ -1068,7 +1188,7 @@ impl Strategy for AlphaZeroStrategy {
 pub fn print_game_state(state: &GameState, evaluation: Option<&MoveEvaluation>) {
     println!("{}", state.board);
     println!("Current player: {}", state.current_player);
-    
+
     if state.is_terminal {
         match state.winner {
             Winner::Draw => println!("Game ended in a draw!"),
@@ -1077,7 +1197,7 @@ pub fn print_game_state(state: &GameState, evaluation: Option<&MoveEvaluation>) 
             Winner::None => println!("Game ended with no winner"),
         }
     }
-    
+
     if let Some(eval) = evaluation {
         println!(
             "Best move: {}, Score: {:.3}, States: {}",
@@ -1092,13 +1212,7 @@ pub fn play_single_game(
     verbose: bool,
 ) -> Result<GameState, String> {
     let strategy_refs = [strategies[0].as_ref(), strategies[1].as_ref()];
-    run_game_from_state(
-        config,
-        GameState::new(config),
-        strategy_refs,
-        verbose,
-        true,
-    )
+    run_game_from_state(config, GameState::new(config), strategy_refs, verbose, true)
 }
 
 fn run_game_from_state(
@@ -1113,7 +1227,11 @@ fn run_game_from_state(
 
     while !state.is_terminal && move_count < max_moves {
         if verbose {
-            println!("\n--- Move {} (Player {}) ---", move_count + 1, state.current_player);
+            println!(
+                "\n--- Move {} (Player {}) ---",
+                move_count + 1,
+                state.current_player
+            );
             print_game_state(&state, None);
         }
 
@@ -1192,7 +1310,7 @@ impl TournamentResult {
             total_games: 0,
         }
     }
-    
+
     pub fn player0_win_rate(&self) -> f64 {
         if self.total_games > 0 {
             (self.player0_wins as f64 + self.draws as f64 * 0.5) / self.total_games as f64
@@ -1200,7 +1318,7 @@ impl TournamentResult {
             0.0
         }
     }
-    
+
     pub fn player1_win_rate(&self) -> f64 {
         if self.total_games > 0 {
             (self.player1_wins as f64 + self.draws as f64 * 0.5) / self.total_games as f64
@@ -1235,28 +1353,28 @@ where
     S2: Strategy + Clone + 'static,
 {
     let mut result = TournamentResult::new();
-    
+
     for i in 0..num_games {
         if verbose && i % (num_games / 10).max(1) == 0 {
             println!("Game {}/{}", i + 1, num_games);
         }
-        
+
         // Alternate who goes first
         let strategies: [Box<dyn Strategy>; 2] = if i % 2 == 0 {
             [Box::new(strategy1.clone()), Box::new(strategy2.clone())]
         } else {
             [Box::new(strategy2.clone()), Box::new(strategy1.clone())]
         };
-        
+
         let final_state = play_single_game(config, strategies, verbose && i < 3)?;
-        
+
         let mut outcome = GameOutcome::from_winner(final_state.winner);
         if i % 2 == 1 {
             outcome = outcome.swapped();
         }
         record_tournament_outcome(&mut result, outcome);
     }
-    
+
     Ok(result)
 }
 
@@ -1265,24 +1383,28 @@ where
 fn demo_single_game() -> Result<(), String> {
     println!("=== Single Game Demo ===");
     let config = GameConfig::new(3, 3, 3);
-    
+
     let strategies: [Box<dyn Strategy>; 2] = [
         Box::new(MinimaxStrategy::new(3)),
         Box::new(MinimaxStrategy::new(1)),
     ];
-    
+
     let final_state = play_single_game(&config, strategies, true)?;
     println!("Game ended with winner: {:?}", final_state.winner);
     Ok(())
 }
 
-fn demo_tournament(model_path: &str, tournament_games: usize, force_cpu: bool) -> Result<(), String> {
+fn demo_tournament(
+    model_path: &str,
+    tournament_games: usize,
+    force_cpu: bool,
+) -> Result<(), String> {
     println!("\n=== Tournament Demo ===");
     let config = GameConfig::new(3, 3, 3);
-    
+
     println!("Tournament Results:");
     println!("{}", "-".repeat(50));
-    
+
     // Deep vs Medium
     let result = play_tournament(
         &config,
@@ -1312,7 +1434,7 @@ fn demo_tournament(model_path: &str, tournament_games: usize, force_cpu: bool) -
         false,
     )?;
     println!("{:8} vs {:8}: {}", "Deep", "Random", result);
-    
+
     // Medium vs Shallow
     let result = play_tournament(
         &config,
@@ -1322,7 +1444,7 @@ fn demo_tournament(model_path: &str, tournament_games: usize, force_cpu: bool) -
         false,
     )?;
     println!("{:8} vs {:8}: {}", "Medium", "Shallow", result);
-    
+
     // Medium vs Random
     let result = play_tournament(
         &config,
@@ -1332,7 +1454,7 @@ fn demo_tournament(model_path: &str, tournament_games: usize, force_cpu: bool) -
         false,
     )?;
     println!("{:8} vs {:8}: {}", "Medium", "Random", result);
-    
+
     // Shallow vs Random
     let result = play_tournament(
         &config,
@@ -1392,25 +1514,25 @@ fn demo_tournament(model_path: &str, tournament_games: usize, force_cpu: bool) -
 
 fn demo_board_analysis() -> Result<(), String> {
     println!("\n=== Board Analysis Demo ===");
-    
+
     // Create a test board
     let board = Board::new(3, 3)
         .set_cell(0, Cell::Player0)? // X at top-left
         .set_cell(1, Cell::Player0)? // X at top-middle
         .set_cell(4, Cell::Player1)?; // O at center
-    
+
     println!("Test board:");
     println!("{}", board);
-    
+
     // Analyze sequences
     let counts = count_all_sequences(&board, 3);
     println!("\nPlayer 0 sequences: {:?}", counts.player0_counts);
     println!("Player 1 sequences: {:?}", counts.player1_counts);
-    
+
     // Check for winners
     let winner = check_winner(&board, 3);
     println!("Winner: {:?}", winner);
-    
+
     // Test move
     let test_move = 2; // Complete the line
     let new_board = board.set_cell(test_move, Cell::Player0)?;
@@ -1418,7 +1540,7 @@ fn demo_board_analysis() -> Result<(), String> {
     println!("\nAfter move {}:", test_move);
     println!("{}", new_board);
     println!("Winner: {:?}", new_winner);
-    
+
     Ok(())
 }
 
@@ -1426,46 +1548,75 @@ fn demo_performance() -> Result<(), String> {
     println!("\n=== Performance Test ===");
     let config = GameConfig::new(3, 3, 3);
     let state = GameState::new(&config);
-    
+
     let start_time = Instant::now();
     let evaluation = find_best_move(&state, &config)?;
     let end_time = Instant::now();
-    
+
     println!("Best opening move: {}", evaluation.move_index);
     println!("Score: {:.3}", evaluation.score);
     println!("States evaluated: {}", evaluation.states_evaluated);
-    println!("Time taken: {:.3} seconds", end_time.duration_since(start_time).as_secs_f64());
-    
+    println!(
+        "Time taken: {:.3} seconds",
+        end_time.duration_since(start_time).as_secs_f64()
+    );
+
     Ok(())
 }
 
-fn demo_head_to_head(model1: &str, model2: &str, tournament_games: usize, force_cpu: bool) -> Result<(), String> {
-    let config = GameConfig::new(3, 3, 3);
+fn demo_head_to_head(
+    model1: &str,
+    model2: &str,
+    board_width: usize,
+    win_k: usize,
+    sims: usize,
+    cpuct: f32,
+    tournament_games: usize,
+    force_cpu: bool,
+) -> Result<(), String> {
+    let config = GameConfig::new(board_width, board_width, win_k);
 
     println!("\n=== Head-to-Head Tournament ===");
     println!("{} vs {}", model1, model2);
     println!("{}", "-".repeat(50));
 
-    let sims = 25;
     use std::io::Write;
     print!("Loading model 1: {} ... ", model1);
     std::io::stdout().flush().ok();
-    let s1 = AlphaZeroStrategy::new_with_model_path_runtime(sims, model1, force_cpu)?;
+    let s1 = AlphaZeroStrategy::new_with_model_path_and_cpuct_runtime_on_board(
+        sims,
+        model1,
+        cpuct,
+        board_width,
+        force_cpu,
+    )?;
     println!("done");
     print!("Loading model 2: {} ... ", model2);
     std::io::stdout().flush().ok();
-    let s2 = AlphaZeroStrategy::new_with_model_path_runtime(sims, model2, force_cpu)?;
+    let s2 = AlphaZeroStrategy::new_with_model_path_and_cpuct_runtime_on_board(
+        sims,
+        model2,
+        cpuct,
+        board_width,
+        force_cpu,
+    )?;
     println!("done");
 
     let result = play_tournament(&config, s1, s2, tournament_games, false)?;
 
-    let name1 = std::path::Path::new(model1).file_stem().unwrap_or_default().to_string_lossy();
-    let name2 = std::path::Path::new(model2).file_stem().unwrap_or_default().to_string_lossy();
+    let name1 = std::path::Path::new(model1)
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy();
+    let name2 = std::path::Path::new(model2)
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy();
     println!("{:16} vs {:16}: {}", name1, name2, result);
-    println!("  {} wins: {}, {} wins: {}, draws: {}",
-        name1, result.player0_wins,
-        name2, result.player1_wins,
-        result.draws);
+    println!(
+        "  {} wins: {}, {} wins: {}, draws: {}",
+        name1, result.player0_wins, name2, result.player1_wins, result.draws
+    );
 
     Ok(())
 }
@@ -1489,10 +1640,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if let Some(ref model2) = args.model_path2 {
+        if args.board_width == 0 {
+            return Err("board_width must be >= 1".into());
+        }
+        if args.win_k == 0 || args.win_k > args.board_width {
+            return Err(format!(
+                "win_k must be in [1, board_width], got win_k={} board_width={}",
+                args.win_k, args.board_width
+            )
+            .into());
+        }
         // Head-to-head mode: just run the two models against each other
-        demo_head_to_head(&args.model_path, model2, args.tournament_games, args.cpu)?;
+        demo_head_to_head(
+            &args.model_path,
+            model2,
+            args.board_width,
+            args.win_k,
+            args.az_sims,
+            args.az_cpuct,
+            args.tournament_games,
+            args.cpu,
+        )?;
     } else {
         // Full demo mode
+        if args.board_width != 3 || args.win_k != 3 {
+            println!(
+                "Note: full demo mode is still 3x3-centric; ignoring --board-width/--win-k (got {}x{} k={}).",
+                args.board_width, args.board_width, args.win_k
+            );
+        }
         demo_board_analysis()?;
         demo_single_game()?;
 
