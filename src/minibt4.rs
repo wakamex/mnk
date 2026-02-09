@@ -127,11 +127,11 @@ impl<B: Backend> MiniBT4Net<B> {
         let value = activation::tanh(self.value_head.forward(value_features)).reshape([batch_size, 1]);
 
         // 6. Policy Head: Linear projection for each square
-        let policy_logits = self.policy_head.forward(x);  // [batch, n_squares, 1]
+        // IMPORTANT: return raw logits for training parity with CNN. Softmax happens in inference/MCTS.
+        let policy_logits = self.policy_head.forward(x); // [batch, n_squares, 1]
         let policy_logits = policy_logits.reshape([batch_size, n_squares]);
-        let policy = activation::softmax(policy_logits, 1);
 
-        (value, policy)
+        (value, policy_logits)
     }
 
     /// Add 2D positional encoding for spatial board awareness
@@ -202,12 +202,14 @@ impl<B: Backend<FloatElem = f32>> MiniBT4Net<B> {
             .reshape([batch_size, board_size]);
 
         // Single forward pass for entire batch
-        let (batch_values, batch_policies) = self.forward(batch_input, self.current_board_width);
+        let (batch_values, batch_policy_logits) = self.forward(batch_input, self.current_board_width);
 
         // Bulk GPU->CPU transfer
         let values_data = batch_values.to_data();
         let values: Vec<f32> = values_data.as_slice::<f32>().unwrap().iter().copied().collect();
 
+        // Convert logits to probabilities for MCTS
+        let batch_policies = activation::softmax(batch_policy_logits, 1);
         let policies_data = batch_policies.to_data();
         let policies_slice = policies_data.as_slice::<f32>().unwrap();
         let policies: Vec<Vec<f32>> = (0..batch_size)
@@ -249,7 +251,8 @@ pub fn evaluate_position<B: Backend<FloatElem = f32>>(
     );
 
     // Forward pass
-    let (value, policy) = net.forward(input_tensor, board_width);
+    let (value, policy_logits) = net.forward(input_tensor, board_width);
+    let policy = activation::softmax(policy_logits, 1);
 
     // Bulk GPU→CPU transfer (avoids into_scalar segfaults on CUDA)
     let value_scalar = value.to_data().as_slice::<f32>().unwrap()[0];

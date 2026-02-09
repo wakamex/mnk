@@ -70,11 +70,8 @@ impl<B: Backend<FloatElem = f32>> Network<B> {
         match self {
             Network::Cnn(net) => net.forward(x),
             Network::Transformer(net) => {
-                let (value, policy) = net.forward(x, net.current_board_width());
-                // MiniBT4 returns softmax policy, we need logits for training
-                // Apply log to convert back to log-space (approximately)
-                let policy_logits = policy.clone().log();
-                (value, policy_logits)
+                // MiniBT4 returns raw logits for training parity with CNN.
+                net.forward(x, net.current_board_width())
             }
         }
     }
