@@ -1432,16 +1432,6 @@ fn demo_tournament(
     )?;
     println!("{:8} vs {:8}: {}", "Deep", "Shallow", result);
 
-    // Deep vs Random
-    let result = play_tournament(
-        &config,
-        MinimaxStrategy::new(3),
-        RandomStrategy::new(),
-        tournament_games,
-        0,
-    )?;
-    println!("{:8} vs {:8}: {}", "Deep", "Random", result);
-
     // Medium vs Shallow
     let result = play_tournament(
         &config,
@@ -1451,26 +1441,6 @@ fn demo_tournament(
         0,
     )?;
     println!("{:8} vs {:8}: {}", "Medium", "Shallow", result);
-
-    // Medium vs Random
-    let result = play_tournament(
-        &config,
-        MinimaxStrategy::new(2),
-        RandomStrategy::new(),
-        tournament_games,
-        0,
-    )?;
-    println!("{:8} vs {:8}: {}", "Medium", "Random", result);
-
-    // Shallow vs Random
-    let result = play_tournament(
-        &config,
-        MinimaxStrategy::new(1),
-        RandomStrategy::new(),
-        tournament_games,
-        0,
-    )?;
-    println!("{:8} vs {:8}: {}", "Shallow", "Random", result);
 
     // AlphaZero tournaments
     println!("\n🧠 AlphaZero Neural Network vs Classical AI:");
@@ -1495,16 +1465,6 @@ fn demo_tournament(
         0,
     )?;
     println!("{:8} vs {:8}: {}", "AZ-25", "Medium", result);
-
-    // AlphaZero vs Random
-    let result = play_tournament(
-        &config,
-        AlphaZeroStrategy::new_with_model_path_runtime(25, model_path, force_cpu)?,
-        RandomStrategy::new(),
-        tournament_games,
-        0,
-    )?;
-    println!("{:8} vs {:8}: {}", "AZ-25", "Random", result);
 
     // Different AlphaZero simulation counts
     let result = play_tournament(
