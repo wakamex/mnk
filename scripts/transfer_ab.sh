@@ -6,13 +6,14 @@ set -euo pipefail
 # Artifacts are written under research_runs/ (gitignored).
 #
 # Example:
-#   SEED=20260209 BOARD=5 K=3 ./scripts/transfer_ab.sh
+#   SEED=20260209 BOARD=5 K=4 ./scripts/transfer_ab.sh
 
 SEED="${SEED:-20260209}"
 BOARD="${BOARD:-5}"
-K="${K:-3}"
+K="${K:-4}"
 ITERS_3X3="${ITERS_3X3:-100}"
 ITERS_BIG="${ITERS_BIG:-100}"
+SKIP_3X3="${SKIP_3X3:-0}"
 
 OUTDIR="research_runs/transfer_ab/seed_${SEED}/b${BOARD}_k${K}"
 mkdir -p "${OUTDIR}"
@@ -26,14 +27,21 @@ echo "seed=${SEED} board=${BOARD} k=${K}"
 echo "outdir=${OUTDIR}"
 echo
 
-echo "== 1) Train 3x3 CNN checkpoint (source) =="
-./target/release/train_alphazero \
-  --net-type cnn \
-  --board-width 3 --win-k 3 \
-  --iterations "${ITERS_3X3}" \
-  --seed "${SEED}" \
-  --model-path "${CNN_3X3}"
-echo
+if [[ "${SKIP_3X3}" == "1" ]]; then
+  echo "== 1) Using existing 3x3 CNN checkpoint (source) =="
+  echo "SKIP_3X3=1, expecting: ${CNN_3X3}"
+  [[ -f "${CNN_3X3}" ]] || { echo "Missing init model: ${CNN_3X3}" >&2; exit 1; }
+  echo
+else
+  echo "== 1) Train 3x3 CNN checkpoint (source) =="
+  ./target/release/train_alphazero \
+    --net-type cnn \
+    --board-width 3 --win-k 3 \
+    --iterations "${ITERS_3X3}" \
+    --seed "${SEED}" \
+    --model-path "${CNN_3X3}"
+  echo
+fi
 
 echo "== 2) Train larger-board CNN from scratch =="
 ./target/release/train_alphazero \

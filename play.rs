@@ -121,6 +121,14 @@ struct Args {
     /// Force CPU inference backend for tournaments/eval
     #[arg(long, default_value_t = false)]
     cpu: bool,
+
+    /// Print board + moves for the first few games (useful for debugging eval mismatches).
+    #[arg(long, default_value_t = false)]
+    verbose: bool,
+
+    /// Number of games to print when --verbose is enabled.
+    #[arg(long, default_value_t = 2)]
+    verbose_games: usize,
 }
 
 /// Infer network type from model filename
@@ -1344,7 +1352,7 @@ pub fn play_tournament<S1, S2>(
     strategy1: S1,
     strategy2: S2,
     num_games: usize,
-    verbose: bool,
+    verbose_games: usize,
 ) -> Result<TournamentResult, String>
 where
     S1: Strategy + Clone + 'static,
@@ -1353,7 +1361,7 @@ where
     let mut result = TournamentResult::new();
 
     for i in 0..num_games {
-        if verbose && i % (num_games / 10).max(1) == 0 {
+        if verbose_games > 0 && i % (num_games / 10).max(1) == 0 {
             println!("Game {}/{}", i + 1, num_games);
         }
 
@@ -1364,7 +1372,8 @@ where
             [Box::new(strategy2.clone()), Box::new(strategy1.clone())]
         };
 
-        let final_state = play_single_game(config, strategies, verbose && i < 3)?;
+        let game_verbose = i < verbose_games;
+        let final_state = play_single_game(config, strategies, game_verbose)?;
 
         let mut outcome = GameOutcome::from_winner(final_state.winner);
         if i % 2 == 1 {
@@ -1409,7 +1418,7 @@ fn demo_tournament(
         MinimaxStrategy::new(3),
         MinimaxStrategy::new(2),
         tournament_games,
-        false,
+        0,
     )?;
     println!("{:8} vs {:8}: {}", "Deep", "Medium", result);
 
@@ -1419,7 +1428,7 @@ fn demo_tournament(
         MinimaxStrategy::new(3),
         MinimaxStrategy::new(1),
         tournament_games,
-        false,
+        0,
     )?;
     println!("{:8} vs {:8}: {}", "Deep", "Shallow", result);
 
@@ -1429,7 +1438,7 @@ fn demo_tournament(
         MinimaxStrategy::new(3),
         RandomStrategy::new(),
         tournament_games,
-        false,
+        0,
     )?;
     println!("{:8} vs {:8}: {}", "Deep", "Random", result);
 
@@ -1439,7 +1448,7 @@ fn demo_tournament(
         MinimaxStrategy::new(2),
         MinimaxStrategy::new(1),
         tournament_games,
-        false,
+        0,
     )?;
     println!("{:8} vs {:8}: {}", "Medium", "Shallow", result);
 
@@ -1449,7 +1458,7 @@ fn demo_tournament(
         MinimaxStrategy::new(2),
         RandomStrategy::new(),
         tournament_games,
-        false,
+        0,
     )?;
     println!("{:8} vs {:8}: {}", "Medium", "Random", result);
 
@@ -1459,7 +1468,7 @@ fn demo_tournament(
         MinimaxStrategy::new(1),
         RandomStrategy::new(),
         tournament_games,
-        false,
+        0,
     )?;
     println!("{:8} vs {:8}: {}", "Shallow", "Random", result);
 
@@ -1473,7 +1482,7 @@ fn demo_tournament(
         AlphaZeroStrategy::new_with_model_path_runtime(25, model_path, force_cpu)?,
         MinimaxStrategy::new(3),
         tournament_games,
-        true,
+        2,
     )?;
     println!("{:8} vs {:8}: {}", "AZ-25", "Deep", result);
 
@@ -1483,7 +1492,7 @@ fn demo_tournament(
         AlphaZeroStrategy::new_with_model_path_runtime(25, model_path, force_cpu)?,
         MinimaxStrategy::new(2),
         tournament_games,
-        false,
+        0,
     )?;
     println!("{:8} vs {:8}: {}", "AZ-25", "Medium", result);
 
@@ -1493,7 +1502,7 @@ fn demo_tournament(
         AlphaZeroStrategy::new_with_model_path_runtime(25, model_path, force_cpu)?,
         RandomStrategy::new(),
         tournament_games,
-        false,
+        0,
     )?;
     println!("{:8} vs {:8}: {}", "AZ-25", "Random", result);
 
@@ -1503,7 +1512,7 @@ fn demo_tournament(
         AlphaZeroStrategy::new_with_model_path_runtime(50, model_path, force_cpu)?,
         AlphaZeroStrategy::new_with_model_path_runtime(10, model_path, force_cpu)?,
         tournament_games,
-        false,
+        0,
     )?;
     println!("{:8} vs {:8}: {}", "AZ-50", "AZ-10", result);
 
@@ -1600,7 +1609,7 @@ fn demo_head_to_head(
     )?;
     println!("done");
 
-    let result = play_tournament(&config, s1, s2, tournament_games, false)?;
+    let result = play_tournament(&config, s1, s2, tournament_games, 0)?;
 
     let name1 = std::path::Path::new(model1)
         .file_stem()
@@ -1645,7 +1654,8 @@ fn eval_vs_minimax(args: &Args, depth: usize, label: &str) -> Result<(), String>
     )?;
     let opp = MinimaxStrategy::new(depth);
 
-    let result = play_tournament(&config, az, opp, args.tournament_games, false)?;
+    let verbose_games = if args.verbose { args.verbose_games } else { 0 };
+    let result = play_tournament(&config, az, opp, args.tournament_games, verbose_games)?;
     println!("{:8} vs {:8}: {}", "AZ", label, result);
     Ok(())
 }
@@ -1674,7 +1684,8 @@ fn eval_vs_random(args: &Args) -> Result<(), String> {
     )?;
     let random = RandomStrategy::new();
 
-    let result = play_tournament(&config, az, random, args.tournament_games, false)?;
+    let verbose_games = if args.verbose { args.verbose_games } else { 0 };
+    let result = play_tournament(&config, az, random, args.tournament_games, verbose_games)?;
     println!("{:8} vs {:8}: {}", "AZ", "Random", result);
     Ok(())
 }
