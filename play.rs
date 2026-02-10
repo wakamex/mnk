@@ -1387,20 +1387,6 @@ where
 
 // Demo functions
 
-fn demo_single_game() -> Result<(), String> {
-    println!("=== Single Game Demo ===");
-    let config = GameConfig::new(3, 3, 3);
-
-    let strategies: [Box<dyn Strategy>; 2] = [
-        Box::new(MinimaxStrategy::new(3)),
-        Box::new(MinimaxStrategy::new(1)),
-    ];
-
-    let final_state = play_single_game(&config, strategies, true)?;
-    println!("Game ended with winner: {:?}", final_state.winner);
-    Ok(())
-}
-
 fn demo_tournament(
     model_path: &str,
     tournament_games: usize,
@@ -1475,38 +1461,6 @@ fn demo_tournament(
         0,
     )?;
     println!("{:8} vs {:8}: {}", "AZ-50", "AZ-10", result);
-
-    Ok(())
-}
-
-fn demo_board_analysis() -> Result<(), String> {
-    println!("\n=== Board Analysis Demo ===");
-
-    // Create a test board
-    let board = Board::new(3, 3)
-        .set_cell(0, Cell::Player0)? // X at top-left
-        .set_cell(1, Cell::Player0)? // X at top-middle
-        .set_cell(4, Cell::Player1)?; // O at center
-
-    println!("Test board:");
-    println!("{}", board);
-
-    // Analyze sequences
-    let counts = count_all_sequences(&board, 3);
-    println!("\nPlayer 0 sequences: {:?}", counts.player0_counts);
-    println!("Player 1 sequences: {:?}", counts.player1_counts);
-
-    // Check for winners
-    let winner = check_winner(&board, 3);
-    println!("Winner: {:?}", winner);
-
-    // Test move
-    let test_move = 2; // Complete the line
-    let new_board = board.set_cell(test_move, Cell::Player0)?;
-    let new_winner = check_winner(&new_board, 3);
-    println!("\nAfter move {}:", test_move);
-    println!("{}", new_board);
-    println!("Winner: {:?}", new_winner);
 
     Ok(())
 }
@@ -1767,8 +1721,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 args.board_width, args.board_width, args.win_k
             );
         }
-        demo_board_analysis()?;
-        demo_single_game()?;
 
         print_gpu_memory("Before AlphaZero tournaments");
         demo_tournament(&args.model_path, args.tournament_games, args.cpu)?;
