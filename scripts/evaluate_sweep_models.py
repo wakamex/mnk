@@ -2,10 +2,14 @@
 """
 Evaluate all successful models from a sweep summary CSV with mnk_game.
 
-Example:
+Examples:
   python scripts/evaluate_sweep_models.py \
     --sweep-csv sweep_results/b5k4_transfer_step24_overnight_20260211_074855.csv \
     --mode random --board-width 5 --win-k 4 --az-sims 50 --tournament-games 200
+
+  python scripts/evaluate_sweep_models.py \
+    --sweep-csv sweep_results/b5k4_transfer_step24_overnight_20260211_074855.csv \
+    --mode random,shallow --board-width 5 --win-k 4 --az-sims 50 --tournament-games 200
 """
 
 from __future__ import annotations
@@ -107,9 +111,8 @@ def main() -> int:
     parser.add_argument("--sweep-csv", required=True, help="Path to sweep summary CSV")
     parser.add_argument(
         "--mode",
-        choices=["random", "shallow", "deep"],
         default="random",
-        help="mnk_game eval mode",
+        help="mnk_game eval mode(s): random, shallow, deep. Comma-separated supported.",
     )
     parser.add_argument("--board-width", type=int, required=True, help="Board width")
     parser.add_argument("--win-k", type=int, required=True, help="K in a row to win")
@@ -131,6 +134,19 @@ def main() -> int:
         help="Path to mnk_game binary",
     )
     args = parser.parse_args()
+
+    valid_modes = {"random", "shallow", "deep"}
+    modes = [m.strip().lower() for m in str(args.mode).split(",") if m.strip()]
+    if not modes:
+        print("No eval mode specified via --mode", file=sys.stderr)
+        return 1
+    invalid_modes = [m for m in modes if m not in valid_modes]
+    if invalid_modes:
+        print(
+            f"Invalid --mode value(s): {invalid_modes}. Valid: {sorted(valid_modes)}",
+            file=sys.stderr,
+        )
+        return 1
 
     sweep_csv = Path(args.sweep_csv)
     if not sweep_csv.exists():
@@ -156,86 +172,95 @@ def main() -> int:
         successful = successful[: args.limit]
 
     print(f"Loaded {len(rows)} rows from {sweep_csv}")
-    print(f"Evaluating {len(successful)} successful models (mode={args.mode})")
+    print(f"Evaluating {len(successful)} successful models (mode={','.join(modes)})")
 
     results: List[Dict[str, object]] = []
     missing_models = 0
 
-    for idx, row in enumerate(successful, start=1):
+    total_jobs = len(successful) * len(modes)
+    job_idx = 0
+    for row in successful:
         exp = str(row.get("Experiment", "")).strip()
         model_path = resolve_model_path(exp, model_root=model_root, sweep_root=sweep_root)
         if model_path is None:
             missing_models += 1
-            print(f"[{idx}/{len(successful)}] MISSING MODEL: {exp}")
+            for mode in modes:
+                job_idx += 1
+                print(f"[{job_idx}/{total_jobs}] MISSING MODEL ({mode}): {exp}")
+                results.append(
+                    {
+                        "Experiment": exp,
+                        "Mode": mode,
+                        "Model_Path": "",
+                        "Status": "MISSING_MODEL",
+                        "Eval_Return_Code": "",
+                        "Eval_Time_s": "",
+                        "Wins": "",
+                        "Losses": "",
+                        "Draws": "",
+                        "Score_Pct": "",
+                        "Training_Time": row.get("Training_Time", ""),
+                        "Empty_Board_Value": row.get("Empty_Board_Value", ""),
+                    }
+                )
+            continue
+
+        for mode in modes:
+            job_idx += 1
+            print(f"[{job_idx}/{total_jobs}] Evaluating ({mode}): {exp}")
+            eval_result = run_eval(
+                mnk_binary=mnk_binary,
+                model_path=model_path,
+                mode=mode,
+                board_width=args.board_width,
+                win_k=args.win_k,
+                tournament_games=args.tournament_games,
+                az_sims=args.az_sims,
+                az_cpuct=args.az_cpuct,
+                force_cpu=args.cpu,
+            )
+
+            ok = (
+                eval_result["returncode"] == 0
+                and eval_result["score_pct"] is not None
+                and eval_result["wins"] is not None
+            )
+            status = "OK" if ok else "EVAL_FAILED"
+            score_display = (
+                f"{eval_result['score_pct']:.1f}%"
+                if eval_result["score_pct"] is not None
+                else "N/A"
+            )
+            print(f"    -> {status} ({score_display}, {eval_result['elapsed_s']:.1f}s)")
+
             results.append(
                 {
                     "Experiment": exp,
-                    "Model_Path": "",
-                    "Status": "MISSING_MODEL",
-                    "Eval_Return_Code": "",
-                    "Eval_Time_s": "",
-                    "Wins": "",
-                    "Losses": "",
-                    "Draws": "",
-                    "Score_Pct": "",
+                    "Mode": mode,
+                    "Model_Path": str(model_path),
+                    "Status": status,
+                    "Eval_Return_Code": eval_result["returncode"],
+                    "Eval_Time_s": eval_result["elapsed_s"],
+                    "Wins": eval_result["wins"] if eval_result["wins"] is not None else "",
+                    "Losses": eval_result["losses"] if eval_result["losses"] is not None else "",
+                    "Draws": eval_result["draws"] if eval_result["draws"] is not None else "",
+                    "Score_Pct": eval_result["score_pct"] if eval_result["score_pct"] is not None else "",
                     "Training_Time": row.get("Training_Time", ""),
                     "Empty_Board_Value": row.get("Empty_Board_Value", ""),
                 }
             )
-            continue
-
-        print(f"[{idx}/{len(successful)}] Evaluating: {exp}")
-        eval_result = run_eval(
-            mnk_binary=mnk_binary,
-            model_path=model_path,
-            mode=args.mode,
-            board_width=args.board_width,
-            win_k=args.win_k,
-            tournament_games=args.tournament_games,
-            az_sims=args.az_sims,
-            az_cpuct=args.az_cpuct,
-            force_cpu=args.cpu,
-        )
-
-        ok = (
-            eval_result["returncode"] == 0
-            and eval_result["score_pct"] is not None
-            and eval_result["wins"] is not None
-        )
-        status = "OK" if ok else "EVAL_FAILED"
-        score_display = (
-            f"{eval_result['score_pct']:.1f}%"
-            if eval_result["score_pct"] is not None
-            else "N/A"
-        )
-        print(f"    -> {status} ({score_display}, {eval_result['elapsed_s']:.1f}s)")
-
-        results.append(
-            {
-                "Experiment": exp,
-                "Model_Path": str(model_path),
-                "Status": status,
-                "Eval_Return_Code": eval_result["returncode"],
-                "Eval_Time_s": eval_result["elapsed_s"],
-                "Wins": eval_result["wins"] if eval_result["wins"] is not None else "",
-                "Losses": eval_result["losses"] if eval_result["losses"] is not None else "",
-                "Draws": eval_result["draws"] if eval_result["draws"] is not None else "",
-                "Score_Pct": eval_result["score_pct"] if eval_result["score_pct"] is not None else "",
-                "Training_Time": row.get("Training_Time", ""),
-                "Empty_Board_Value": row.get("Empty_Board_Value", ""),
-            }
-        )
 
     if args.output:
         output_path = Path(args.output)
     else:
         output_path = (
             sweep_csv.parent
-            / f"{sweep_csv.stem}_eval_{args.mode}_bw{args.board_width}_k{args.win_k}_sims{args.az_sims}.csv"
+            / f"{sweep_csv.stem}_eval_{'-'.join(modes)}_bw{args.board_width}_k{args.win_k}_sims{args.az_sims}.csv"
         )
 
     fieldnames = [
         "Experiment",
+        "Mode",
         "Model_Path",
         "Status",
         "Eval_Return_Code",
@@ -265,7 +290,7 @@ def main() -> int:
         print("\nTop 10:")
         for i, row in enumerate(ok_rows[:10], start=1):
             print(
-                f"  {i:2d}. {row['Experiment']}  "
+                f"  {i:2d}. [{row['Mode']}] {row['Experiment']}  "
                 f"score={float(row['Score_Pct']):.1f}%  "
                 f"W-L-D={row['Wins']}-{row['Losses']}-{row['Draws']}"
             )
@@ -275,4 +300,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
