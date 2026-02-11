@@ -631,6 +631,7 @@ class SweepConfig:
     Only tournament_games has a sweep-side default (it's not a training binary param).
     """
     # Core training parameters
+    seed: List[int] = None
     iterations: List[int] = None
     games_per_iter: List[int] = None
     epochs: List[int] = None
@@ -735,6 +736,7 @@ def parse_int_range(value_str: str) -> List[int]:
 # No defaults stored here — the binary owns all defaults via clap.
 # (config_attr, argparse_dest, binary_flag, name_prefix, display_name, value_type)
 PARAM_TABLE = [
+    ("seed",            "seed",          "--seed",               "seed", "Seed",                "int"),
     ("iterations",      "iterations",    "--iterations",         "i",    "Iterations",          "int"),
     ("games_per_iter",  "games",         "--games-per-iter",     "g",    "Games per iteration", "int"),
     ("epochs",          "epochs",        "--epochs",             "e",    "Epochs",              "int"),
@@ -1003,6 +1005,7 @@ Examples:
 
     # Training hyperparameters — defaults come from the binary, not duplicated here
     param_group = parser.add_argument_group('training hyperparameters')
+    param_group.add_argument('--seed', help='Training seed')
     param_group.add_argument('--iterations', '-i', help='Training iterations')
     param_group.add_argument('--games', '-g', help='Games per iteration')
     param_group.add_argument('--epochs', '-e', help='Training epochs')
