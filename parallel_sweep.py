@@ -650,6 +650,9 @@ class SweepConfig:
 
     # Network architecture
     net_type: List[str] = None
+    board_width: List[int] = None
+    win_k: List[int] = None
+    init_model_path: List[str] = None
 
     # Sweep-only settings (not training binary params)
     tournament_games: List[int] = None
@@ -685,7 +688,12 @@ def generate_experiments(sweep_config: SweepConfig) -> List[ExperimentConfig]:
         name_parts = []
         args_parts = []
         for (flag, prefix, _), value in zip(active, combo):
-            name_parts.append(f"{prefix}{value}")
+            # Keep experiment names filesystem-safe (paths like init_model_path may include '/').
+            value_name = str(value).replace(os.sep, "_").replace(" ", "_")
+            if os.altsep:
+                value_name = value_name.replace(os.altsep, "_")
+            value_name = value_name.replace(":", "_")
+            name_parts.append(f"{prefix}{value_name}")
             args_parts.append(f"{flag} {value}")
         experiments.append(ExperimentConfig(
             name="_".join(name_parts),
@@ -740,6 +748,9 @@ PARAM_TABLE = [
     ("value_weight",    "value_weight",  "--value-weight",       "vw",   "Value weight",        "float"),
     ("mcts_simulations","mcts",          "--mcts-simulations",   "mcts", "MCTS simulations",    "int"),
     ("net_type",        "net_type",      "--net-type",           "net",  "Network type",        "str"),
+    ("board_width",     "board_width",   "--board-width",        "bw",   "Board width",         "int"),
+    ("win_k",           "win_k",         "--win-k",              "k",    "Win condition K",     "int"),
+    ("init_model_path", "init_model_path","--init-model-path",   "init", "Init model path",     "str"),
     ("temperature",     "temperature",   "--temperature",        "temp", "Temperature",         "float"),
     ("temperature_cutoff_moves", "temperature_cutoff_moves", "--temperature-cutoff-moves", "tcut", "Temp cutoff moves", "int"),
     ("dirichlet_alpha", "dirichlet_alpha", "--dirichlet-alpha", "dalpha", "Dirichlet alpha", "float"),
@@ -1007,6 +1018,9 @@ Examples:
     param_group.add_argument('--value-weight', '-vw', help='Value loss weight')
     param_group.add_argument('--mcts', '-m', help='MCTS simulations per move')
     param_group.add_argument('--net-type', help='Network architecture: cnn, minibt4/transformer')
+    param_group.add_argument('--board-width', help='Board width for training')
+    param_group.add_argument('--win-k', help='Win condition K in a row')
+    param_group.add_argument('--init-model-path', help='Initialize model from checkpoint path')
     param_group.add_argument('--tournament-games', '-tg', help='Games per tournament matchup (default: 100)')
 
     # Advanced parameter group
