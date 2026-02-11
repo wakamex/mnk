@@ -13,7 +13,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -632,6 +632,7 @@ class SweepConfig:
     """
     # Core training parameters
     seed: List[int] = None
+    preset: List[str] = None
     iterations: List[int] = None
     games_per_iter: List[int] = None
     epochs: List[int] = None
@@ -663,6 +664,7 @@ class SweepConfig:
     temperature_cutoff_moves: List[int] = None
     dirichlet_alpha: List[float] = None
     cpuct: List[float] = None
+    fixed_suite_every: List[int] = None
 
     def __post_init__(self):
         if self.tournament_games is None:
@@ -732,11 +734,18 @@ def parse_int_range(value_str: str) -> List[int]:
         return [int(x.strip()) for x in value_str.split(',')]
 
 
+def _format_display_value(value: object) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
 # Maps sweep parameters to binary CLI flags for arg generation and defaults display.
 # No defaults stored here — the binary owns all defaults via clap.
 # (config_attr, argparse_dest, binary_flag, name_prefix, display_name, value_type)
 PARAM_TABLE = [
     ("seed",            "seed",          "--seed",               "seed", "Seed",                "int"),
+    ("preset",          "preset",        "--preset",             "preset", "Preset",            "str"),
     ("iterations",      "iterations",    "--iterations",         "i",    "Iterations",          "int"),
     ("games_per_iter",  "games",         "--games-per-iter",     "g",    "Games per iteration", "int"),
     ("epochs",          "epochs",        "--epochs",             "e",    "Epochs",              "int"),
@@ -757,6 +766,7 @@ PARAM_TABLE = [
     ("temperature_cutoff_moves", "temperature_cutoff_moves", "--temperature-cutoff-moves", "tcut", "Temp cutoff moves", "int"),
     ("dirichlet_alpha", "dirichlet_alpha", "--dirichlet-alpha", "dalpha", "Dirichlet alpha", "float"),
     ("cpuct",           "cpuct",         "--cpuct",              "cpuct","CPUCT",               "float"),
+    ("fixed_suite_every","fixed_suite_every","--fixed-suite-every","fse", "Fixed-suite every",   "int"),
 ]
 
 VALUE_PARSERS = {
@@ -792,6 +802,34 @@ def query_binary_defaults() -> Dict[str, str]:
         return {}
 
 
+def _resolve_preset_path(preset_name: str) -> Optional[Path]:
+    direct = Path(preset_name)
+    if direct.exists():
+        return direct
+
+    cfg_root = Path("configs/train")
+    in_dir = cfg_root / preset_name
+    if in_dir.exists():
+        return in_dir
+
+    if not preset_name.endswith(".json"):
+        with_ext = cfg_root / f"{preset_name}.json"
+        if with_ext.exists():
+            return with_ext
+
+    return None
+
+
+def _load_preset_dict(preset_name: str) -> Dict[str, object]:
+    path = _resolve_preset_path(preset_name)
+    if path is None:
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
 def _infer_effective_net_type(sweep_config: "SweepConfig", binary_defaults: Dict[str, str]) -> Optional[str]:
     """Infer the effective net-type for this sweep (single value only).
 
@@ -801,7 +839,36 @@ def _infer_effective_net_type(sweep_config: "SweepConfig", binary_defaults: Dict
         if len(sweep_config.net_type) == 1:
             return str(sweep_config.net_type[0]).strip().lower()
         return None
+
+    if sweep_config.preset is not None and len(sweep_config.preset) == 1:
+        preset_data = _load_preset_dict(str(sweep_config.preset[0]))
+        net_type = preset_data.get("net_type")
+        if isinstance(net_type, str) and net_type.strip():
+            return net_type.strip().lower()
+
     return str(binary_defaults.get("net-type", "")).strip().lower() or None
+
+
+def _infer_effective_iterations(
+    sweep_config: "SweepConfig",
+    binary_defaults: Dict[str, str],
+) -> Optional[int]:
+    if sweep_config.iterations is not None:
+        if len(sweep_config.iterations) == 1:
+            return int(sweep_config.iterations[0])
+        return None
+
+    if sweep_config.preset is not None and len(sweep_config.preset) == 1:
+        preset_data = _load_preset_dict(str(sweep_config.preset[0]))
+        preset_iters = preset_data.get("iterations")
+        if isinstance(preset_iters, int) and preset_iters > 0:
+            return preset_iters
+
+    try:
+        iters = int(binary_defaults.get("iterations", "0"))
+        return iters if iters > 0 else None
+    except ValueError:
+        return None
 
 
 def _find_baseline_training_log(net_type: Optional[str]) -> Optional[Path]:
@@ -873,16 +940,8 @@ def estimate_sweep_serial_equiv_s(
     except Exception:
         return None
 
-    # Infer the target iteration count (single value or binary default).
-    target_iters: Optional[int] = None
-    if sweep_config.iterations is not None:
-        if len(sweep_config.iterations) == 1:
-            target_iters = int(sweep_config.iterations[0])
-    if target_iters is None:
-        try:
-            target_iters = int(binary_defaults.get("iterations", "0"))
-        except ValueError:
-            target_iters = None
+    # Infer the target iteration count (single value, or preset, or binary default).
+    target_iters = _infer_effective_iterations(sweep_config, binary_defaults)
     if not target_iters or target_iters <= 0:
         return None
 
@@ -983,6 +1042,9 @@ Examples:
   # Basic sweep with learning rate variations
   python parallel_sweep.py --learning-rate 0.001,0.01,0.1
 
+  # Run from a named preset and only sweep selected fields
+  python parallel_sweep.py --preset cnn_5x5k4_transfer --learning-rate 0.0015,0.002
+
   # Optimizer + LR schedule comparison
   python parallel_sweep.py --optimizer sgd,adamw --lr-schedule constant,cosine --learning-rate 0.01,0.02
 
@@ -1006,6 +1068,7 @@ Examples:
     # Training hyperparameters — defaults come from the binary, not duplicated here
     param_group = parser.add_argument_group('training hyperparameters')
     param_group.add_argument('--seed', help='Training seed')
+    param_group.add_argument('--preset', help='Training preset name or JSON path (passed to train_alphazero --preset)')
     param_group.add_argument('--iterations', '-i', help='Training iterations')
     param_group.add_argument('--games', '-g', help='Games per iteration')
     param_group.add_argument('--epochs', '-e', help='Training epochs')
@@ -1024,6 +1087,7 @@ Examples:
     param_group.add_argument('--board-width', help='Board width for training')
     param_group.add_argument('--win-k', help='Win condition K in a row')
     param_group.add_argument('--init-model-path', help='Initialize model from checkpoint path')
+    param_group.add_argument('--fixed-suite-every', help='Run fixed-suite eval every N iterations (0 disables)')
     param_group.add_argument('--tournament-games', '-tg', help='Games per tournament matchup (default: 100)')
 
     # Advanced parameter group
@@ -1069,13 +1133,23 @@ Examples:
     print(f"Generated {len(experiments)} experiments from parameter combinations")
 
     # Show parameters using binary defaults (not specified in this sweep)
+    preset_defaults: Dict[str, object] = {}
+    if sweep_config.preset is not None and len(sweep_config.preset) == 1:
+        preset_defaults = _load_preset_dict(str(sweep_config.preset[0]))
+
     print(f"\nParameters using binary defaults (not swept):")
     has_defaults = False
     for config_attr, _, binary_flag, _, display_name, _ in PARAM_TABLE:
         if getattr(sweep_config, config_attr) is None:
-            flag_key = binary_flag.lstrip('-')
-            default_val = binary_defaults.get(flag_key, '?')
-            print(f"   {display_name}: {default_val}")
+            if config_attr in preset_defaults:
+                default_val = _format_display_value(preset_defaults.get(config_attr))
+                print(f"   {display_name}: {default_val} (from preset)")
+            else:
+                flag_key = binary_flag.lstrip('-')
+                default_val = binary_defaults.get(flag_key)
+                if default_val is None:
+                    default_val = "(none)" if config_attr in {"preset", "init_model_path"} else "?"
+                print(f"   {display_name}: {default_val}")
             has_defaults = True
     if not has_defaults:
         print("   (All parameters explicitly set)")
@@ -1139,7 +1213,7 @@ Examples:
         high_min = serial_equiv_s / 60.0
         effective_net_type = _infer_effective_net_type(sweep_config, binary_defaults)
         try:
-            iters = int((sweep_config.iterations or [int(binary_defaults.get("iterations", "0"))])[0])
+            iters = _infer_effective_iterations(sweep_config, binary_defaults)
         except Exception:
             iters = None
 
@@ -1166,11 +1240,11 @@ Examples:
     if serial_equiv_s is not None and serial_equiv_s > 0:
         effective_net_type = _infer_effective_net_type(sweep_config, binary_defaults)
         try:
-            iters = int((sweep_config.iterations or [int(binary_defaults.get("iterations", "0"))])[0])
+            iters = _infer_effective_iterations(sweep_config, binary_defaults)
         except Exception:
             iters = None
         _append_eta_history({
-            "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "timestamp": datetime.now(UTC).isoformat(timespec="seconds"),
             "sweep_name": args.sweep_name,
             "net_type": effective_net_type,
             "jobs": sweep.max_parallel_jobs,

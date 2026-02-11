@@ -33,14 +33,15 @@ bash build.sh
 
 Key flags:
 - `--iterations N` — self-play/train cycles (default: 100)
+- `--preset NAME|PATH` — load a named JSON preset from `configs/train/` (or explicit path). CLI flags override preset values.
 - `--games-per-iter N` — games per self-play phase (default: 1000)
 - `--mcts-simulations N` — MCTS sims per move (default: 50)
 - `--epochs N` — training epochs per iteration (default: 8)
-- `--learning-rate F` — SGD learning rate (default: 0.02)
+- `--learning-rate F` — SGD learning rate (default: 0.0015)
 - `--optimizer sgd|adamw` — optimizer (default: sgd)
 - `--lr-schedule constant|step|cosine` — LR schedule (default: step)
 - `--lr-decay-step N` — step schedule interval (default: 25)
-- `--lr-decay-gamma F` — step decay factor (default: 0.65)
+- `--lr-decay-gamma F` — step decay factor (default: 0.45)
 - `--value-weight F` — value-loss weight (default: 2.0)
 - `--temperature F` — opening move temperature (default: 1.25)
 - `--temperature-cutoff-moves N` — opening moves with non-zero temperature (default: 1)
@@ -50,6 +51,17 @@ Key flags:
 - `--board-width N` — square board width (default: 3)
 - `--win-k N` — K in a row to win (default: 3)
 - `--init-model-path PATH` — warm-start from an existing checkpoint (useful for transfer learning)
+
+Preset examples:
+
+```bash
+# 3x3 production baseline (old strong 3x3 settings)
+./target/release/train_alphazero --preset cnn_3x3_prod
+
+# 5x5 k=4 transfer baseline (current transfer settings)
+./target/release/train_alphazero --preset cnn_5x5k4_transfer \
+  --init-model-path research_runs/transfer_ab/seed_20260209/b5_k4/cnn_3x3k3_seed20260209.bin
+```
 
 MiniBT4 baseline run (recommended starting point):
 
@@ -70,7 +82,7 @@ MiniBT4 baseline run (recommended starting point):
 The CNN architecture has board-agnostic heads, so you can initialize a larger-board CNN from a 3x3 checkpoint.
 
 Notes:
-- The fixed-suite `vs_Deep` evaluation currently targets `3x3 k=3` only. For other boards, run with `--fixed-suite-every 0`.
+- Fixed-suite evaluation now follows `--board-width` and `--win-k`. For larger boards, consider reducing `--fixed-suite-openings` / `--fixed-suite-sims` or evaluating every few iterations (`--fixed-suite-every 5`) to control wall-clock.
 
 Scratch vs transfer example (5x5, still k=3 to keep the win condition comparable):
 

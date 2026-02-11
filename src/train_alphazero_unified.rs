@@ -7,7 +7,7 @@ use burn::optim::{AdamWConfig, GradientsParams, Optimizer, SgdConfig};
 use burn::prelude::*;
 use burn::tensor::activation;
 use burn::tensor::backend::AutodiffBackend;
-use clap::{Parser, ValueEnum};
+use clap::{parser::ValueSource, ArgMatches, CommandFactory, FromArgMatches, Parser, ValueEnum};
 use mnk::fixed_suite_eval::{
     evaluate_fixed_suite_vs_deep_inprocess, FixedSuiteConfig, FixedSuiteDeepEvaluation,
 };
@@ -15,7 +15,9 @@ use mnk::network::{Network, NetworkType};
 use mnk::unified_mcts::{GameConfig as MctsGameConfig, NetworkInference, TrainingExample};
 use rand::Rng;
 use rand::SeedableRng;
+use serde::Deserialize;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 /// Query GPU VRAM usage via nvidia-smi. Returns (used_mb, total_mb) or None.
 fn gpu_vram_mb() -> Option<(u64, u64)> {
@@ -313,14 +315,13 @@ where
     B: Backend<FloatElem = f32>,
     N: NetworkInference<B>,
 {
-    if args.board_width != 3 || args.win_k != 3 {
-        return None;
-    }
     if args.fixed_suite_every == 0 || iteration % args.fixed_suite_every != 0 {
         return None;
     }
 
     let cfg = FixedSuiteConfig {
+        board_width: args.board_width,
+        win_k: args.win_k,
         openings: args.fixed_suite_openings,
         sides: args.fixed_suite_sides,
         sims: args.fixed_suite_sims,
@@ -343,13 +344,15 @@ fn derive_seed(base: u64, iteration: usize, tag: u64) -> u64 {
     base ^ (iteration as u64).wrapping_mul(0x9E3779B97F4A7C15) ^ tag
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug, ValueEnum, Deserialize)]
+#[serde(rename_all = "lowercase")]
 enum OptimizerChoice {
     Sgd,
     Adamw,
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug, ValueEnum, Deserialize)]
+#[serde(rename_all = "lowercase")]
 enum LrScheduleChoice {
     Constant,
     Step,
@@ -382,6 +385,11 @@ fn learning_rate_for_iteration(args: &Args, iteration: usize) -> f64 {
 #[command(name = "train_alphazero")]
 #[command(about = "Train AlphaZero neural network with configurable hyperparameters")]
 struct Args {
+    /// Named training preset (JSON under configs/train/*.json, or explicit JSON path).
+    /// CLI flags override preset values.
+    #[arg(long)]
+    preset: Option<String>,
+
     /// Number of training iterations
     #[arg(short, long, default_value = "100")]
     iterations: usize,
@@ -398,8 +406,8 @@ struct Args {
     #[arg(short, long, default_value = "256")]
     batch_size: usize,
 
-    /// Learning rate for optimizer (SGD default: 0.02)
-    #[arg(long, default_value = "0.02")]
+    /// Learning rate for optimizer (SGD default: 0.0015)
+    #[arg(long, default_value = "0.0015")]
     learning_rate: f64,
 
     /// Optimizer type
@@ -411,7 +419,7 @@ struct Args {
     lr_schedule: LrScheduleChoice,
 
     /// Step schedule decay factor (used when --lr-schedule step)
-    #[arg(long, default_value = "0.65")]
+    #[arg(long, default_value = "0.45")]
     lr_decay_gamma: f64,
 
     /// Step schedule interval in iterations (used when --lr-schedule step)
@@ -512,8 +520,285 @@ struct Args {
     promote_on_vs_deep_improvement: bool,
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct TrainPreset {
+    iterations: Option<usize>,
+    games_per_iter: Option<usize>,
+    epochs: Option<usize>,
+    batch_size: Option<usize>,
+    learning_rate: Option<f64>,
+    optimizer: Option<OptimizerChoice>,
+    lr_schedule: Option<LrScheduleChoice>,
+    lr_decay_gamma: Option<f64>,
+    lr_decay_step: Option<usize>,
+    lr_min_ratio: Option<f64>,
+    value_weight: Option<f32>,
+    mcts_simulations: Option<usize>,
+    cpuct: Option<f32>,
+    init_model_path: Option<String>,
+    net_type: Option<String>,
+    board_width: Option<usize>,
+    win_k: Option<usize>,
+    temperature: Option<f32>,
+    temperature_cutoff_moves: Option<usize>,
+    dirichlet_alpha: Option<f64>,
+    seed: Option<u64>,
+    replay_buffer_size: Option<usize>,
+    fixed_suite_every: Option<usize>,
+    fixed_suite_openings: Option<usize>,
+    fixed_suite_sides: Option<usize>,
+    fixed_suite_sims: Option<usize>,
+    fixed_suite_cpuct: Option<f32>,
+    fixed_suite_max_plies: Option<usize>,
+    fixed_suite_seed: Option<u64>,
+    promote_on_vs_deep_improvement: Option<bool>,
+}
+
+fn available_presets() -> Vec<String> {
+    let mut presets = Vec::new();
+    let dir = Path::new("configs/train");
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) {
+                presets.push(stem.to_string());
+            }
+        }
+    }
+    presets.sort();
+    presets
+}
+
+fn resolve_preset_path(preset: &str) -> Option<PathBuf> {
+    let direct = PathBuf::from(preset);
+    if direct.exists() {
+        return Some(direct);
+    }
+
+    let dir = Path::new("configs/train");
+    let explicit_in_dir = dir.join(preset);
+    if explicit_in_dir.exists() {
+        return Some(explicit_in_dir);
+    }
+
+    if !preset.ends_with(".json") {
+        let with_ext = dir.join(format!("{preset}.json"));
+        if with_ext.exists() {
+            return Some(with_ext);
+        }
+    }
+    None
+}
+
+fn load_train_preset(preset: &str) -> Result<(TrainPreset, PathBuf), String> {
+    let path = resolve_preset_path(preset).ok_or_else(|| {
+        let available = available_presets();
+        if available.is_empty() {
+            format!(
+                "Preset '{preset}' not found (tried '{preset}' and configs/train/{preset}.json)"
+            )
+        } else {
+            format!(
+                "Preset '{preset}' not found (tried '{preset}' and configs/train/{preset}.json). Available presets: {}",
+                available.join(", ")
+            )
+        }
+    })?;
+
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|e| format!("Failed reading preset '{}': {e}", path.display()))?;
+    let parsed: TrainPreset = serde_json::from_str(&raw)
+        .map_err(|e| format!("Failed parsing preset '{}': {e}", path.display()))?;
+    Ok((parsed, path))
+}
+
+fn is_cli_override(matches: &ArgMatches, arg_id: &str) -> bool {
+    matches.value_source(arg_id) == Some(ValueSource::CommandLine)
+}
+
+fn apply_clone_if_not_cli<T: Clone>(
+    target: &mut T,
+    preset_value: Option<T>,
+    matches: &ArgMatches,
+    arg_id: &str,
+) {
+    if is_cli_override(matches, arg_id) {
+        return;
+    }
+    if let Some(value) = preset_value {
+        *target = value;
+    }
+}
+
+fn apply_train_preset(args: &mut Args, matches: &ArgMatches) -> Result<Option<PathBuf>, String> {
+    let Some(ref preset_name) = args.preset else {
+        return Ok(None);
+    };
+
+    let (preset, preset_path) = load_train_preset(preset_name)?;
+
+    apply_clone_if_not_cli(&mut args.iterations, preset.iterations, matches, "iterations");
+    apply_clone_if_not_cli(
+        &mut args.games_per_iter,
+        preset.games_per_iter,
+        matches,
+        "games_per_iter",
+    );
+    apply_clone_if_not_cli(&mut args.epochs, preset.epochs, matches, "epochs");
+    apply_clone_if_not_cli(&mut args.batch_size, preset.batch_size, matches, "batch_size");
+    apply_clone_if_not_cli(
+        &mut args.learning_rate,
+        preset.learning_rate,
+        matches,
+        "learning_rate",
+    );
+    apply_clone_if_not_cli(&mut args.optimizer, preset.optimizer, matches, "optimizer");
+    apply_clone_if_not_cli(
+        &mut args.lr_schedule,
+        preset.lr_schedule,
+        matches,
+        "lr_schedule",
+    );
+    apply_clone_if_not_cli(
+        &mut args.lr_decay_gamma,
+        preset.lr_decay_gamma,
+        matches,
+        "lr_decay_gamma",
+    );
+    apply_clone_if_not_cli(
+        &mut args.lr_decay_step,
+        preset.lr_decay_step,
+        matches,
+        "lr_decay_step",
+    );
+    apply_clone_if_not_cli(
+        &mut args.lr_min_ratio,
+        preset.lr_min_ratio,
+        matches,
+        "lr_min_ratio",
+    );
+    apply_clone_if_not_cli(
+        &mut args.value_weight,
+        preset.value_weight,
+        matches,
+        "value_weight",
+    );
+    apply_clone_if_not_cli(
+        &mut args.mcts_simulations,
+        preset.mcts_simulations,
+        matches,
+        "mcts_simulations",
+    );
+    apply_clone_if_not_cli(&mut args.cpuct, preset.cpuct, matches, "cpuct");
+    if !is_cli_override(matches, "init_model_path") {
+        if let Some(path) = preset.init_model_path {
+            args.init_model_path = Some(path);
+        }
+    }
+    apply_clone_if_not_cli(&mut args.net_type, preset.net_type, matches, "net_type");
+    apply_clone_if_not_cli(
+        &mut args.board_width,
+        preset.board_width,
+        matches,
+        "board_width",
+    );
+    apply_clone_if_not_cli(&mut args.win_k, preset.win_k, matches, "win_k");
+    apply_clone_if_not_cli(
+        &mut args.temperature,
+        preset.temperature,
+        matches,
+        "temperature",
+    );
+    apply_clone_if_not_cli(
+        &mut args.temperature_cutoff_moves,
+        preset.temperature_cutoff_moves,
+        matches,
+        "temperature_cutoff_moves",
+    );
+    apply_clone_if_not_cli(
+        &mut args.dirichlet_alpha,
+        preset.dirichlet_alpha,
+        matches,
+        "dirichlet_alpha",
+    );
+    apply_clone_if_not_cli(&mut args.seed, preset.seed, matches, "seed");
+    apply_clone_if_not_cli(
+        &mut args.replay_buffer_size,
+        preset.replay_buffer_size,
+        matches,
+        "replay_buffer_size",
+    );
+    apply_clone_if_not_cli(
+        &mut args.fixed_suite_every,
+        preset.fixed_suite_every,
+        matches,
+        "fixed_suite_every",
+    );
+    apply_clone_if_not_cli(
+        &mut args.fixed_suite_openings,
+        preset.fixed_suite_openings,
+        matches,
+        "fixed_suite_openings",
+    );
+    apply_clone_if_not_cli(
+        &mut args.fixed_suite_sides,
+        preset.fixed_suite_sides,
+        matches,
+        "fixed_suite_sides",
+    );
+    apply_clone_if_not_cli(
+        &mut args.fixed_suite_sims,
+        preset.fixed_suite_sims,
+        matches,
+        "fixed_suite_sims",
+    );
+    apply_clone_if_not_cli(
+        &mut args.fixed_suite_cpuct,
+        preset.fixed_suite_cpuct,
+        matches,
+        "fixed_suite_cpuct",
+    );
+    apply_clone_if_not_cli(
+        &mut args.fixed_suite_max_plies,
+        preset.fixed_suite_max_plies,
+        matches,
+        "fixed_suite_max_plies",
+    );
+    apply_clone_if_not_cli(
+        &mut args.fixed_suite_seed,
+        preset.fixed_suite_seed,
+        matches,
+        "fixed_suite_seed",
+    );
+    apply_clone_if_not_cli(
+        &mut args.promote_on_vs_deep_improvement,
+        preset.promote_on_vs_deep_improvement,
+        matches,
+        "promote_on_vs_deep_improvement",
+    );
+
+    Ok(Some(preset_path))
+}
+
+fn parse_args_with_preset() -> (Args, Option<PathBuf>) {
+    let matches = Args::command().get_matches();
+    let mut args = Args::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+    let preset_path = match apply_train_preset(&mut args, &matches) {
+        Ok(path) => path,
+        Err(err) => {
+            eprintln!("❌ {err}");
+            std::process::exit(2);
+        }
+    };
+    (args, preset_path)
+}
+
 fn main() {
-    let args = Args::parse();
+    let (args, applied_preset_path) = parse_args_with_preset();
     assert!(
         args.learning_rate > 0.0,
         "learning-rate must be > 0, got {}",
@@ -663,6 +948,9 @@ fn main() {
     let learning_rate = args.learning_rate;
 
     println!("Training Configuration:");
+    if let Some(path) = &applied_preset_path {
+        println!("  Preset: {}", path.display());
+    }
     println!("  Iterations: {}", iterations);
     println!("  Games per iteration: {}", games_per_iter);
     println!("  Epochs: {}", epochs);
@@ -694,10 +982,13 @@ fn main() {
     println!("  Dirichlet alpha: {}", args.dirichlet_alpha);
     println!("  Seed: {}", args.seed);
     println!("  Replay buffer size: {}", args.replay_buffer_size);
-    if args.fixed_suite_every > 0 && board_width == 3 && win_k == 3 {
+    if args.fixed_suite_every > 0 {
         println!(
-            "  Fixed-suite eval (Deep): every {} iters (openings={}, sides={}, sims={}, cpuct={}, max_plies={}, seed={})",
+            "  Fixed-suite eval (Deep): every {} iters (board={}x{} k={}, openings={}, sides={}, sims={}, cpuct={}, max_plies={}, seed={})",
             args.fixed_suite_every,
+            board_width,
+            board_width,
+            win_k,
             args.fixed_suite_openings,
             args.fixed_suite_sides,
             args.fixed_suite_sims,
@@ -705,13 +996,8 @@ fn main() {
             args.fixed_suite_max_plies,
             args.fixed_suite_seed
         );
-    } else if args.fixed_suite_every == 0 {
-        println!("  Fixed-suite eval: disabled");
     } else {
-        println!(
-            "  Fixed-suite eval: disabled for {}x{} k={} (suite currently targets 3x3 k=3)",
-            board_width, board_width, win_k
-        );
+        println!("  Fixed-suite eval: disabled");
     }
     println!();
 

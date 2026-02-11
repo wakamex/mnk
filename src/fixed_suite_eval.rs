@@ -8,19 +8,6 @@ use std::time::Instant;
 
 use crate::unified_mcts::{mcts_search_with_hyperparams, GameConfig, NetworkInference};
 
-const BOARD_LEN: usize = 9;
-const WIN_LINES: [[usize; 3]; 8] = [
-    [0, 1, 2],
-    [3, 4, 5],
-    [6, 7, 8],
-    [0, 3, 6],
-    [1, 4, 7],
-    [2, 5, 8],
-    [0, 4, 8],
-    [2, 4, 6],
-];
-const OPENING_MOVE_ORDER: [usize; BOARD_LEN] = [4, 0, 2, 6, 8, 1, 3, 5, 7];
-
 #[derive(Clone, Copy, Debug)]
 pub struct FixedSuiteMetrics {
     pub vs_deep: f32,
@@ -119,6 +106,8 @@ pub struct FixedSuiteDeepTiming {
 
 #[derive(Debug, Clone)]
 pub struct FixedSuiteConfig {
+    pub board_width: usize,
+    pub win_k: usize,
     pub openings: usize,
     pub sides: usize,
     pub sims: usize,
@@ -131,6 +120,8 @@ pub struct FixedSuiteConfig {
 impl Default for FixedSuiteConfig {
     fn default() -> Self {
         Self {
+            board_width: 3,
+            win_k: 3,
             openings: 25,
             sides: 2,
             sims: 100,
@@ -189,14 +180,14 @@ impl GameOutcome {
 
 #[derive(Clone, Debug)]
 struct OpeningState {
-    board: [Option<u8>; BOARD_LEN],
+    board: Vec<Option<u8>>,
     current_player: u8,
 }
 
 impl OpeningState {
-    fn new() -> Self {
+    fn new(board_size: usize) -> Self {
         Self {
-            board: [None; BOARD_LEN],
+            board: vec![None; board_size],
             current_player: 0,
         }
     }
@@ -210,8 +201,8 @@ impl OpeningState {
 }
 
 fn state_key(state: &OpeningState) -> String {
-    let mut key = String::with_capacity(BOARD_LEN + 1);
-    for cell in state.board {
+    let mut key = String::with_capacity(state.board.len() + 1);
+    for cell in &state.board {
         key.push(match cell {
             Some(0) => 'X',
             Some(1) => 'O',
@@ -226,77 +217,135 @@ fn opening_plies(state: &OpeningState) -> usize {
     state.board.iter().filter(|cell| cell.is_some()).count()
 }
 
-fn legal_moves(board: &[Option<u8>; BOARD_LEN]) -> Vec<usize> {
+fn legal_moves(board: &[Option<u8>]) -> Vec<usize> {
     board
         .iter()
         .enumerate()
-        .filter_map(|(idx, cell)| if cell.is_none() { Some(idx) } else { None })
+        .filter_map(|(i, cell)| if cell.is_none() { Some(i) } else { None })
         .collect()
 }
 
-fn check_winner(board: &[Option<u8>; BOARD_LEN]) -> Option<u8> {
-    for line in WIN_LINES {
-        let a = board[line[0]];
-        let b = board[line[1]];
-        let c = board[line[2]];
-        if let (Some(pa), Some(pb), Some(pc)) = (a, b, c) {
-            if pa == pb && pb == pc {
-                return Some(pa);
+fn check_winner(board: &[Option<u8>], cfg: GameConfig) -> Option<u8> {
+    let w = cfg.board_width as isize;
+    let k = cfg.win_k as isize;
+    let dirs: [(isize, isize); 4] = [(1, 0), (0, 1), (1, 1), (-1, 1)];
+
+    for row in 0..w {
+        for col in 0..w {
+            let start = (row * w + col) as usize;
+            let Some(p) = board[start] else { continue };
+
+            for (dx, dy) in dirs {
+                let end_col = col + (k - 1) * dx;
+                let end_row = row + (k - 1) * dy;
+                if end_col < 0 || end_col >= w || end_row < 0 || end_row >= w {
+                    continue;
+                }
+
+                let mut all_match = true;
+                for step in 1..k {
+                    let nc = col + step * dx;
+                    let nr = row + step * dy;
+                    let nidx = (nr * w + nc) as usize;
+                    if board[nidx] != Some(p) {
+                        all_match = false;
+                        break;
+                    }
+                }
+                if all_match {
+                    return Some(p);
+                }
             }
         }
     }
     None
 }
 
-fn is_terminal(board: &[Option<u8>; BOARD_LEN]) -> bool {
-    check_winner(board).is_some() || board.iter().all(|cell| cell.is_some())
+fn is_terminal(board: &[Option<u8>], cfg: GameConfig) -> bool {
+    check_winner(board, cfg).is_some() || board.iter().all(|cell| cell.is_some())
 }
 
-fn count_unblocked_threats(board: &[Option<u8>; BOARD_LEN], player: u8, needed: usize) -> usize {
+fn count_unblocked_threats(board: &[Option<u8>], cfg: GameConfig, player: u8, needed: usize) -> usize {
+    if needed == 0 || needed >= cfg.win_k {
+        return 0;
+    }
+
+    let w = cfg.board_width as isize;
+    let k = cfg.win_k as isize;
     let opponent = 1 - player;
-    WIN_LINES
-        .iter()
-        .filter(|line| {
-            let mut player_count = 0usize;
-            for idx in **line {
-                match board[idx] {
-                    Some(p) if p == opponent => return false,
-                    Some(p) if p == player => player_count += 1,
-                    _ => {}
+    let dirs: [(isize, isize); 4] = [(1, 0), (0, 1), (1, 1), (-1, 1)];
+    let mut count = 0usize;
+
+    for row in 0..w {
+        for col in 0..w {
+            for (dx, dy) in dirs {
+                let end_col = col + (k - 1) * dx;
+                let end_row = row + (k - 1) * dy;
+                if end_col < 0 || end_col >= w || end_row < 0 || end_row >= w {
+                    continue;
+                }
+
+                let mut player_count = 0usize;
+                let mut blocked = false;
+                let mut empty_count = 0usize;
+
+                for step in 0..k {
+                    let nc = col + step * dx;
+                    let nr = row + step * dy;
+                    let nidx = (nr * w + nc) as usize;
+                    match board[nidx] {
+                        Some(p) if p == opponent => {
+                            blocked = true;
+                            break;
+                        }
+                        Some(p) if p == player => player_count += 1,
+                        _ => empty_count += 1,
+                    }
+                }
+
+                if !blocked && player_count == needed && empty_count > 0 {
+                    count += 1;
                 }
             }
-            player_count == needed
-        })
-        .count()
+        }
+    }
+
+    count
 }
 
-fn evaluate_board(board: &[Option<u8>; BOARD_LEN]) -> f64 {
-    if let Some(winner) = check_winner(board) {
+fn evaluate_board(board: &[Option<u8>], cfg: GameConfig) -> f64 {
+    if let Some(winner) = check_winner(board, cfg) {
         return if winner == 0 { 1.0 } else { -1.0 };
     }
     if board.iter().all(|cell| cell.is_some()) {
         return 0.0;
     }
 
-    let threat_diff =
-        count_unblocked_threats(board, 0, 2) as f64 - count_unblocked_threats(board, 1, 2) as f64;
-    (threat_diff * 0.1).clamp(-0.9, 0.9)
+    let strong_needed = cfg.win_k.saturating_sub(1);
+    let weak_needed = cfg.win_k.saturating_sub(2);
+    let strong_diff = count_unblocked_threats(board, cfg, 0, strong_needed) as f64
+        - count_unblocked_threats(board, cfg, 1, strong_needed) as f64;
+    let weak_diff = count_unblocked_threats(board, cfg, 0, weak_needed) as f64
+        - count_unblocked_threats(board, cfg, 1, weak_needed) as f64;
+
+    (strong_diff * 0.25 + weak_diff * 0.05).clamp(-0.9, 0.9)
 }
 
 fn minimax_recursive(
-    board: &mut [Option<u8>; BOARD_LEN],
+    board: &mut [Option<u8>],
+    cfg: GameConfig,
     current_player: u8,
     depth: usize,
     mut alpha: f64,
     mut beta: f64,
 ) -> (f64, Option<usize>) {
-    if depth == 0 || is_terminal(board) {
-        return (evaluate_board(board), None);
+    if depth == 0 || is_terminal(board, cfg) {
+        return (evaluate_board(board, cfg), None);
     }
 
     let legal = legal_moves(board);
     if legal.is_empty() {
-        return (evaluate_board(board), None);
+        return (evaluate_board(board, cfg), None);
     }
 
     let maximizing = current_player == 0;
@@ -306,7 +355,7 @@ fn minimax_recursive(
         let mut best_score = f64::NEG_INFINITY;
         for mv in legal {
             board[mv] = Some(current_player);
-            let (score, _) = minimax_recursive(board, 1 - current_player, depth - 1, alpha, beta);
+            let (score, _) = minimax_recursive(board, cfg, 1 - current_player, depth - 1, alpha, beta);
             board[mv] = None;
 
             if score > best_score {
@@ -323,7 +372,7 @@ fn minimax_recursive(
         let mut best_score = f64::INFINITY;
         for mv in legal {
             board[mv] = Some(current_player);
-            let (score, _) = minimax_recursive(board, 1 - current_player, depth - 1, alpha, beta);
+            let (score, _) = minimax_recursive(board, cfg, 1 - current_player, depth - 1, alpha, beta);
             board[mv] = None;
 
             if score < best_score {
@@ -339,15 +388,16 @@ fn minimax_recursive(
     }
 }
 
-fn minimax_move(state: &OpeningState, depth: usize) -> usize {
+fn minimax_move(state: &OpeningState, cfg: GameConfig, depth: usize) -> usize {
     let legal = legal_moves(&state.board);
     if legal.len() == 1 {
         return legal[0];
     }
 
-    let mut board = state.board;
+    let mut board = state.board.clone();
     let (_, best) = minimax_recursive(
         &mut board,
+        cfg,
         state.current_player,
         depth,
         f64::NEG_INFINITY,
@@ -361,7 +411,7 @@ fn seeded_random_move(state: &OpeningState, seed: u64) -> usize {
     let mut hasher = DefaultHasher::new();
     seed.hash(&mut hasher);
     state.current_player.hash(&mut hasher);
-    for cell in state.board {
+    for cell in &state.board {
         cell.hash(&mut hasher);
     }
     let idx = (hasher.finish() as usize) % legal.len();
@@ -371,18 +421,14 @@ fn seeded_random_move(state: &OpeningState, seed: u64) -> usize {
 fn az_move<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
     net: &N,
     state: &OpeningState,
+    cfg_game: GameConfig,
     sims: usize,
     cpuct: f32,
 ) -> usize {
-    let cfg_game = GameConfig {
-        board_width: 3,
-        win_k: 3,
-    };
-    let board_vec = state.board.to_vec();
     let policy = mcts_search_with_hyperparams(
         net,
         cfg_game,
-        &board_vec,
+        &state.board,
         state.current_player,
         sims,
         false,
@@ -408,11 +454,12 @@ fn play_game_from_opening<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
     az_player: u8,
     opponent: Opponent,
     cfg: &FixedSuiteConfig,
+    cfg_game: GameConfig,
 ) -> GameOutcome {
     let mut state = opening.clone();
 
     loop {
-        if let Some(winner) = check_winner(&state.board) {
+        if let Some(winner) = check_winner(&state.board, cfg_game) {
             return GameOutcome::Winner(winner);
         }
 
@@ -422,9 +469,9 @@ fn play_game_from_opening<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
         }
 
         let mv = if state.current_player == az_player {
-            az_move(net, &state, cfg.sims, cfg.cpuct)
+            az_move(net, &state, cfg_game, cfg.sims, cfg.cpuct)
         } else if let Some(depth) = opponent.minimax_depth() {
-            minimax_move(&state, depth)
+            minimax_move(&state, cfg_game, depth)
         } else {
             seeded_random_move(&state, cfg.seed)
         };
@@ -437,33 +484,47 @@ fn play_game_from_opening<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
     }
 }
 
-fn generate_fixed_openings(num_openings: usize, max_plies: usize) -> Vec<OpeningState> {
+fn opening_move_order(board_width: usize) -> Vec<usize> {
+    // Center-first deterministic ordering (ties: row-major).
+    let center2 = (board_width as isize) - 1; // doubled center coordinate
+    let mut moves: Vec<usize> = (0..board_width * board_width).collect();
+    moves.sort_by_key(|&mv| {
+        let row = (mv / board_width) as isize;
+        let col = (mv % board_width) as isize;
+        let dist = (2 * row - center2).abs() + (2 * col - center2).abs();
+        (dist, row, col)
+    });
+    moves
+}
+
+fn generate_fixed_openings(num_openings: usize, max_plies: usize, cfg_game: GameConfig) -> Vec<OpeningState> {
     let mut openings = Vec::with_capacity(num_openings);
     let mut queue = VecDeque::new();
     let mut seen = HashSet::new();
+    let move_order = opening_move_order(cfg_game.board_width);
 
-    let root = OpeningState::new();
+    let root = OpeningState::new(cfg_game.board_size());
     seen.insert(state_key(&root));
     queue.push_back(root);
 
     while let Some(state) = queue.pop_front() {
-        if !is_terminal(&state.board) {
+        if !is_terminal(&state.board, cfg_game) {
             openings.push(state.clone());
             if openings.len() >= num_openings {
                 break;
             }
         }
 
-        if is_terminal(&state.board) || opening_plies(&state) >= max_plies {
+        if is_terminal(&state.board, cfg_game) || opening_plies(&state) >= max_plies {
             continue;
         }
 
-        for mv in OPENING_MOVE_ORDER {
+        for &mv in &move_order {
             if state.board[mv].is_some() {
                 continue;
             }
             let next = state.make_move(mv);
-            if is_terminal(&next.board) {
+            if is_terminal(&next.board, cfg_game) {
                 continue;
             }
             let key = state_key(&next);
@@ -515,6 +576,7 @@ fn prepare_csv_writer(
 fn evaluate_matchup<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
     net: &N,
     cfg: &FixedSuiteConfig,
+    cfg_game: GameConfig,
     openings: &[OpeningState],
     opponent: Opponent,
     csv_writer: &mut Option<std::io::BufWriter<std::fs::File>>,
@@ -529,7 +591,7 @@ fn evaluate_matchup<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
                 1 - opening.current_player
             };
 
-            let outcome = play_game_from_opening(net, opening, az_player, opponent, cfg);
+            let outcome = play_game_from_opening(net, opening, az_player, opponent, cfg, cfg_game);
             let az_score = aggregate.record_outcome(outcome, az_player);
 
             if let Some(writer) = csv_writer.as_mut() {
@@ -582,8 +644,21 @@ fn evaluate_fixed_suite_with_opponents<B: Backend<FloatElem = f32>, N: NetworkIn
     if cfg.sides == 0 {
         return Err("sides must be >= 1".to_string());
     }
+    if cfg.board_width == 0 {
+        return Err("board_width must be >= 1".to_string());
+    }
+    if cfg.win_k == 0 || cfg.win_k > cfg.board_width {
+        return Err(format!(
+            "win_k must be in [1, board_width], got win_k={} board_width={}",
+            cfg.win_k, cfg.board_width
+        ));
+    }
 
-    let openings = generate_fixed_openings(cfg.openings, cfg.max_plies.max(1));
+    let cfg_game = GameConfig {
+        board_width: cfg.board_width,
+        win_k: cfg.win_k,
+    };
+    let openings = generate_fixed_openings(cfg.openings, cfg.max_plies.max(1), cfg_game);
     if openings.len() < cfg.openings {
         return Err(format!(
             "only generated {} openings (requested {}), increase max_plies",
@@ -606,7 +681,7 @@ fn evaluate_fixed_suite_with_opponents<B: Backend<FloatElem = f32>, N: NetworkIn
 
     for &opponent in opponents {
         let start = Instant::now();
-        let result = evaluate_matchup(net, cfg, &openings, opponent, &mut csv_writer)?;
+        let result = evaluate_matchup(net, cfg, cfg_game, &openings, opponent, &mut csv_writer)?;
         let elapsed_s = start.elapsed().as_secs_f32();
         match opponent {
             Opponent::Deep => {
@@ -673,16 +748,38 @@ mod tests {
 
     #[test]
     fn generates_requested_openings() {
-        let openings = generate_fixed_openings(10, 4);
+        let cfg = GameConfig {
+            board_width: 3,
+            win_k: 3,
+        };
+        let openings = generate_fixed_openings(10, 4, cfg);
         assert_eq!(openings.len(), 10);
     }
 
     #[test]
-    fn winner_detection_works() {
-        let mut board = [None; BOARD_LEN];
+    fn winner_detection_works_3x3() {
+        let cfg = GameConfig {
+            board_width: 3,
+            win_k: 3,
+        };
+        let mut board = vec![None; 9];
         board[0] = Some(0);
         board[1] = Some(0);
         board[2] = Some(0);
-        assert_eq!(check_winner(&board), Some(0));
+        assert_eq!(check_winner(&board, cfg), Some(0));
+    }
+
+    #[test]
+    fn winner_detection_works_5x5k4() {
+        let cfg = GameConfig {
+            board_width: 5,
+            win_k: 4,
+        };
+        let mut board = vec![None; 25];
+        board[5] = Some(1);
+        board[11] = Some(1);
+        board[17] = Some(1);
+        board[23] = Some(1);
+        assert_eq!(check_winner(&board, cfg), Some(1));
     }
 }

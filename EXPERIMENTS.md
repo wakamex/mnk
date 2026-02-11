@@ -21,10 +21,10 @@ Key additions in code:
 Critical finding:
 - Many legacy checkpoints are not loadable with the current recorder path (`Utf8` record error). Earlier sweeps that allowed fallback-to-untrained were partly invalid for model ranking.
 
-## Current defaults (as of 2026-02-08)
+## Current defaults (as of 2026-02-11)
 
 - `--iterations`: `100`
-- `--learning-rate`: `0.02`
+- `--learning-rate`: `0.0015`
 - `--mcts-simulations`: `50`
 - `--value-weight`: `2.0`
 - `--temperature`: `1.25`
@@ -34,7 +34,14 @@ Critical finding:
 - `--optimizer`: `sgd`
 - `--lr-schedule`: `step`
 - `--lr-decay-step`: `25`
-- `--lr-decay-gamma`: `0.65`
+- `--lr-decay-gamma`: `0.45`
+
+Notes:
+- These defaults now prioritize the current transfer-learning track (`5x5 k=4`, init from `3x3` CNN), not legacy `3x3` fixed-suite-only optimization.
+- For pure `3x3` work, the older `lr=0.02, gamma=0.65` setting remains a valid baseline.
+- To avoid ambiguity, use explicit presets:
+  - `--preset cnn_3x3_prod` for 3x3
+  - `--preset cnn_5x5k4_transfer` for 5x5 k=4 transfer
 
 ## Optimizer + LR-schedule sweep (2026-02-07)
 
@@ -299,7 +306,7 @@ Status: unblocked.
 - Trainer now exposes `--board-width` and `--win-k` for larger-board training.
 - Trainer also supports warm-start via `--init-model-path` (useful for transfer learning).
 
-Note: the fixed-suite `vs_Deep` evaluation still targets `3x3 k=3` only, so larger-board runs should use `--fixed-suite-every 0` for now.
+Note: fixed-suite `vs_Deep` now follows the configured board (`--board-width`, `--win-k`). For larger boards, run it less frequently (for example, every 5 iterations) and/or with lighter suite settings to keep runtime manageable.
 
 ### Transfer learning kickoff (next)
 
@@ -307,7 +314,8 @@ Goal: verify the CNN can warm-start larger boards from a 3x3 checkpoint (board-a
 
 Approach:
 - Run scratch vs `--init-model-path` A/B for `5x5 k=3` (and later `7x7 k=4` once stable).
-- Since fixed-suite `vs_Deep` is 3x3-only, evaluate transfer runs via:
+- Use fixed-suite `vs_Deep` directly on the configured board (`--board-width`, `--win-k`) as the primary strength signal.
+- Still track:
   - early-iteration loss curves (`value_loss`, `policy_loss`)
   - replay-buffer unique growth / saturation
   - self-play throughput stability (games/sec)

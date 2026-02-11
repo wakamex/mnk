@@ -58,6 +58,8 @@ fn evaluate_and_print<B: Backend<FloatElem = f32>>(
     args: &Args,
 ) -> Result<(), String> {
     let cfg = FixedSuiteConfig {
+        board_width: args.board_width,
+        win_k: args.win_k,
         openings: args.fixed_suite_openings,
         sides: args.fixed_suite_sides,
         sims: args.fixed_suite_sims,
@@ -72,10 +74,13 @@ fn evaluate_and_print<B: Backend<FloatElem = f32>>(
 }
 
 pub(crate) fn run_fixed_suite_eval(args: &Args) -> Result<(), String> {
-    if args.board_width != 3 || args.win_k != 3 {
+    if args.board_width == 0 {
+        return Err("board_width must be >= 1".to_string());
+    }
+    if args.win_k == 0 || args.win_k > args.board_width {
         return Err(format!(
-            "fixed-suite eval currently targets 3x3 k=3 only (got {}x{} k={})",
-            args.board_width, args.board_width, args.win_k
+            "win_k must be in [1, board_width], got win_k={} board_width={}",
+            args.win_k, args.board_width
         ));
     }
     if args.fixed_suite_openings == 0 {
@@ -90,7 +95,10 @@ pub(crate) fn run_fixed_suite_eval(args: &Args) -> Result<(), String> {
     println!("=== Fixed Deterministic Evaluation Suite ===");
     println!("Model: {}", args.model_path);
     println!(
-        "Protocol: openings={}, sides/opening={}, total_games_per_matchup={}, eval_sims={}, eval_cpuct={}, root_noise=false",
+        "Protocol: board={}x{} k={}, openings={}, sides/opening={}, total_games_per_matchup={}, eval_sims={}, eval_cpuct={}, root_noise=false",
+        args.board_width,
+        args.board_width,
+        args.win_k,
         args.fixed_suite_openings,
         args.fixed_suite_sides,
         total_games,
@@ -121,7 +129,7 @@ pub(crate) fn run_fixed_suite_eval(args: &Args) -> Result<(), String> {
                     args.model_path, e
                 )
             })?;
-        let net = Network::<Cuda>::new(net_type, &device, 3).load_record(record);
+        let net = Network::<Cuda>::new(net_type, &device, args.board_width).load_record(record);
         println!(
             "Loaded trained {:?} model on GPU from '{}'",
             net_type, args.model_path
@@ -140,7 +148,7 @@ pub(crate) fn run_fixed_suite_eval(args: &Args) -> Result<(), String> {
                 args.model_path, e
             )
         })?;
-    let net = Network::<NdArray>::new(net_type, &device, 3).load_record(record);
+    let net = Network::<NdArray>::new(net_type, &device, args.board_width).load_record(record);
     println!(
         "Loaded trained {:?} model on CPU from '{}'",
         net_type, args.model_path
