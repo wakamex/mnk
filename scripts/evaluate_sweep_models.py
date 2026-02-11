@@ -135,7 +135,7 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    valid_modes = {"random", "shallow", "deep"}
+    valid_modes = {"random", "shallow", "medium", "deep"}
     modes = [m.strip().lower() for m in str(args.mode).split(",") if m.strip()]
     if not modes:
         print("No eval mode specified via --mode", file=sys.stderr)
