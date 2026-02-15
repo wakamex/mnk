@@ -28,4 +28,8 @@
 ## Build
 - All compilation must happen in the `cuda-dev` podman container
 - Use `bash build.sh` to build
-- Run binaries via `podman exec cuda-dev bash -c "cd /workspace/mnk && LD_LIBRARY_PATH=... ./target/release/train_alphazero"`
+
+## Run
+- Training and tournament binaries can run directly on the host (no container needed)
+- `./target/release/train_alphazero ...` — training
+- `./target/release/mnk_game ...` — tournament/eval (add `--cpu` for CPU inference)

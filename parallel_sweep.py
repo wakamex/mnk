@@ -663,7 +663,9 @@ class SweepConfig:
     temperature: List[float] = None
     temperature_cutoff_moves: List[int] = None
     dirichlet_alpha: List[float] = None
+    value_target_blend: List[float] = None
     cpuct: List[float] = None
+    fixed_suite_mode: List[str] = None
     fixed_suite_every: List[int] = None
 
     def __post_init__(self):
@@ -765,7 +767,9 @@ PARAM_TABLE = [
     ("temperature",     "temperature",   "--temperature",        "temp", "Temperature",         "float"),
     ("temperature_cutoff_moves", "temperature_cutoff_moves", "--temperature-cutoff-moves", "tcut", "Temp cutoff moves", "int"),
     ("dirichlet_alpha", "dirichlet_alpha", "--dirichlet-alpha", "dalpha", "Dirichlet alpha", "float"),
+    ("value_target_blend", "value_target_blend", "--value-target-blend", "vtb", "Value target blend", "float"),
     ("cpuct",           "cpuct",         "--cpuct",              "cpuct","CPUCT",               "float"),
+    ("fixed_suite_mode","fixed_suite_mode","--fixed-suite-mode","fsm", "Fixed-suite mode",    "str"),
     ("fixed_suite_every","fixed_suite_every","--fixed-suite-every","fse", "Fixed-suite every",   "int"),
 ]
 
@@ -1095,6 +1099,8 @@ Examples:
     advanced_group.add_argument('--temperature', '-t', help='MCTS temperature')
     advanced_group.add_argument('--temperature-cutoff-moves', help='Opening moves using high temperature before switching to temp=0')
     advanced_group.add_argument('--dirichlet-alpha', help='Dirichlet alpha for root noise during self-play')
+    advanced_group.add_argument('--value-target-blend', help='Value target blend (1.0=game outcome, 0.0=MCTS value)')
+    advanced_group.add_argument('--fixed-suite-mode', help='Fixed-suite opponent: deep or medium')
     advanced_group.add_argument('--cpuct', '-c', help='MCTS CPUCT exploration parameter')
 
     # Execution control

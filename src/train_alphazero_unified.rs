@@ -9,7 +9,8 @@ use burn::tensor::activation;
 use burn::tensor::backend::AutodiffBackend;
 use clap::{parser::ValueSource, ArgMatches, CommandFactory, FromArgMatches, Parser, ValueEnum};
 use mnk::fixed_suite_eval::{
-    evaluate_fixed_suite_vs_deep_inprocess, FixedSuiteConfig, FixedSuiteDeepEvaluation,
+    evaluate_fixed_suite_vs_deep_inprocess, evaluate_fixed_suite_vs_medium_inprocess,
+    FixedSuiteConfig, FixedSuiteDeepEvaluation,
 };
 use mnk::network::{Network, NetworkType};
 use mnk::unified_mcts::{GameConfig as MctsGameConfig, NetworkInference, TrainingExample};
@@ -81,6 +82,7 @@ fn apply_transform(example: &TrainingExample, transform: Transform) -> TrainingE
         player: example.player,
         policy: transform_policy(&example.policy, board_width, transform),
         value: example.value,
+        mcts_value: example.mcts_value,
     }
 }
 
@@ -243,6 +245,7 @@ impl ReplayBuffer {
                         player: key.player,
                         policy,
                         value: acc.sum_value / count_f,
+                        mcts_value: 0.0, // already blended into value
                     },
                     weight: count_f.sqrt(),
                 }
@@ -330,7 +333,12 @@ where
         seed: args.fixed_suite_seed,
         csv_path: None,
     };
-    match evaluate_fixed_suite_vs_deep_inprocess::<B, N>(net, &cfg) {
+    let result = if args.fixed_suite_mode == "medium" {
+        evaluate_fixed_suite_vs_medium_inprocess::<B, N>(net, &cfg)
+    } else {
+        evaluate_fixed_suite_vs_deep_inprocess::<B, N>(net, &cfg)
+    };
+    match result {
         Ok(eval) => Some(eval),
         Err(e) => {
             eprintln!("Fixed-suite eval skipped: {}", e);
@@ -474,6 +482,12 @@ struct Args {
     #[arg(long, default_value = "0.1")]
     dirichlet_alpha: f64,
 
+    /// Value target blend: 1.0 = pure game outcome (standard AlphaZero),
+    /// 0.0 = pure MCTS root Q-value. Intermediate values blend both.
+    /// E.g. 0.1 = 90% MCTS value + 10% game outcome (wazir-drop style).
+    #[arg(long, default_value = "1.0")]
+    value_target_blend: f32,
+
     /// Deterministic RNG seed (controls self-play noise + temperature sampling + training shuffle/augmentation).
     /// Note: network weight initialization may still have nondeterminism depending on backend.
     #[arg(long, default_value = "20260209")]
@@ -515,6 +529,10 @@ struct Args {
     #[arg(long, default_value = "20260207")]
     fixed_suite_seed: u64,
 
+    /// Fixed-suite opponent mode: 'deep' (default) or 'medium'
+    #[arg(long, default_value = "deep")]
+    fixed_suite_mode: String,
+
     /// Only promote the newly trained net for next-iteration self-play when fixed-suite vs_Deep improves
     #[arg(long, default_value_t = false)]
     promote_on_vs_deep_improvement: bool,
@@ -543,6 +561,7 @@ struct TrainPreset {
     temperature: Option<f32>,
     temperature_cutoff_moves: Option<usize>,
     dirichlet_alpha: Option<f64>,
+    value_target_blend: Option<f32>,
     seed: Option<u64>,
     replay_buffer_size: Option<usize>,
     fixed_suite_every: Option<usize>,
@@ -552,6 +571,7 @@ struct TrainPreset {
     fixed_suite_cpuct: Option<f32>,
     fixed_suite_max_plies: Option<usize>,
     fixed_suite_seed: Option<u64>,
+    fixed_suite_mode: Option<String>,
     promote_on_vs_deep_improvement: Option<bool>,
 }
 
@@ -725,6 +745,12 @@ fn apply_train_preset(args: &mut Args, matches: &ArgMatches) -> Result<Option<Pa
         matches,
         "dirichlet_alpha",
     );
+    apply_clone_if_not_cli(
+        &mut args.value_target_blend,
+        preset.value_target_blend,
+        matches,
+        "value_target_blend",
+    );
     apply_clone_if_not_cli(&mut args.seed, preset.seed, matches, "seed");
     apply_clone_if_not_cli(
         &mut args.replay_buffer_size,
@@ -773,6 +799,12 @@ fn apply_train_preset(args: &mut Args, matches: &ArgMatches) -> Result<Option<Pa
         preset.fixed_suite_seed,
         matches,
         "fixed_suite_seed",
+    );
+    apply_clone_if_not_cli(
+        &mut args.fixed_suite_mode,
+        preset.fixed_suite_mode,
+        matches,
+        "fixed_suite_mode",
     );
     apply_clone_if_not_cli(
         &mut args.promote_on_vs_deep_improvement,
@@ -980,6 +1012,7 @@ fn main() {
         args.temperature_cutoff_moves
     );
     println!("  Dirichlet alpha: {}", args.dirichlet_alpha);
+    println!("  Value target blend: {}", args.value_target_blend);
     println!("  Seed: {}", args.seed);
     println!("  Replay buffer size: {}", args.replay_buffer_size);
     if args.fixed_suite_every > 0 {
@@ -1054,6 +1087,7 @@ fn main() {
             args.temperature_cutoff_moves,
             args.cpuct,
             args.dirichlet_alpha,
+            args.value_target_blend,
             &mut selfplay_rng,
             64,
         );
@@ -1262,9 +1296,16 @@ fn main() {
         let current_vs_deep_score = fixed_suite_eval.as_ref().map(|eval| eval.score_percent());
         let mut promoted = true;
         if let Some(eval) = fixed_suite_eval.as_ref() {
+            let mode_label = if args.fixed_suite_mode == "medium" {
+                "Medium"
+            } else {
+                "Deep"
+            };
             println!(
-                "  Fixed-suite: vs_Deep={:.1}% (Deep {:.2}s, Total {:.2}s)",
+                "  Fixed-suite: vs_{}={:.1}% ({} {:.2}s, Total {:.2}s)",
+                mode_label,
                 eval.score_percent(),
+                mode_label,
                 eval.timing.deep_s,
                 eval.timing.total_s
             );

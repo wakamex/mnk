@@ -296,78 +296,151 @@ This was later superseded in current defaults by a short opening schedule (`--te
 
 The `vw=2.0, temp=1.0` result from the 4x4 grid (50%/50% vsD/vsM) did not reproduce (0.5%/0.0%) — confirmed as noise at n=1. `temp=1.25` is consistently the best temperature in this region.
 
+## Reference implementation comparison
+
+Both `/code/alpha-zero` (Connect4) and `/code/AlphaZero_Gomoku` (Gomoku) use ~103K param CNNs on 6x6 boards — same architecture as ours. Key hyperparameter gaps:
+
+| | AlphaZero_Gomoku | alpha-zero | Our setup |
+|--|--|--|--|
+| **Board** | 6x6 k=4 | 6x6 Connect4 | 5x5 k=4 |
+| **Params** | ~104K | ~103K | ~103K |
+| **MCTS sims** | **400** | **500** | 50 |
+| **Replay buffer** | 10K | 20K | 20K |
+| **Grad updates/game** | **5 epochs x batch** | **50 per game** | 8 epochs x ~few batches |
+| **Optimizer** | **Adam lr=0.002** | **Adam lr=0.001** | SGD lr=0.02 |
+| **Input channels** | **4** (pieces, last move, color) | 1 | 1 |
+| **Total games** | 1,500 | 3,000 | 1,000/iter x 100 iter |
+| **c_puct** | **5.0** | **5.0** | 0.75 |
+| **Dirichlet alpha** | 0.3 | 0.3 | 0.1 |
+| **Training time** | ~2 hrs (6x6) | 7-8 hrs | ~2.4 hrs (5x5, 100 iter) |
+
+Top gaps to close (in priority order):
+1. **c_puct**: both references use 5.0, we use 0.75 — low c_puct means MCTS doesn't explore the tree, so more sims just deepen the same narrow line
+2. **MCTS sims**: 400-500 vs 50 — now that we have a replay buffer, higher sims should produce sharper targets the buffer can train on repeatedly
+3. **Optimizer**: both use Adam, we use SGD — Adam is more forgiving, especially for larger/harder problems
+
+## 5x5 k=4 transfer learning sweeps (2026-02-13 to 2026-02-15)
+
+All runs use `--preset cnn_5x5k4_transfer` (transfer from 3x3 CNN checkpoint, 1000 games/iter, replay buffer 20K).
+
+### c_puct x MCTS sims (`b5k4_cpuct_high_v1`, vs_Deep)
+
+Goal: close the c_puct gap with reference implementations (they use 5.0, we use 0.75).
+
+Grid: `cpuct={2.0,5.0}` x `mcts={50,100,200}`, 100 iterations.
+
+| Config | Time | vs_Deep max | vs_Deep final |
+|--------|------|-------------|---------------|
+| mcts50, cpuct2.0 | 4083s | 3.0% @i90 | 2.0% |
+| mcts50, cpuct5.0 | 3635s | 3.0% @i30 | 0.0% |
+| mcts100, cpuct2.0 | 5994s | 3.0% @i5 | 0.0% |
+| mcts100, cpuct5.0 | 5662s | 2.0% @i80 | 0.0% |
+| mcts200, cpuct2.0 | 9024s | 2.0% @i55 | 0.0% |
+| mcts200, cpuct5.0 | 8947s | 2.0% @i25 | 0.0% |
+
+Conclusion: c_puct doesn't matter at these levels. More MCTS sims don't help either — 2.5x wall time for no improvement. All configs 0-3% vs_Deep.
+
+### Adam optimizer (`b5k4_adam_v1`, vs_Deep)
+
+Goal: test Adam (gap #3 from reference comparison).
+
+| Optimizer | vs_Deep max | Final |
+|-----------|-------------|-------|
+| AdamW (lr=0.0015) | **5.0%** @i45 | 3.0% |
+| SGD (lr=0.0015) | 0.0% | 0.0% |
+
+Adam is clearly better. But lr=0.0015 was tuned for SGD.
+
+### Adam LR sweep (`b5k4_adam_lr_v1`, vs_Deep)
+
+| LR | vs_Deep max | Peak iter | Final | Pattern |
+|----|-------------|-----------|-------|---------|
+| **0.0001** | **6.0%** | **100** | **6.0%** | **Still climbing** |
+| 0.0003 | 4.0% | 25 | 0.0% | Collapsed |
+| 0.001 | 2.0% | 80 | 0.0% | Collapsed |
+| 0.003 | 4.0% | 60 | 1.0% | Collapsed |
+
+lr=0.0001 is the only config that didn't collapse — peaked at the last iteration. But extending to 300 iters (`b5k4_adam_long_v1`) didn't help: lr=0.0001 only hit 2% max over 300 iters, lr=5e-05 hit 4% max. The 6% result was noise.
+
+### Value target blending (new feature)
+
+Inspired by [wazir-drop](https://github.com/tczajka/wazir-drop): instead of training the value head on pure game outcomes (+1/-1), blend with the MCTS root Q-value:
+
+```
+value = blend * game_outcome + (1 - blend) * mcts_root_q
+```
+
+CLI: `--value-target-blend` (default 1.0 = pure game outcome, backward compatible).
+
+Rationale: with 50 MCTS sims on a 25-cell board (~2 visits/move), self-play games are nearly random. Game outcomes have almost no correlation with position quality. The MCTS root Q-value, even from a weak net, provides a lower-variance bootstrap signal.
+
+### vtb sweep vs_Deep (`b5k4_vtb_v1`)
+
+| vtb | vs_Deep max | Final |
+|-----|-------------|-------|
+| 0.1 | 2.0% @i10 | 1.0% |
+| 0.5 | 1.0% @i40 | 1.0% |
+| 1.0 | 0.0% | 0.0% |
+
+Tiny signal in right direction, but Deep is too strong to measure at these levels.
+
+### vtb sweep vs_Medium (`b5k4_vs_medium_v1`)
+
+Switched fixed-suite to `--fixed-suite-mode medium` (new feature) to get more signal.
+
+| vtb | vs_Medium max | Peak iter | Final |
+|-----|---------------|-----------|-------|
+| **0.1** | **13.0%** | 35 | 6.0% |
+| 1.0 | 6.0% | 40 | 5.0% |
+
+The model IS learning — we were just measuring against too strong an opponent. vtb=0.1 doubles the peak score.
+
+### vtb aggressive sweep vs_Medium (`b5k4_vtb_medium_v2`, 200 iters)
+
+| vtb | vs_Medium max | Peak iter | Final | Collapse |
+|-----|---------------|-----------|-------|----------|
+| **0.0** (pure MCTS) | **22.0%** | 25 | **18.0%** | 4% drop |
+| 0.05 | 18.0% | 40 | 11.0% | 7% drop |
+| 0.1 | 17.0% | 10 | 6.0% | 11% drop |
+
+Key findings:
+1. **Less game outcome = better**: vtb=0.0 > 0.05 > 0.1 monotonically. Game outcomes are pure noise on 5x5 k=4 with 50-sim MCTS.
+2. **Less game outcome = more stable**: vtb=0.0 only dropped 4% from peak, while vtb=0.1 dropped 11%. Game outcome noise causes training collapse.
+3. **Pure MCTS value (vtb=0.0) is best**: 22% vs_Medium max, 18% final — best 5x5 result so far.
+
+### Current best 5x5 k=4 config
+
+```
+--preset cnn_5x5k4_transfer
+--optimizer adamw
+--learning-rate 0.0001
+--cpuct 2.0
+--value-target-blend 0.0
+--fixed-suite-mode medium
+```
+
+### Summary of what helped vs what didn't for 5x5 k=4
+
+| Change | Impact |
+|--------|--------|
+| Adam optimizer | Major (0% → 6% vs_Deep) |
+| Value target blend (vtb=0.0) | Major (6% → 22% vs_Medium) |
+| Lower LR (0.0001) | Moderate (prevents collapse) |
+| Higher c_puct (2.0, 5.0) | None |
+| More MCTS sims (100-1000) | None |
+| More iterations (300) | None (model collapses) |
+
 ## Next experiments
 
-### Board-size self-play unblocker (priority)
+### Push vtb=0.0 further
 
-Status: unblocked.
+- Longer training (300+ iters) — vtb=0.0 showed only 4% collapse, might keep climbing
+- Test vtb=0.0 with higher MCTS sims (100, 200) — now that value targets are stable, more sims might actually help
+- Test vtb=0.0 with vs_Deep to see if we've crossed the threshold
 
-- `src/unified_mcts.rs` no longer assumes 3x3; MCTS/self-play is parameterized by `board_width` and `win_k` via `GameConfig`.
-- Trainer now exposes `--board-width` and `--win-k` for larger-board training.
-- Trainer also supports warm-start via `--init-model-path` (useful for transfer learning).
+### Batch size exploration
 
-Note: fixed-suite `vs_Deep` now follows the configured board (`--board-width`, `--win-k`). For larger boards, run it less frequently (for example, every 5 iterations) and/or with lighter suite settings to keep runtime manageable.
-
-### Transfer learning kickoff (next)
-
-Goal: verify the CNN can warm-start larger boards from a 3x3 checkpoint (board-agnostic heads).
-
-Approach:
-- Run scratch vs `--init-model-path` A/B for `5x5 k=3` (and later `7x7 k=4` once stable).
-- Use fixed-suite `vs_Deep` directly on the configured board (`--board-width`, `--win-k`) as the primary strength signal.
-- Still track:
-  - early-iteration loss curves (`value_loss`, `policy_loss`)
-  - replay-buffer unique growth / saturation
-  - self-play throughput stability (games/sec)
-
-Helper script (writes artifacts under `research_runs/`, not committed):
-
-```bash
-SEED=20260209 BOARD=5 K=3 ./scripts/transfer_ab.sh
-```
-
-### MaxRL (not a priority for our current approach)
-
-Reference: https://zanette-labs.github.io/MaxRL/
-
-Rationale:
-- MaxRL targets sparse/binary “success” signals (pass/fail) and reframes RL as approximating maximum-likelihood on `p(success)` by sampling multiple rollouts per input.
-- Our current loop is AlphaZero-style policy iteration: we already train on strong supervised targets (MCTS visit distribution for policy + outcome/value for value). This is typically far more sample-efficient than pure policy-gradient from win/loss for games.
-- Implementing MaxRL here would mean adding a new on-policy trajectory-sampling trainer mode with success-only updates (and variance reduction/baselines), and it’s not obvious it would beat the existing MCTS-target training for MNK.
-
-### Reproducibility check (priority)
-
-All sweep results are n=1 per config. The `vw=2.0, temp=1.0` non-reproduction shows this is a problem. Run the best config 5 times to get confidence intervals:
-
-```bash
-# Run 5 identical training runs, compare tournament variance
-for i in 1 2 3 4 5; do
-  python parallel_sweep.py --net-type cnn -i 20 -g 1000 \
-    --value-weight 2.0 --temperature 1.25 \
-    --sweep-name reproducibility_run$i
-done
-```
-
-### Longer training horizon
-
-All sweeps used 20 iterations. The model may still be improving. Run the best config for 50-100 iterations to find the convergence ceiling:
-
-```bash
-python parallel_sweep.py --net-type cnn -i 50,100 -g 1000 \
-  --value-weight 2.0 --temperature 1.25 \
-  --sweep-name longer_training
-```
-
-### MCTS sims scaling
-
-More search produces sharper policy targets. Now that VRAM is stable, try higher sims with best params:
-
-```bash
-python parallel_sweep.py --net-type cnn -i 20 -g 1000 \
-  --mcts 50,100,200,400 \
-  --value-weight 2.0 --temperature 1.25 \
-  --sweep-name mcts_scaling
-```
+Reference implementations use batch_size=512-8192, we use 256. Larger batches stabilize Adam training. Worth testing 512, 1024, 2048.
 
 ### Phase 3: Transformer on Larger Boards
 
@@ -384,20 +457,14 @@ Analyze latest sweep:
 python analyze_sweep.py sweep_results/
 ```
 
-Analyze a specific summary:
-
-```bash
-python analyze_sweep.py sweep_results/cnn_lr_mcts_20260206_125932.csv
-```
-
-Run the CNN lr/mcts sweep:
+Run a 5x5 k=4 training sweep:
 
 ```bash
 python parallel_sweep.py \
-  --net-type cnn \
-  -i 20 \
-  -g 1000 \
-  --learning-rate 0.005,0.01,0.02,0.05 \
-  --mcts 25,50,100,200 \
-  --sweep-name cnn_lr_mcts
+  --preset cnn_5x5k4_transfer \
+  -i 200 --epochs 8 \
+  --optimizer adamw --learning-rate 0.0001 \
+  --cpuct 2.0 --value-target-blend 0.0 \
+  --fixed-suite-mode medium --fixed-suite-every 5 \
+  --sweep-name my_sweep
 ```

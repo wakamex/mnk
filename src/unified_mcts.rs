@@ -8,6 +8,9 @@ pub struct TrainingExample {
     pub player: u8,
     pub policy: Vec<f32>,
     pub value: f32,
+    /// MCTS root Q-value from the current player's perspective at this position.
+    /// Used for value-target blending: final_value = (1-λ)*mcts_value + λ*game_outcome
+    pub mcts_value: f32,
 }
 
 /// Trait for neural network inference to avoid circular dependencies
@@ -379,6 +382,8 @@ fn scheduled_temperature(
 /// - Neural network expansion
 /// - Dirichlet noise at root
 /// - Value backpropagation through the tree
+/// Returns (visit_count_policy, root_q_value).
+/// root_q_value is the MCTS estimate of the position value from the current player's perspective.
 fn mcts_search_configured<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
     net: &N,
     cfg: GameConfig,
@@ -388,7 +393,7 @@ fn mcts_search_configured<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
     root_noise: bool,
     c_puct: f32,
     dirichlet_alpha: f64,
-) -> Vec<f32> {
+) -> (Vec<f32>, f32) {
     let mut rng = rand::thread_rng();
     assert_square_board(board, cfg);
     let board_size = cfg.board_size();
@@ -399,14 +404,14 @@ fn mcts_search_configured<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
         .collect();
 
     if legal_moves.is_empty() {
-        return vec![0.0; board_size];
+        return (vec![0.0; board_size], 0.0);
     }
 
     // If only one legal move, return it immediately
     if legal_moves.len() == 1 {
         let mut policy = vec![0.0; board_size];
         policy[legal_moves[0]] = 1.0;
-        return policy;
+        return (policy, 0.0);
     }
 
     // Create root node and expand it
@@ -520,6 +525,9 @@ fn mcts_search_configured<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
         }
     }
 
+    // Compute root Q-value from children (children store values from opponent's perspective)
+    let root_q = root_q_value(&root);
+
     // Extract visit counts from root children
     let mut visit_counts = vec![0.0f32; board_size];
     for i in 0..board_size {
@@ -536,7 +544,26 @@ fn mcts_search_configured<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
         }
     }
 
-    visit_counts
+    (visit_counts, root_q)
+}
+
+/// Compute the Q-value at the root from the root player's perspective.
+fn root_q_value(root: &MctsNode) -> f32 {
+    let mut total_child_value = 0.0f32;
+    let mut total_child_visits = 0u32;
+    for child_opt in &root.children {
+        if let Some(child) = child_opt {
+            total_child_value += child.total_value;
+            total_child_visits += child.visit_count;
+        }
+    }
+    if total_child_visits > 0 {
+        // Children store values from the child player's perspective (opponent),
+        // so negate to get root player's perspective
+        -total_child_value / total_child_visits as f32
+    } else {
+        0.0
+    }
 }
 
 pub fn mcts_search_with_options<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
@@ -548,14 +575,7 @@ pub fn mcts_search_with_options<B: Backend<FloatElem = f32>, N: NetworkInference
     root_noise: bool,
 ) -> Vec<f32> {
     mcts_search_with_hyperparams(
-        net,
-        cfg,
-        board,
-        player,
-        simulations,
-        root_noise,
-        DEFAULT_C_PUCT,
-        DIRICHLET_ALPHA,
+        net, cfg, board, player, simulations, root_noise, DEFAULT_C_PUCT, DIRICHLET_ALPHA,
     )
 }
 
@@ -579,6 +599,7 @@ pub fn mcts_search_with_hyperparams<B: Backend<FloatElem = f32>, N: NetworkInfer
         c_puct,
         dirichlet_alpha,
     )
+    .0
 }
 
 /// Default AlphaZero search behavior used in self-play: root noise enabled.
@@ -593,6 +614,8 @@ pub fn mcts_search<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
 }
 
 /// Play a complete self-play game using proper MCTS and return training examples.
+/// `value_target_blend`: 1.0 = pure game outcome, 0.0 = pure MCTS value.
+/// Formula: value = blend * game_outcome + (1 - blend) * mcts_root_q
 pub fn self_play_game_mcts<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
     net: &N,
     cfg: GameConfig,
@@ -601,6 +624,7 @@ pub fn self_play_game_mcts<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
     temperature_cutoff_moves: usize,
     c_puct: f32,
     dirichlet_alpha: f64,
+    value_target_blend: f32,
 ) -> Vec<TrainingExample> {
     let mut rng = rand::thread_rng();
     let mut board = vec![None; cfg.board_size()];
@@ -623,8 +647,8 @@ pub fn self_play_game_mcts<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
             break;
         }
 
-        // Run MCTS to get policy
-        let policy = mcts_search_configured(
+        // Run MCTS to get policy and root Q-value
+        let (policy, root_q) = mcts_search_configured(
             net,
             cfg,
             &board,
@@ -635,12 +659,13 @@ pub fn self_play_game_mcts<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
             dirichlet_alpha,
         );
 
-        // Store training example (value filled in later)
+        // Store training example (value filled in later with blend)
         examples.push(TrainingExample {
             board: board.clone(),
             player,
             policy: policy.clone(),
             value: 0.0,
+            mcts_value: root_q,
         });
 
         // Select move using temperature-scaled visit counts
@@ -655,14 +680,16 @@ pub fn self_play_game_mcts<B: Backend<FloatElem = f32>, N: NetworkInference<B>>(
         move_number += 1;
     }
 
-    // Fill in values from game outcome
+    // Fill in values: blend game outcome with MCTS root Q-value
     let winner = check_winner_square_k(&board, cfg);
     for example in &mut examples {
-        example.value = match winner {
+        let game_outcome = match winner {
             Some(w) if w == example.player => 1.0,
             Some(_) => -1.0,
             None => 0.0, // Draw
         };
+        example.value =
+            value_target_blend * game_outcome + (1.0 - value_target_blend) * example.mcts_value;
     }
 
     examples
@@ -678,6 +705,7 @@ pub fn generate_training_data<B: Backend<FloatElem = f32>, N: NetworkInference<B
     temperature_cutoff_moves: usize,
     c_puct: f32,
     dirichlet_alpha: f64,
+    value_target_blend: f32,
 ) -> Vec<Vec<TrainingExample>> {
     let mut all_games = Vec::with_capacity(num_games);
 
@@ -690,6 +718,7 @@ pub fn generate_training_data<B: Backend<FloatElem = f32>, N: NetworkInference<B
             temperature_cutoff_moves,
             c_puct,
             dirichlet_alpha,
+            value_target_blend,
         );
         all_games.push(examples);
     }
@@ -778,6 +807,7 @@ pub fn generate_training_data_batched<B: Backend<FloatElem = f32>, N: NetworkInf
     temperature_cutoff_moves: usize,
     c_puct: f32,
     dirichlet_alpha: f64,
+    value_target_blend: f32,
     rng: &mut impl Rng,
     batch_size: usize,
 ) -> Vec<Vec<TrainingExample>> {
@@ -808,7 +838,7 @@ pub fn generate_training_data_batched<B: Backend<FloatElem = f32>, N: NetworkInf
             // If this game has completed all simulations for the current position,
             // extract policy, make a move, and prepare next position
             if game.sim_count >= simulations && !game.root_needs_expansion {
-                handle_move_selection(game, temperature, temperature_cutoff_moves, rng);
+                handle_move_selection(game, temperature, temperature_cutoff_moves, value_target_blend, rng);
                 if game.completed {
                     continue;
                 }
@@ -824,7 +854,7 @@ pub fn generate_training_data_batched<B: Backend<FloatElem = f32>, N: NetworkInf
                 .filter_map(|(i, &c)| if c.is_none() { Some(i) } else { None })
                 .collect();
             if legal_moves.is_empty() || check_winner_square_k(&game.board, game.cfg).is_some() {
-                finish_game(game);
+                finish_game(game, value_target_blend);
                 continue;
             }
 
@@ -1026,6 +1056,7 @@ fn handle_move_selection(
     game: &mut GameInProgress,
     temperature: f32,
     temperature_cutoff_moves: usize,
+    value_target_blend: f32,
     rng: &mut impl Rng,
 ) {
     let root = game.root.as_ref().unwrap();
@@ -1047,12 +1078,16 @@ fn handle_move_selection(
         }
     }
 
-    // Store training example (value filled in later)
+    // Compute root Q-value before we drop the root
+    let mcts_q = root_q_value(root);
+
+    // Store training example (value filled in later with blend)
     game.examples.push(TrainingExample {
         board: game.board.clone(),
         player: game.player,
         policy: visit_counts.clone(),
         value: 0.0,
+        mcts_value: mcts_q,
     });
 
     // Select move with AlphaZero-style opening temperature schedule.
@@ -1071,19 +1106,23 @@ fn handle_move_selection(
     if check_winner_square_k(&game.board, game.cfg).is_some()
         || game.board.iter().all(|c| c.is_some())
     {
-        finish_game(game);
+        finish_game(game, value_target_blend);
     }
 }
 
 /// Fill in game outcome values for all training examples and mark game complete.
-fn finish_game(game: &mut GameInProgress) {
+/// Blends game outcome with MCTS root Q-value:
+/// value = blend * game_outcome + (1 - blend) * mcts_value
+fn finish_game(game: &mut GameInProgress, value_target_blend: f32) {
     let winner = check_winner_square_k(&game.board, game.cfg);
     for example in &mut game.examples {
-        example.value = match winner {
+        let game_outcome = match winner {
             Some(w) if w == example.player => 1.0,
             Some(_) => -1.0,
             None => 0.0,
         };
+        example.value = value_target_blend * game_outcome
+            + (1.0 - value_target_blend) * example.mcts_value;
     }
     game.completed = true;
 }

@@ -160,6 +160,7 @@ impl Opponent {
 
 const OPPONENTS_FULL: [Opponent; 3] = [Opponent::Deep, Opponent::Medium, Opponent::Random];
 const OPPONENTS_DEEP_ONLY: [Opponent; 1] = [Opponent::Deep];
+const OPPONENTS_MEDIUM_ONLY: [Opponent; 1] = [Opponent::Medium];
 
 #[derive(Clone, Copy, Debug)]
 enum GameOutcome {
@@ -737,6 +738,27 @@ pub fn evaluate_fixed_suite_vs_deep_inprocess<
         deep,
         timing: FixedSuiteDeepTiming {
             deep_s: run.timing.deep_s,
+            total_s: run.timing.total_s,
+        },
+    })
+}
+
+/// Like vs_deep but evaluates against Medium opponent only.
+/// Returns the same struct shape for compatibility (result goes in .deep field).
+pub fn evaluate_fixed_suite_vs_medium_inprocess<
+    B: Backend<FloatElem = f32>,
+    N: NetworkInference<B>,
+>(
+    net: &N,
+    cfg: &FixedSuiteConfig,
+) -> Result<FixedSuiteDeepEvaluation, String> {
+    let run = evaluate_fixed_suite_with_opponents(net, cfg, &OPPONENTS_MEDIUM_ONLY)?;
+    let medium = require_result(run.medium, "Medium result")?;
+
+    Ok(FixedSuiteDeepEvaluation {
+        deep: medium,
+        timing: FixedSuiteDeepTiming {
+            deep_s: run.timing.medium_s,
             total_s: run.timing.total_s,
         },
     })
