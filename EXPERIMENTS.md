@@ -419,6 +419,28 @@ Key findings:
 --fixed-suite-mode medium
 ```
 
+### Long vtb=0.0 run (`b5k4_vtb0_long_v1`, 300 iters)
+
+| Iters | vs_Medium max | Peak iter | Final |
+|-------|---------------|-----------|-------|
+| 300 | 24.0% | 45 | 14.0% |
+
+Slightly higher peak than 200-iter run (24% vs 22%) but model still collapses after iter 45. Extra 255 iterations wasted.
+
+### LR schedule sweep with vtb=0.0 (`b5k4_vtb0_lrsched_v1`, `b5k4_vtb0_cosine_v1`)
+
+| Schedule | vs_Medium max | Peak iter | Final |
+|----------|---------------|-----------|-------|
+| Constant | **30.0%** | 5 | 12.0% |
+| Cosine (min=0.01) | 27.0% | 25 | 12.0% |
+| Cosine (min=0.1) | 25.0% | 65 | **18.0%** |
+| Cosine (min=0.3) | 24.0% | 115 | 12.0% |
+| Step (gamma=0.45) | 20.0% | 40 | 13.0% |
+
+Pattern: more aggressive early LR → higher peak but worse collapse. Constant LR hits 30% at iter 5 (!) then crashes. Moderate cosine (min=0.1) has the best balance (25% peak, 18% final). No schedule prevents collapse entirely.
+
+Conclusion: LR schedule affects *when* the peak occurs and how badly it collapses, but the ceiling is ~25-30% vs_Medium regardless. Since the trainer exports the best checkpoint, practical peak is what matters — and we're hitting diminishing returns on schedule tuning.
+
 ### Summary of what helped vs what didn't for 5x5 k=4
 
 | Change | Impact |
@@ -426,28 +448,40 @@ Key findings:
 | Adam optimizer | Major (0% → 6% vs_Deep) |
 | Value target blend (vtb=0.0) | Major (6% → 22% vs_Medium) |
 | Lower LR (0.0001) | Moderate (prevents collapse) |
+| LR schedule (cosine/constant) | Minor (20% → 30% peak, but all collapse) |
 | Higher c_puct (2.0, 5.0) | None |
 | More MCTS sims (100-1000) | None |
 | More iterations (300) | None (model collapses) |
 
-## Next experiments
+## Next experiments (priority order)
 
-### Push vtb=0.0 further
+### 1. More MCTS sims with vtb=0.0 (high priority)
 
-- Longer training (300+ iters) — vtb=0.0 showed only 4% collapse, might keep climbing
-- Test vtb=0.0 with higher MCTS sims (100, 200) — now that value targets are stable, more sims might actually help
-- Test vtb=0.0 with vs_Deep to see if we've crossed the threshold
+Earlier MCTS scaling tests (50-1000 sims) showed no improvement — but those used vtb=1.0 (pure game outcome). With vtb=0.0, the MCTS root Q-value IS the training signal, so search quality directly affects training data quality. Higher sims should now actually help.
 
-### Batch size exploration
+```bash
+python parallel_sweep.py --preset cnn_5x5k4_transfer -i 200 --epochs 8 \
+  --optimizer adamw --learning-rate 0.0001 --lr-schedule cosine --lr-min-ratio 0.1 \
+  --mcts 50,100,200 --value-target-blend 0.0 \
+  --fixed-suite-mode medium --fixed-suite-every 5 \
+  --sweep-name b5k4_vtb0_mcts_v1
+```
 
-Reference implementations use batch_size=512-8192, we use 256. Larger batches stabilize Adam training. Worth testing 512, 1024, 2048.
+### 2. More games per iteration (high priority)
 
-### Phase 3: Transformer on Larger Boards
+Currently 1000 games/iter. With 25-cell board and ~10 moves/game, that's ~10K examples per iteration — but many are duplicates after canonicalization. More games means more diverse positions in the replay buffer.
 
-The current MiniBT4 default is right-sized to ~101K params (close to CNN ~103K), so capacity mismatch is no longer the main concern for 3x3. Instead of broad sweeps on 3x3:
-- **Sanity check**: One quick Transformer run on 3x3 (5 iterations) to confirm it trains
-- **Real test**: Transformer on 5x5 or 7x7 boards where capacity is more justified than 3x3
-- Compare Transformer learning curves on larger boards against random/minimax baselines
+### 3. Larger replay buffer (medium priority)
+
+20K unique positions may saturate quickly for 5x5. Worth testing 50K-100K. The 5x5 k=4 state space is vastly larger than 3x3.
+
+### 4. Batch size (medium priority)
+
+Reference implementations use batch_size=512-8192, we use 256. Larger batches stabilize Adam training and reduce gradient noise.
+
+### 5. Phase 3: Transformer on Larger Boards (low priority for now)
+
+Defer until CNN on 5x5 k=4 is better understood. The current bottleneck is training dynamics, not architecture.
 
 ## Useful commands
 
