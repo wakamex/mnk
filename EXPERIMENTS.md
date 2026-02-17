@@ -441,6 +441,18 @@ Pattern: more aggressive early LR → higher peak but worse collapse. Constant L
 
 Conclusion: LR schedule affects *when* the peak occurs and how badly it collapses, but the ceiling is ~25-30% vs_Medium regardless. Since the trainer exports the best checkpoint, practical peak is what matters — and we're hitting diminishing returns on schedule tuning.
 
+### MCTS scaling with vtb=0.0 (`b5k4_vtb0_mcts_v1`)
+
+Earlier MCTS scaling (50-1000 sims with vtb=1.0) showed zero improvement. Re-tested with vtb=0.0 where search quality directly drives training signal quality.
+
+| MCTS sims | vs_Medium max | Peak iter | Final | Wall time |
+|-----------|---------------|-----------|-------|-----------|
+| 50 | 25.0% | 40 | 17.0% | 5838s |
+| 100 | 23.0% | 30 | 10.0% | 8923s |
+| **200** | **29.0%** | **50** | **20.0%** | 13804s |
+
+Conclusion: MCTS sims now matter — 200 sims hits 29% vs_Medium (best peak yet with cosine schedule). The mcts=100 dip is likely noise at n=1. However, 200 sims costs 2.4x wall time for +4% peak. The model still collapses (29%→20%).
+
 ### Summary of what helped vs what didn't for 5x5 k=4
 
 | Change | Impact |
@@ -449,37 +461,34 @@ Conclusion: LR schedule affects *when* the peak occurs and how badly it collapse
 | Value target blend (vtb=0.0) | Major (6% → 22% vs_Medium) |
 | Lower LR (0.0001) | Moderate (prevents collapse) |
 | LR schedule (cosine/constant) | Minor (20% → 30% peak, but all collapse) |
+| More MCTS sims with vtb=0.0 | Minor (25% → 29% peak, 2.4x cost) |
 | Higher c_puct (2.0, 5.0) | None |
-| More MCTS sims (100-1000) | None |
+| More MCTS sims with vtb=1.0 | None |
 | More iterations (300) | None (model collapses) |
 
 ## Next experiments (priority order)
 
-### 1. More MCTS sims with vtb=0.0 (high priority)
+### 1. More games per iteration (high priority)
 
-Earlier MCTS scaling tests (50-1000 sims) showed no improvement — but those used vtb=1.0 (pure game outcome). With vtb=0.0, the MCTS root Q-value IS the training signal, so search quality directly affects training data quality. Higher sims should now actually help.
+Currently 1000 games/iter. With 25-cell board and ~10 moves/game, that's ~10K examples per iteration — but many are duplicates after canonicalization (replay buffer shows heavy merging). More games means more diverse positions in the replay buffer, which directly addresses the collapse problem (model overfits to repeated positions).
 
 ```bash
 python parallel_sweep.py --preset cnn_5x5k4_transfer -i 200 --epochs 8 \
   --optimizer adamw --learning-rate 0.0001 --lr-schedule cosine --lr-min-ratio 0.1 \
-  --mcts 50,100,200 --value-target-blend 0.0 \
+  --mcts 50 --games 1000,3000,5000 --value-target-blend 0.0 \
   --fixed-suite-mode medium --fixed-suite-every 5 \
-  --sweep-name b5k4_vtb0_mcts_v1
+  --sweep-name b5k4_vtb0_games_v1
 ```
 
-### 2. More games per iteration (high priority)
-
-Currently 1000 games/iter. With 25-cell board and ~10 moves/game, that's ~10K examples per iteration — but many are duplicates after canonicalization. More games means more diverse positions in the replay buffer.
-
-### 3. Larger replay buffer (medium priority)
+### 2. Larger replay buffer (medium priority)
 
 20K unique positions may saturate quickly for 5x5. Worth testing 50K-100K. The 5x5 k=4 state space is vastly larger than 3x3.
 
-### 4. Batch size (medium priority)
+### 3. Batch size (medium priority)
 
 Reference implementations use batch_size=512-8192, we use 256. Larger batches stabilize Adam training and reduce gradient noise.
 
-### 5. Phase 3: Transformer on Larger Boards (low priority for now)
+### 4. Phase 3: Transformer on Larger Boards (low priority for now)
 
 Defer until CNN on 5x5 k=4 is better understood. The current bottleneck is training dynamics, not architecture.
 
