@@ -665,6 +665,7 @@ class SweepConfig:
     dirichlet_alpha: List[float] = None
     value_target_blend: List[float] = None
     cpuct: List[float] = None
+    replay_buffer_size: List[int] = None
     fixed_suite_mode: List[str] = None
     fixed_suite_every: List[int] = None
 
@@ -769,6 +770,7 @@ PARAM_TABLE = [
     ("dirichlet_alpha", "dirichlet_alpha", "--dirichlet-alpha", "dalpha", "Dirichlet alpha", "float"),
     ("value_target_blend", "value_target_blend", "--value-target-blend", "vtb", "Value target blend", "float"),
     ("cpuct",           "cpuct",         "--cpuct",              "cpuct","CPUCT",               "float"),
+    ("replay_buffer_size","replay_buffer_size","--replay-buffer-size","rbs","Replay buffer size", "int"),
     ("fixed_suite_mode","fixed_suite_mode","--fixed-suite-mode","fsm", "Fixed-suite mode",    "str"),
     ("fixed_suite_every","fixed_suite_every","--fixed-suite-every","fse", "Fixed-suite every",   "int"),
 ]
@@ -1102,6 +1104,7 @@ Examples:
     advanced_group.add_argument('--value-target-blend', help='Value target blend (1.0=game outcome, 0.0=MCTS value)')
     advanced_group.add_argument('--fixed-suite-mode', help='Fixed-suite opponent: deep or medium')
     advanced_group.add_argument('--cpuct', '-c', help='MCTS CPUCT exploration parameter')
+    advanced_group.add_argument('--replay-buffer-size', help='Replay buffer capacity (unique canonical positions)')
 
     # Execution control
     control_group = parser.add_argument_group('execution control')

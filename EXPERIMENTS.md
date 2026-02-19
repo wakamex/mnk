@@ -466,31 +466,76 @@ Conclusion: MCTS sims now matter — 200 sims hits 29% vs_Medium (best peak yet 
 | More MCTS sims with vtb=1.0 | None |
 | More iterations (300) | None (model collapses) |
 
-## Next experiments (priority order)
+### Games per iteration (`b5k4_vtb0_games_v1`)
 
-### 1. More games per iteration (high priority)
+| Games/iter | vs_Medium max | Peak iter | Final | Time |
+|------------|---------------|-----------|-------|------|
+| 1000 | 19.0% | 85 | 12.0% | 5750s |
+| **3000** | **24.0%** | 25 | **20.0%** | 12358s |
+| 5000 | 24.0% | 155 | 13.0% | 19708s |
 
-Currently 1000 games/iter. With 25-cell board and ~10 moves/game, that's ~10K examples per iteration — but many are duplicates after canonicalization (replay buffer shows heavy merging). More games means more diverse positions in the replay buffer, which directly addresses the collapse problem (model overfits to repeated positions).
+3000 games/iter is the sweet spot. 5000 offers no improvement — the replay buffer (20K) saturates and extra games just cause faster eviction of older positions.
+
+### Replay buffer size (`b5k4_vtb0_buffer_v1`, with 3000 games/iter)
+
+| Buffer size | vs_Medium max | Peak iter | Final | Time |
+|-------------|---------------|-----------|-------|------|
+| 20K | 20.0% | 25 | 18.0% | 17893s |
+| **50K** | **25.0%** | 15 | **22.0%** | 23117s |
+| 100K | 24.0% | 125 | 17.0% | 27486s |
+
+50K is the sweet spot. 100K fills too slowly (3000 games × ~10 moves = ~30K examples/iter) and trains on stale data.
+
+### Combined best config (`b5k4_best_combined_v1`)
+
+Tested all improvements together: Adam, vtb=0.0, cosine schedule, 3000 games, 50K buffer, 200 sims.
+
+| Config | vs_Medium max | Peak iter | Final | Time |
+|--------|---------------|-----------|-------|------|
+| 200 sims (cosine, 1K games, 20K buf) | 29.0% | 50 | 20.0% | 13804s |
+| 50K buffer (cosine, 3K games, 50 sims) | 25.0% | 15 | 22.0% | 23117s |
+| **Combined** (200 sims, 3K games, 50K buf) | 24.0% | 45 | 12.0% | **46763s** |
+
+**Improvements do not stack.** Combined run was no better than either individual improvement and cost 3.4x the wall time. Each dimension was fixing a different bottleneck; there are no more easy levers in hyperparameter space.
+
+### Summary of what helped vs what didn't for 5x5 k=4 (CNN)
+
+| Change | Impact |
+|--------|--------|
+| Adam optimizer | Major (0% → ~20% vs_Medium) |
+| Value target blend vtb=0.0 | Major (unlocked training signal) |
+| Lower LR (0.0001) | Moderate (prevents early collapse) |
+| 3000 games/iter | Moderate (20% → 24% peak) |
+| 50K replay buffer | Moderate (22% final vs 12-18%) |
+| LR schedule (cosine/constant) | Minor (peak only, doesn't help final) |
+| More MCTS sims with vtb=0.0 | Minor (25% → 29% peak, 2.4x cost) |
+| Higher c_puct (2.0, 5.0) | None |
+| More iterations (300) | None (model collapses) |
+| Combining all improvements | None (no stacking benefit) |
+
+**Ceiling: ~25-30% vs_Medium** regardless of configuration. The CNN appears to be fundamentally limited on 5x5 k=4 with this training setup.
+
+## Next experiments
+
+### MiniBT4 (Transformer) on 5x5 k=4
+
+The CNN has plateaued. MiniBT4 handles variable board sizes natively and may have better inductive bias for spatial reasoning on larger boards (attention vs. fixed conv kernels). Test with same best-practice settings found for CNN.
 
 ```bash
 python parallel_sweep.py --preset cnn_5x5k4_transfer -i 200 --epochs 8 \
+  --net-type minibt4 \
   --optimizer adamw --learning-rate 0.0001 --lr-schedule cosine --lr-min-ratio 0.1 \
-  --mcts 50 --games 1000,3000,5000 --value-target-blend 0.0 \
+  --mcts 50 --games 3000 --replay-buffer-size 50000 \
+  --value-target-blend 0.0 \
   --fixed-suite-mode medium --fixed-suite-every 5 \
-  --sweep-name b5k4_vtb0_games_v1
+  --sweep-name b5k4_minibt4_v1
 ```
 
-### 2. Larger replay buffer (medium priority)
+Note: MiniBT4 cannot use `--init-model-path` from a CNN checkpoint (different architecture). Will train from scratch.
 
-20K unique positions may saturate quickly for 5x5. Worth testing 50K-100K. The 5x5 k=4 state space is vastly larger than 3x3.
+### Verify pipeline on easier target (if Transformer also plateaus)
 
-### 3. Batch size (medium priority)
-
-Reference implementations use batch_size=512-8192, we use 256. Larger batches stabilize Adam training and reduce gradient noise.
-
-### 4. Phase 3: Transformer on Larger Boards (low priority for now)
-
-Defer until CNN on 5x5 k=4 is better understood. The current bottleneck is training dynamics, not architecture.
+Try 4x4 k=3 or 4x4 k=4 where depth-2 minimax is weaker. If we can't reach ~50% vs_Medium there, the problem is algorithmic, not architecture-specific.
 
 ## Useful commands
 
