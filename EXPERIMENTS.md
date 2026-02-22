@@ -30,7 +30,7 @@ Critical finding:
 - `--temperature`: `1.25`
 - `--temperature-cutoff-moves`: `1`
 - `--dirichlet-alpha`: `0.1`
-- `--cpuct`: `0.75`
+- `--cpuct`: `1.5` (updated from 0.75 after cpuct sweep, 2026-02-21)
 - `--optimizer`: `sgd`
 - `--lr-schedule`: `step`
 - `--lr-decay-step`: `25`
@@ -204,11 +204,43 @@ Final default decision:
 Rationale:
 - Temp-cutoff sweep (`sweep_results/temp_cutoff_v1_20260207_000025.csv`) selected `tcut=1` as the only setting that kept `vsDeep=25%` while reaching `vsMedium=50%`.
 - Dirichlet sweep at `tcut=1` (`sweep_results/dirichlet_tcut1_v1_20260207_001159.csv`) selected `dalpha=0.1` as top balanced config (`vsR=89.5%, vsD=25.0%, vsM=50.0%`).
-- CPUCT sweep (`sweep_results/cpuct_tcut1_dalpha0.1_v1_20260207_002811.csv`) selected `cpuct=0.75` as best combined strength/diversity tradeoff.
+- CPUCT sweep (`sweep_results/cpuct_tcut1_dalpha0.1_v1_20260207_002811.csv`) originally selected `cpuct=0.75`; later updated to `cpuct=1.5` after i100 sweep (see below).
 
 Position-diversity note:
 - Duplicate analysis showed very high repetition with `tcut=1` (`8978` samples, `145` exact uniques, `34` canonical uniques), versus `tcut=4` (`6635` samples, `934` exact uniques, `241` canonical uniques).
 - We keep `tcut=1` for strength and track diversity as a secondary metric during sweeps.
+
+## CPUCT sweep on 3x3 (2026-02-21)
+
+Motivated by head-to-head comparison with Python reference repo (`/code/alpha-zero`), which uses cpuct=5.0. Tested whether higher cpuct improves learning speed.
+
+### i10 (10K games)
+
+`python parallel_sweep.py --preset cnn_3x3_prod --cpuct 0.75,1.5,3.0,5.0 --iterations 10 --sweep-name cpuct_3x3_v1`
+
+| cpuct | vs_Deep max | Peak iter | vs_Deep final |
+|-------|-------------|-----------|---------------|
+| 0.75 | 47% | 6 | 43% |
+| 1.5 | 45% | 6 | 45% |
+| 3.0 | 45% | 2 | 42% |
+| 5.0 | 46% | 10 | 46% |
+
+No meaningful difference at 10K games — all within noise.
+
+### i100 (100K games)
+
+`python parallel_sweep.py --preset cnn_3x3_prod --cpuct 0.75,1.5,3.0,5.0 --sweep-name cpuct_3x3_i100_v1`
+
+| cpuct | vs_Deep max | Peak iter | vs_Deep final |
+|-------|-------------|-----------|---------------|
+| **1.5** | **50%** | 52 | 29% |
+| 0.75 | 47% | 43 | 29% |
+| 3.0 | 45% | 24 | 26% |
+| 5.0 | 42% | 5 | **22%** |
+
+Higher cpuct is worse with more data. cpuct=5.0 peaks at iter 5 then collapses to 22% — too much exploration degrades self-play quality over time. cpuct=1.5 edges out 0.75 (50% vs 47% peak).
+
+Decision: update `cnn_3x3_prod` default from cpuct=0.75 to cpuct=1.5.
 
 ## Architecture update (2026-02-07)
 

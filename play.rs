@@ -134,6 +134,12 @@ struct Args {
     /// Number of games to print when --verbose is enabled.
     #[arg(long, default_value_t = 2)]
     verbose_games: usize,
+
+    /// Interactive mode: read board states from stdin, output best moves.
+    /// Protocol: input line = space-separated cells (0=empty,1=P0,2=P1) then current_player (0|1)
+    /// Output: move index (0 to W*H-1)
+    #[arg(long, default_value_t = false)]
+    interactive: bool,
 }
 
 /// Infer network type from model filename
@@ -1609,6 +1615,80 @@ fn eval_vs_random(args: &Args) -> Result<(), String> {
     Ok(())
 }
 
+fn run_interactive(args: &Args, _mode: InferenceMode) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::{self, BufRead, Write};
+
+    let model_path = if args.model_path.ends_with(".bin") {
+        &args.model_path[..args.model_path.len() - 4]
+    } else {
+        &args.model_path
+    };
+
+    let az = AlphaZeroStrategy::new_with_model_path_and_cpuct_runtime_on_board(
+        args.az_sims,
+        model_path,
+        args.az_cpuct,
+        args.board_width,
+        args.cpu,
+    )?;
+
+    let config = GameConfig::new(args.board_width, args.board_width, args.win_k);
+
+    eprintln!("READY");
+
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+
+    for line in stdin.lock().lines() {
+        let line = line?;
+        let line = line.trim().to_string();
+        if line.is_empty() || line == "QUIT" {
+            break;
+        }
+
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        let board_size = args.board_width * args.board_width;
+        if tokens.len() != board_size + 1 {
+            writeln!(stdout, "ERROR expected {} tokens ({}board + 1player), got {}", board_size + 1, board_size, tokens.len())?;
+            stdout.flush()?;
+            continue;
+        }
+
+        // Parse board: 0=empty, 1=Player0(X), 2=Player1(O)
+        let mut cells = Vec::with_capacity(board_size);
+        for i in 0..board_size {
+            let v: u8 = tokens[i].parse().unwrap_or(0);
+            cells.push(match v {
+                1 => Cell::Player0,
+                2 => Cell::Player1,
+                _ => Cell::Empty,
+            });
+        }
+        let current_player_id: u8 = tokens[board_size].parse().unwrap_or(0);
+        let current_player = if current_player_id == 1 { Cell::Player1 } else { Cell::Player0 };
+
+        let board = Board::from_cells(args.board_width, args.board_width, cells)?;
+        let winner = check_winner(&board, args.win_k);
+
+        let state = GameState {
+            board,
+            current_player,
+            last_move: None,
+            winner,
+            is_terminal: winner != Winner::None,
+        };
+
+        match az.get_move(&state, &config) {
+            Ok(mv) => writeln!(stdout, "{}", mv)?,
+            Err(e) => writeln!(stdout, "ERROR {}", e)?,
+        }
+        stdout.flush()?;
+    }
+
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let inference_mode = select_inference_mode(args.cpu);
@@ -1616,14 +1696,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Print GPU memory usage at start
     print_gpu_memory("Tournament start");
 
-    println!("Functional M,N,K Game Implementation in Rust");
-    println!("{}", "=".repeat(45));
-    println!("Inference mode: {:?}", inference_mode);
+    if !args.interactive {
+        println!("Functional M,N,K Game Implementation in Rust");
+        println!("{}", "=".repeat(45));
+        println!("Inference mode: {:?}", inference_mode);
+    }
 
     if args.fixed_suite_eval {
         fixed_suite::run_fixed_suite_eval(&args).map_err(std::io::Error::other)?;
         print_gpu_memory("Tournament end");
         println!("\nDone!");
+        return Ok(());
+    }
+
+    if args.interactive {
+        run_interactive(&args, inference_mode)?;
         return Ok(());
     }
 

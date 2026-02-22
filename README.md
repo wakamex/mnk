@@ -2,6 +2,8 @@
 
 Tic-Tac-Toe (3,3,3 game) with AlphaZero-style training using the [Burn](https://burn.dev/) deep learning framework in Rust. GPU-accelerated with CUDA.
 
+Ties https://github.com/zhihanyang2022/alpha-zero after 50 seconds of training vs. 61 minutes, with 103,138 params vs 95,060, being 75x faster at self-play.
+
 ## Architecture
 
 - **CNN Network** (`src/alphazero.rs`) — 3-layer conv backbone with board-agnostic heads: policy uses conv-only per-cell logits, value uses global pooling + MLP (transfer-ready across board sizes)

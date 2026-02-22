@@ -11,7 +11,7 @@
   "lr_min_ratio": 0.1,
   "value_weight": 2.0,
   "mcts_simulations": 50,
-  "cpuct": 0.75,
+  "cpuct": 1.5,
   "net_type": "cnn",
   "board_width": 3,
   "win_k": 3,
@@ -24,7 +24,7 @@
   "fixed_suite_openings": 25,
   "fixed_suite_sides": 2,
   "fixed_suite_sims": 100,
-  "fixed_suite_cpuct": 0.75,
+  "fixed_suite_cpuct": 1.5,
   "fixed_suite_max_plies": 4,
   "fixed_suite_seed": 20260207
 }
