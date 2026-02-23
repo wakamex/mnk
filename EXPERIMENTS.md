@@ -547,6 +547,49 @@ Tested all improvements together: Adam, vtb=0.0, cosine schedule, 3000 games, 50
 
 **Ceiling: ~25-30% vs_Medium** regardless of configuration. The CNN appears to be fundamentally limited on 5x5 k=4 with this training setup.
 
+## 6x6 k=4 CNN from scratch (2026-02-22)
+
+Goal: train a CNN on 6x6 k=4 from scratch and compare against AlphaZero_Gomoku's pre-trained model via head-to-head.
+
+### Training run (`cnn_6x6k4` preset)
+
+Config: SGD lr=0.0015, step schedule (gamma=0.45, step=25), vtb=0.0, 3000 games/iter, 50K buffer, 50 sims, cpuct=0.75. 200 iterations, ~3.7 hours.
+
+| Metric | Value |
+|--------|-------|
+| vs_Deep max | 13.0% @iter 5 |
+| vs_Deep final | 0.0% |
+| Collapse | Immediate (iter 5 → 0% by iter 10) |
+
+The CNN completely failed to learn 6x6 k=4 from scratch with these hyperparams. Policy loss was flat at ~2.38 the entire run. The `cnn_5x5k4_transfer` hyperparams (SGD lr=0.0015) were tuned for fine-tuning from a 3x3 checkpoint, not training from zero on a 36-cell board.
+
+### H2H vs AlphaZero_Gomoku
+
+Used best checkpoint (iter 5, 13% vs_Deep) against AlphaZero_Gomoku's pre-trained `best_policy_6_6_4.model`.
+
+```
+python head_to_head.py \
+  --board-width 6 --win-k 4 --games 20 --sims 400 \
+  --rust-model alphazero_model.bin \
+  --opponent gomoku --opponent-model /code/AlphaZero_Gomoku/best_policy_6_6_4.model \
+  --cpu
+```
+
+| | Rust | Gomoku |
+|--|------|--------|
+| As P1 | 0/10 | 10/10 |
+| As P2 | 0/10 | 10/10 |
+| **Total** | **0/20** | **20/20** |
+
+0-20 wipeout. The Rust model is essentially random — gomoku wins every game in 7-8 moves.
+
+### Next steps for 6x6
+
+The CNN needs either:
+1. Adam optimizer (was critical for 5x5 k=4 learning)
+2. Transfer from a trained 5x5 checkpoint
+3. MiniBT4 architecture (which learned better on 5x5)
+
 ## Next experiments
 
 ### MiniBT4 (Transformer) on 5x5 k=4
